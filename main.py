@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V20 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
+# POLYMARKET BTC V21 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -146,7 +146,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v19")
+log = logging.getLogger("btc-polymarket-v21")
 STOP = False
 
 
@@ -175,7 +175,7 @@ def get(url, params=None):
     if params:
         url += "?" + urlencode(params)
     with urlopen(
-        Request(url, headers={"User-Agent": "btc-polymarket-v19"}),
+        Request(url, headers={"User-Agent": "btc-polymarket-v21"}),
         timeout=12,
     ) as r:
         return json.loads(r.read())
@@ -194,7 +194,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 20,
+        "version": 21,
         "strategies": {},
         "capital_reconciliation": {
             "initialized": False,
@@ -304,7 +304,7 @@ def load():
             except Exception:
                 pass
 
-        new["version"] = 20
+        new["version"] = 21
         save(new)
         return new
     except Exception:
@@ -743,12 +743,118 @@ class Bot:
             winning_shares,
         )
 
-    def process_redemptions(self, force=False):
-        """Redeem resolved winning positions through the official gasless SDK.
+    def _inspect_redeemable_position(self, condition_id):
+        """Return the wallet position state for one condition.
 
-        redeem_positions(condition_id=...) redeems the wallet's redeemable
-        position for that market condition.  Failures stay persisted and are
-        retried; a successful condition is never intentionally submitted twice.
+        The official Positions API is consulted BEFORE sending a relayer redeem.
+        Status values:
+          REDEEMABLE   -> at least one live position for the condition is redeemable
+          NOT_READY    -> position exists with size > 0, but is not redeemable yet
+          ABSENT       -> no positive-size open position is returned for the condition
+          ERROR        -> inspection failed; never assume redemption is complete
+
+        ABSENT is intentionally not treated as final on the first observation.
+        Data APIs can lag, so process_redemptions requires two consecutive ABSENT
+        confirmations before reconciling the queue as already settled/redeemed.
+        """
+        try:
+            positions = list(
+                self.c.list_positions(
+                    user=WALLET,
+                    page_size=100,
+                ).iter_items()
+            )
+        except Exception as exc:
+            return {
+                "status": "ERROR",
+                "error": repr(exc),
+                "positions": [],
+                "total_size": D("0"),
+                "redeemable_size": D("0"),
+            }
+
+        matches = []
+        total_size = D("0")
+        redeemable_size = D("0")
+
+        for pos in positions:
+            cid = str(self._obj_field(pos, "condition_id", "conditionId", default="") or "").strip()
+            if cid.lower() != str(condition_id).lower():
+                continue
+
+            try:
+                size = D(self._obj_field(pos, "size", default="0") or "0")
+            except Exception:
+                size = D("0")
+            if size <= 0:
+                continue
+
+            redeemable = bool(self._obj_field(pos, "redeemable", default=False))
+            total_size += size
+            if redeemable:
+                redeemable_size += size
+
+            matches.append({
+                "size": str(size),
+                "redeemable": redeemable,
+                "outcome": str(self._obj_field(pos, "outcome", default="") or ""),
+                "token_id": str(self._obj_field(pos, "token_id", "tokenId", default="") or ""),
+            })
+
+        if redeemable_size > 0:
+            status = "REDEEMABLE"
+        elif total_size > 0:
+            status = "NOT_READY"
+        else:
+            status = "ABSENT"
+
+        return {
+            "status": status,
+            "positions": matches,
+            "total_size": total_size,
+            "redeemable_size": redeemable_size,
+            "error": None,
+        }
+
+    def _finish_redemption_reconciliation(self, rec, processed, item, reason, inspection=None, outcome=None):
+        """Mark one condition reconciled and write an auditable terminal record."""
+        condition_id = str(item.get("condition_id") or "").strip()
+        slug = str(item.get("slug") or "").strip()
+        processed.add(condition_id)
+
+        rec["last_redeem"] = {
+            "condition_id": condition_id,
+            "slug": slug,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "reason": reason,
+            "outcome": str(outcome) if outcome is not None else None,
+            "inspection": {
+                "status": (inspection or {}).get("status"),
+                "total_size": str((inspection or {}).get("total_size", "0")),
+                "redeemable_size": str((inspection or {}).get("redeemable_size", "0")),
+            },
+        }
+
+        audit({
+            "type": "automatic_redeem_reconciliation",
+            "condition_id": condition_id,
+            "slug": slug,
+            "winning_shares": str(item.get("winning_shares") or "0"),
+            "reason": reason,
+            "outcome": str(outcome) if outcome is not None else None,
+            "ts": datetime.now(UTC).isoformat(),
+        })
+
+    def process_redemptions(self, force=False):
+        """Redeem only positions that the Positions API still marks redeemable.
+
+        V21 prevents repeated relayer submissions against already-settled positions:
+        1) inspect the wallet's current position for the condition;
+        2) submit redeem only when redeemable=True and size>0;
+        3) keep a non-redeemable live position queued with a slower retry;
+        4) require two consecutive ABSENT observations before treating a condition
+           as already redeemed/settled;
+        5) after a relayer revert, re-inspect before scheduling another submit.
         """
         if not LIVE or not self.c:
             return
@@ -769,9 +875,8 @@ class Bot:
         changed = False
         now_epoch = time.time()
         kept = []
-
-        # Processa no maximo 3 por passagem para nao atrasar o loop de trading.
         processed_now = 0
+
         for item in list(queue):
             if not isinstance(item, dict):
                 changed = True
@@ -798,7 +903,7 @@ class Bot:
 
             if not condition_id:
                 item["attempts"] = int(item.get("attempts") or 0) + 1
-                item["next_try_epoch"] = now_epoch + 15
+                item["next_try_epoch"] = now_epoch + 30
                 kept.append(item)
                 changed = True
                 log.warning("RESGATE | condition_id ainda indisponivel | slug=%s", slug)
@@ -809,24 +914,82 @@ class Bot:
                 continue
 
             processed_now += 1
+            inspection = self._inspect_redeemable_position(condition_id)
+            status = inspection.get("status")
+
+            if status == "ERROR":
+                item["inspection_errors"] = int(item.get("inspection_errors") or 0) + 1
+                item["next_try_epoch"] = now_epoch + 60
+                item["last_error"] = inspection.get("error")
+                kept.append(item)
+                changed = True
+                log.warning(
+                    "RESGATE | PRE-CHECK FALHOU | condition_id=%s | retry=60s | erro=%s",
+                    condition_id,
+                    inspection.get("error"),
+                )
+                continue
+
+            if status == "ABSENT":
+                absent_n = int(item.get("absent_confirmations") or 0) + 1
+                item["absent_confirmations"] = absent_n
+                changed = True
+
+                if absent_n >= 2:
+                    self._finish_redemption_reconciliation(
+                        rec, processed, item,
+                        reason="already_settled_or_no_open_position",
+                        inspection=inspection,
+                    )
+                    log.info(
+                        "RESGATE RECONCILIADO | condition_id=%s | sem posicao aberta em 2 verificacoes; "
+                        "considerado ja liquidado/resgatado",
+                        condition_id,
+                    )
+                    continue
+
+                item["next_try_epoch"] = now_epoch + 30
+                kept.append(item)
+                log.info(
+                    "RESGATE | SEM POSICAO ABERTA | condition_id=%s | confirmacao=1/2 | retry=30s",
+                    condition_id,
+                )
+                continue
+
+            # Qualquer posicao reaparecendo zera a confirmacao de ausencia.
+            if item.get("absent_confirmations"):
+                item["absent_confirmations"] = 0
+                changed = True
+
+            if status == "NOT_READY":
+                item["not_ready_checks"] = int(item.get("not_ready_checks") or 0) + 1
+                # Nao martela o relayer: a posicao existe, mas a Data API ainda nao a
+                # classifica como redeemable. Reconsulta em 60s sem POST /submit.
+                item["next_try_epoch"] = now_epoch + 60
+                kept.append(item)
+                changed = True
+                log.info(
+                    "RESGATE | AINDA NAO RESGATAVEL | condition_id=%s | size=%s | retry=60s",
+                    condition_id,
+                    inspection.get("total_size"),
+                )
+                continue
+
+            # Somente REDEEMABLE chega ao relayer.
             try:
+                log.info(
+                    "RESGATE | PRE-CHECK OK | condition_id=%s | redeemable_size=%s | enviando ao relayer",
+                    condition_id,
+                    inspection.get("redeemable_size"),
+                )
                 handle = self.c.redeem_positions(condition_id=condition_id)
                 outcome = handle.wait()
-                processed.add(condition_id)
-                rec["last_redeem"] = {
-                    "condition_id": condition_id,
-                    "slug": slug,
-                    "timestamp": datetime.now(UTC).isoformat(),
-                    "outcome": str(outcome),
-                }
-                audit({
-                    "type": "automatic_redeem",
-                    "condition_id": condition_id,
-                    "slug": slug,
-                    "winning_shares": str(item.get("winning_shares") or "0"),
-                    "outcome": str(outcome),
-                    "ts": datetime.now(UTC).isoformat(),
-                })
+                self._finish_redemption_reconciliation(
+                    rec, processed, item,
+                    reason="redeem_submitted_successfully",
+                    inspection=inspection,
+                    outcome=outcome,
+                )
                 log.info(
                     "RESGATE AUTOMATICO OK | condition_id=%s | slug=%s | outcome=%s",
                     condition_id,
@@ -834,17 +997,67 @@ class Bot:
                     outcome,
                 )
                 changed = True
+                continue
+
             except Exception as exc:
                 item["attempts"] = int(item.get("attempts") or 0) + 1
-                # Backoff curto, limitado a 60s: mercados podem estar resolvidos
-                # na Gamma antes de o redeem on-chain ficar imediatamente pronto.
-                delay = min(60, 5 * max(1, item["attempts"]))
-                item["next_try_epoch"] = now_epoch + delay
                 item["last_error"] = repr(exc)
+
+                # Uma falha pode ser corrida com auto-settlement/auto-redeem. Rele a
+                # posicao imediatamente e, sobretudo, NAO repete POST em poucos segundos.
+                post = self._inspect_redeemable_position(condition_id)
+                post_status = post.get("status")
+
+                if post_status == "ABSENT":
+                    item["absent_confirmations"] = int(item.get("absent_confirmations") or 0) + 1
+                    item["next_try_epoch"] = now_epoch + 30
+                    kept.append(item)
+                    changed = True
+                    log.warning(
+                        "RESGATE | RELAYER REVERTEU MAS POSICAO SUMIU | condition_id=%s | "
+                        "confirmacao=%s/2 | retry somente pre-check em 30s | erro=%r",
+                        condition_id,
+                        item["absent_confirmations"],
+                        exc,
+                    )
+                    continue
+
+                if post_status == "NOT_READY":
+                    item["next_try_epoch"] = now_epoch + 60
+                    kept.append(item)
+                    changed = True
+                    log.warning(
+                        "RESGATE | RELAYER REVERTEU E POSICAO NAO ESTA REDEEMABLE | "
+                        "condition_id=%s | retry=60s sem novo POST ate novo pre-check | erro=%r",
+                        condition_id,
+                        exc,
+                    )
+                    continue
+
+                if post_status == "ERROR":
+                    delay = min(300, 60 * max(1, item["attempts"]))
+                    item["next_try_epoch"] = now_epoch + delay
+                    kept.append(item)
+                    changed = True
+                    log.warning(
+                        "RESGATE AUTOMATICO PENDENTE | condition_id=%s | tentativa=%s | "
+                        "pre-check pos-falha indisponivel | retry=%ss | erro=%r",
+                        condition_id,
+                        item["attempts"],
+                        delay,
+                        exc,
+                    )
+                    continue
+
+                # Se continua REDEEMABLE, conserva na fila, mas com backoff longo.
+                # Repetir a cada 5-20s foi exatamente o comportamento indesejado da V20.
+                delay = min(600, 60 * (2 ** min(item["attempts"] - 1, 3)))
+                item["next_try_epoch"] = now_epoch + delay
                 kept.append(item)
                 changed = True
                 log.warning(
-                    "RESGATE AUTOMATICO PENDENTE | condition_id=%s | tentativa=%s | retry=%ss | erro=%r",
+                    "RESGATE AUTOMATICO PENDENTE | condition_id=%s | continua redeemable | "
+                    "tentativa=%s | retry=%ss | erro=%r",
                     condition_id,
                     item["attempts"],
                     delay,
@@ -1130,7 +1343,7 @@ class Bot:
                 })
                 req = Request(
                     f"https://data-api.polymarket.com/activity?{params}",
-                    headers={"User-Agent": "btc-polymarket-v19"},
+                    headers={"User-Agent": "btc-polymarket-v21"},
                 )
                 with urlopen(req, timeout=15) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -2206,14 +2419,14 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=20 | ENTRY_SECONDS=%s | INITIAL_EDGE=%s", ENTRY_SECONDS, INITIAL_EDGE)
+        log.info("STARTUP OK | codigo carregado | versao=21 | ENTRY_SECONDS=%s | INITIAL_EDGE=%s", ENTRY_SECONDS, INITIAL_EDGE)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V20 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V21 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | SO ENVIA SE AMBOS<=%s ANTES DO INICIO | "
             "PARTIAL=PROPORCIONAL | SE 1 FULL: OUTRO 100%% ATE FINAL | "
-            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO | BALANCE=MONITORADO | MARTINGALE_BASE=CONGELADA_POR_CICLO | EDGE_INICIAL=%s | TARGET=%s | DATA=%s",
+            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_PRECHECK | BALANCE=MONITORADO | MARTINGALE_BASE=CONGELADA_POR_CICLO | EDGE_INICIAL=%s | TARGET=%s | DATA=%s",
             LIVE,
             gasless_mode,
             INITIAL,
