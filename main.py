@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V14 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
+# POLYMARKET BTC V16 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -89,7 +89,7 @@ def ensure_sdk():
 
 ensure_sdk()
 
-from polymarket import SecureClient  # noqa: E402
+from polymarket import SecureClient, AssetType  # noqa: E402
 
 
 TZ = ZoneInfo("America/Sao_Paulo")
@@ -110,6 +110,7 @@ HIGH_BANKROLL_EDGE = Decimal(os.getenv("HIGH_BANKROLL_EDGE", "10.00"))
 MAX_ENTRY = Decimal(os.getenv("MAX_ENTRY", "1000.00"))
 TARGET = Decimal(os.getenv("TARGET_BANKROLL", "200000.00"))
 WITHDRAWAL_SYNC_SECONDS = float(os.getenv("WITHDRAWAL_SYNC_SECONDS", "20"))
+BALANCE_SYNC_SECONDS = float(os.getenv("BALANCE_SYNC_SECONDS", "30"))
 
 ENTRY_SECONDS = 30  # FIXO: trava o sinal 30s antes da proxima rodada
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "0.5"))
@@ -128,7 +129,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v14")
+log = logging.getLogger("btc-polymarket-v16")
 STOP = False
 
 
@@ -157,7 +158,7 @@ def get(url, params=None):
     if params:
         url += "?" + urlencode(params)
     with urlopen(
-        Request(url, headers={"User-Agent": "btc-polymarket-v14"}),
+        Request(url, headers={"User-Agent": "btc-polymarket-v16"}),
         timeout=12,
     ) as r:
         return json.loads(r.read())
@@ -176,7 +177,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 14,
+        "version": 16,
         "strategies": {},
         "capital_reconciliation": {
             "initialized": False,
@@ -196,6 +197,7 @@ def fresh():
                 "session": session,
                 "bankroll": str(INITIAL),
                 "loss_streak": 0,
+                "martingale_base_edge": None,
                 "wins": 0,
                 "losses": 0,
                 "trades": 0,
@@ -227,6 +229,7 @@ def load():
             for field in (
                 "bankroll",
                 "loss_streak",
+                "martingale_base_edge",
                 "wins",
                 "losses",
                 "trades",
@@ -260,7 +263,7 @@ def load():
                 if field in tracker:
                     dst_tracker[field] = tracker[field]
 
-        new["version"] = 14
+        new["version"] = 16
         save(new)
         return new
     except Exception:
@@ -481,6 +484,12 @@ def sizing(st, min_shares, limit_price):
     O lado oposto usa exatamente o minimo de shares do mercado.
     O diferencial do lado direcional e definido em USDC.
 
+    MARTINGALE V16:
+    - a base e calculada apenas no inicio de uma sequencia;
+    - essa base fica CONGELADA durante todas as perdas do ciclo;
+    - o multiplicador 2**loss_streak e aplicado sobre a base congelada;
+    - apos uma vitoria, a base e apagada e sera recalculada na proxima entrada.
+
     Como a ordem e LIMIT @ <=0.55, o gasto maximo teorico e:
         shares * limit_price
     """
@@ -490,7 +499,15 @@ def sizing(st, min_shares, limit_price):
     opposite_shares = min_shares
     opposite_max_spend = opposite_shares * limit_price
 
-    edge = base_edge(st) * (D(2) ** int(st["loss_streak"]))
+    frozen = st.get("martingale_base_edge")
+    if frozen in (None, "", "None"):
+        # Calcula a candidata, mas so a persiste quando a entrada e realmente
+        # preparada e passa pelas validacoes de mercado/capital.
+        frozen = base_edge(st)
+    else:
+        frozen = D(frozen)
+
+    edge = frozen * (D(2) ** int(st["loss_streak"]))
     edge = min(edge, MAX_ENTRY)
 
     directional_max_spend_target = min(
@@ -513,6 +530,7 @@ def sizing(st, min_shares, limit_price):
         "opposite_max_spend": opposite_max_spend,
         "directional_max_spend": directional_max_spend,
         "edge": actual_edge_at_limit,
+        "martingale_base_edge": frozen,
     }
 
 
@@ -557,7 +575,68 @@ class Bot:
             log.info("SIMULACAO")
 
         self.last_withdrawal_sync = 0.0
+        self.last_balance_sync = 0.0
+        self.last_balance_snapshot = None
         self.initialize_withdrawal_tracker()
+
+        if LIVE:
+            self.sync_balance(force=True)
+
+    # -------------------- REAL WALLET BALANCE --------------------
+
+    @staticmethod
+    def _obj_field(obj, *names, default=None):
+        for name in names:
+            if isinstance(obj, dict) and name in obj:
+                return obj.get(name)
+            if hasattr(obj, name):
+                return getattr(obj, name)
+        return default
+
+    def sync_balance(self, force=False):
+        """
+        Consulta o saldo/allowance de COLLATERAL da carteira autenticada.
+
+        Isto NAO altera os bankrolls logicos; serve para confirmar que a carteira
+        configurada no Railway e a carteira que possui collateral disponivel para
+        negociacao no CLOB da Polymarket.
+        """
+        if not LIVE or not self.c:
+            return None
+
+        now_monotonic = time.monotonic()
+        if not force and now_monotonic - self.last_balance_sync < BALANCE_SYNC_SECONDS:
+            return self.last_balance_snapshot
+        self.last_balance_sync = now_monotonic
+
+        try:
+            info = self.c.get_balance_allowance(asset_type=AssetType.COLLATERAL)
+
+            balance = self._obj_field(info, "balance", default=None)
+            allowances = self._obj_field(info, "allowances", "allowance", default=None)
+
+            self.last_balance_snapshot = {
+                "balance": str(balance) if balance is not None else None,
+                "allowances": allowances,
+                "wallet": str(self.c.wallet),
+                "signer": str(self.c.signer),
+                "raw_type": type(info).__name__,
+            }
+
+            log.info(
+                "CARTEIRA OK | wallet=%s | signer=%s | collateral_balance=%s | allowance=%s",
+                self.c.wallet,
+                self.c.signer,
+                balance,
+                allowances,
+            )
+            return self.last_balance_snapshot
+
+        except Exception:
+            log.exception(
+                "CARTEIRA ERRO | nao foi possivel consultar balance/allowance de COLLATERAL"
+            )
+            return None
 
     # -------------------- CAPITAL / WITHDRAWALS --------------------
 
@@ -722,8 +801,10 @@ class Bot:
         found = []
 
         try:
+            # SDK 0.3.0b1 reconhece WithdrawalActivity no parser, mas o filtro
+            # activity_types ainda rejeita "WITHDRAWAL" client-side. Portanto,
+            # busca a janela SEM filtro e seleciona WITHDRAWAL localmente.
             paginator = self.c.list_activity(
-                activity_types=("WITHDRAWAL",),
                 start=start_epoch,
                 end=now_epoch,
                 page_size=100,
@@ -736,7 +817,12 @@ class Bot:
                     if count > 1000:
                         raise RuntimeError("mais de 1000 saques na janela de reconciliacao")
 
-                    if str(getattr(activity, "type", "")) != "WITHDRAWAL":
+                    activity_type = str(
+                        getattr(activity, "type", "")
+                        or getattr(activity, "activity_type", "")
+                        or ""
+                    ).upper()
+                    if activity_type != "WITHDRAWAL" and type(activity).__name__ != "WithdrawalActivity":
                         continue
 
                     ts = getattr(activity, "timestamp", None)
@@ -1149,6 +1235,11 @@ class Bot:
             )
             return
 
+        # A sequencia de Martingale passa a existir a partir daqui: mercado,
+        # sizing e capital ja foram validados. Congela/persiste a base do ciclo.
+        if st.get("martingale_base_edge") in (None, "", "None"):
+            st["martingale_base_edge"] = str(sz["martingale_base_edge"])
+
         directional_token = m["up"] if direction == "UP" else m["down"]
         opposite_token = m["down"] if direction == "UP" else m["up"]
         opposite_direction = "DOWN" if direction == "UP" else "UP"
@@ -1177,6 +1268,7 @@ class Bot:
             "limit_price": str(limit_price),
             "minimum_order_shares": str(min_shares),
             "edge_at_limit": str(sz["edge"]),
+            "martingale_base_edge": str(st["martingale_base_edge"]),
             "signal_locked_at": datetime.now(UTC).isoformat(),
             "live": LIVE,
             "last_wait_log": 0,
@@ -1601,8 +1693,15 @@ class Bot:
         if directional_win:
             st["wins"] += 1
             st["loss_streak"] = 0
+            # Encerra o ciclo. A proxima entrada calcula uma nova base
+            # usando o bankroll atualizado naquele momento.
+            st["martingale_base_edge"] = None
         else:
             st["losses"] += 1
+            # A base do ciclo permanece congelada. Em estados migrados antigos,
+            # garante uma base valida antes de incrementar a sequencia.
+            if st.get("martingale_base_edge") in (None, "", "None"):
+                st["martingale_base_edge"] = str(base_edge(st))
             st["loss_streak"] += 1
 
         audit({
@@ -1619,6 +1718,7 @@ class Bot:
             "pnl": str(pnl),
             "bankroll_after": str(bankroll),
             "loss_streak_after": st["loss_streak"],
+            "martingale_base_edge_after": st.get("martingale_base_edge"),
             "ts": datetime.now(UTC).isoformat(),
         })
 
@@ -1626,13 +1726,14 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | WINNER=%s | %s | PNL=%s | BANKROLL=%s | loss_streak=%s",
+            "%s | WINNER=%s | %s | PNL=%s | BANKROLL=%s | loss_streak=%s | martingale_base=%s",
             st["name"],
             w,
             "WIN" if directional_win else "LOSS",
             pnl,
             bankroll,
             st["loss_streak"],
+            st.get("martingale_base_edge"),
         )
 
     # ------------------------- LOOP -------------------------
@@ -1701,24 +1802,25 @@ class Bot:
             return
 
         log.info(
-            "%s | SINAL APROVADO | direction=%s | dirs=%s | macd=%s | signal=%s | loss_streak=%s",
+            "%s | SINAL APROVADO | direction=%s | dirs=%s | macd=%s | signal=%s | loss_streak=%s | martingale_base=%s",
             st["name"],
             direction,
             dirs,
             macd,
             sig,
             st["loss_streak"],
+            st.get("martingale_base_edge"),
         )
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=14 | ENTRY_SECONDS=%s", ENTRY_SECONDS)
+        log.info("STARTUP OK | codigo carregado | versao=16 | ENTRY_SECONDS=%s", ENTRY_SECONDS)
         log.info(
-            "POLYMARKET BTC V14 FINAL | LIVE=%s | 6 ROBOS | "
+            "POLYMARKET BTC V16 FINAL | LIVE=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | SO ENVIA SE AMBOS<=%s ANTES DO INICIO | "
             "PARTIAL=PROPORCIONAL | SE 1 FULL: OUTRO 100%% ATE FINAL | "
-            "SAQUES=AUTO_PROPORCIONAL | TARGET=%s | DATA=%s",
+            "SAQUES=AUTO_PROPORCIONAL | BALANCE=MONITORADO | MARTINGALE_BASE=CONGELADA_POR_CICLO | TARGET=%s | DATA=%s",
             LIVE,
             INITIAL,
             ENTRY_SECONDS,
@@ -1731,11 +1833,13 @@ class Bot:
 
         # Primeira consulta logo apos o startup; baseline impede desconto retroativo.
         self.sync_withdrawals(force=True)
+        self.sync_balance(force=True)
 
         while not STOP:
             now = datetime.now(UTC)
 
             self.sync_withdrawals()
+            self.sync_balance()
 
             for st in self.s["strategies"].values():
                 try:
@@ -1747,13 +1851,16 @@ class Bot:
                 summary = " | ".join(
                     f'{st["name"]}:bank={st["bankroll"]},'
                     f'L={st["loss_streak"]},'
+                    f'MB={st.get("martingale_base_edge") or "-"},'
                     f'phase={(st.get("pending") or {}).get("phase","-")}'
                     for st in self.s["strategies"].values()
                 )
                 recon = self.s.get("capital_reconciliation", {})
+                bal = self.last_balance_snapshot or {}
                 log.info(
-                    "HEARTBEAT | LIVE=%s | withdrawn_applied=%s | %s",
+                    "HEARTBEAT | LIVE=%s | wallet_balance=%s | withdrawn_applied=%s | %s",
                     LIVE,
+                    bal.get("balance", "?"),
                     recon.get("total_withdrawn_applied", "0"),
                     summary,
                 )
