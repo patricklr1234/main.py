@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V18 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
+# POLYMARKET BTC V19 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -139,7 +139,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v18")
+log = logging.getLogger("btc-polymarket-v19")
 STOP = False
 
 
@@ -168,7 +168,7 @@ def get(url, params=None):
     if params:
         url += "?" + urlencode(params)
     with urlopen(
-        Request(url, headers={"User-Agent": "btc-polymarket-v18"}),
+        Request(url, headers={"User-Agent": "btc-polymarket-v19"}),
         timeout=12,
     ) as r:
         return json.loads(r.read())
@@ -187,7 +187,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 18,
+        "version": 19,
         "strategies": {},
         "capital_reconciliation": {
             "initialized": False,
@@ -494,7 +494,7 @@ def sizing(st, min_shares, limit_price):
     O lado oposto usa exatamente o minimo de shares do mercado.
     O diferencial do lado direcional e definido em USDC.
 
-    MARTINGALE V18:
+    MARTINGALE V19:
     - a base e calculada apenas no inicio de uma sequencia;
     - essa base fica CONGELADA durante todas as perdas do ciclo;
     - o multiplicador 2**loss_streak e aplicado sobre a base congelada;
@@ -891,6 +891,15 @@ class Bot:
         return effective_applied
 
     def sync_withdrawals(self, force=False):
+        """
+        Reconcilia saques pela Data API em JSON bruto.
+
+        Motivo: polymarket-client 0.3.0b1 pode falhar ao desserializar a lista
+        de activity quando um item TRADE vem sem outcomeIndex. Um item invalido
+        derruba a pagina inteira antes de chegarmos aos WITHDRAWAL. Aqui usamos
+        o mesmo endpoint oficial, mas filtramos type=WITHDRAWAL antes de qualquer
+        validacao Pydantic do SDK.
+        """
         if not LIVE or not self.c:
             return
 
@@ -903,62 +912,95 @@ class Bot:
         baseline = int(tracker.get("baseline_epoch", 0) or 0)
         last_success = int(tracker.get("last_success_epoch", baseline) or baseline)
         now_epoch = int(time.time())
-
-        # Janela com overlap de 1h para absorver atraso eventual da Data API.
-        # O conjunto processed_withdrawals impede qualquer desconto duplicado.
         start_epoch = max(baseline, last_success - 3600)
         processed = set(str(x) for x in tracker.get("processed_withdrawals", []))
         found = []
 
         try:
-            # SDK 0.3.0b1 reconhece WithdrawalActivity no parser, mas o filtro
-            # activity_types ainda rejeita "WITHDRAWAL" client-side. Portanto,
-            # busca a janela SEM filtro e seleciona WITHDRAWAL localmente.
-            paginator = self.c.list_activity(
-                start=start_epoch,
-                end=now_epoch,
-                page_size=100,
-            )
+            offset = 0
+            limit = 100
+            scanned = 0
 
-            count = 0
-            for page in paginator:
-                for activity in page.items:
-                    count += 1
-                    if count > 1000:
-                        raise RuntimeError("mais de 1000 saques na janela de reconciliacao")
+            while True:
+                params = urlencode({
+                    "user": WALLET,
+                    "start": start_epoch,
+                    "end": now_epoch,
+                    "limit": limit,
+                    "offset": offset,
+                })
+                req = Request(
+                    f"https://data-api.polymarket.com/activity?{params}",
+                    headers={"User-Agent": "btc-polymarket-v19"},
+                )
+                with urlopen(req, timeout=15) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
 
-                    activity_type = str(
-                        getattr(activity, "type", "")
-                        or getattr(activity, "activity_type", "")
-                        or ""
-                    ).upper()
-                    if activity_type != "WITHDRAWAL" and type(activity).__name__ != "WithdrawalActivity":
+                if not isinstance(payload, list):
+                    raise RuntimeError(f"Data API activity retornou {type(payload).__name__}, esperado list")
+
+                for item in payload:
+                    scanned += 1
+                    if scanned > 5000:
+                        raise RuntimeError("mais de 5000 atividades na janela de reconciliacao")
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("type", "")).upper() != "WITHDRAWAL":
                         continue
 
-                    ts = getattr(activity, "timestamp", None)
-                    if ts is None:
+                    raw_ts = item.get("timestamp")
+                    if raw_ts is None:
                         continue
-                    ts_epoch = int(ts.timestamp())
+                    try:
+                        if isinstance(raw_ts, (int, float)) or str(raw_ts).isdigit():
+                            ts_epoch = int(raw_ts)
+                            ts = datetime.fromtimestamp(ts_epoch, UTC)
+                        else:
+                            ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                            ts_epoch = int(ts.timestamp())
+                    except Exception:
+                        log.warning("SAQUES | WITHDRAWAL ignorado por timestamp invalido: %r", raw_ts)
+                        continue
+
                     if ts_epoch <= baseline:
                         continue
 
-                    amount = D(getattr(activity, "amount", 0) or 0)
+                    amount = D(item.get("amount", 0) or 0)
                     if amount <= 0:
                         continue
 
-                    key = self.withdrawal_key(activity)
+                    tx = str(
+                        item.get("transactionHash")
+                        or item.get("transaction_hash")
+                        or item.get("txHash")
+                        or ""
+                    )
+                    key = f"{tx}|{ts.isoformat()}|{amount}"
                     if key in processed:
                         continue
 
+                    # Objeto minimo compativel com apply_withdrawal(), sem depender
+                    # dos modelos quebrados de activity do SDK beta.
+                    from types import SimpleNamespace
+                    activity = SimpleNamespace(
+                        timestamp=ts,
+                        transaction_hash=tx,
+                        amount=amount,
+                        type="WITHDRAWAL",
+                    )
                     found.append((ts_epoch, key, activity, amount))
 
-            # Processa cronologicamente para o historico ficar deterministico.
+                if len(payload) < limit:
+                    break
+                offset += limit
+                if offset >= 5000:
+                    raise RuntimeError("paginacao de activity excedeu 5000 registros")
+
             found.sort(key=lambda x: (x[0], x[1]))
             for _ts_epoch, key, activity, amount in found:
                 self.apply_withdrawal(amount, activity)
                 processed.add(key)
 
-            # Retem chaves recentes; 2000 e muito acima do uso esperado e evita crescimento infinito.
             tracker["processed_withdrawals"] = list(processed)[-2000:]
             tracker["last_success_epoch"] = now_epoch
             save(self.s)
@@ -967,7 +1009,6 @@ class Bot:
                 log.info("SAQUES | reconciliados=%s | scan_ate=%s", len(found), now_epoch)
 
         except Exception:
-            # Nao altera last_success_epoch em caso de falha; assim a proxima tentativa cobre a mesma janela.
             log.exception("SAQUES | falha ao consultar/reconciliar withdrawals; sera tentado novamente")
 
     # ------------------------- ORDERS -------------------------
@@ -1964,7 +2005,7 @@ class Bot:
         log.info("STARTUP OK | codigo carregado | versao=18 | ENTRY_SECONDS=%s", ENTRY_SECONDS)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V18 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V19 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | SO ENVIA SE AMBOS<=%s ANTES DO INICIO | "
             "PARTIAL=PROPORCIONAL | SE 1 FULL: OUTRO 100%% ATE FINAL | "
