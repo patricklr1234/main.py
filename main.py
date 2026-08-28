@@ -1,782 +1,176 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-POLYMARKET BTC BOT - SINGLE FILE
-Compatível com Railway.
-
-IMPORTANTE:
-- Este arquivo NÃO coloca PRIVATE_KEY no código.
-- LIVE_TRADING=0 por padrão.
-- O bot monitora o CLOB/Gamma e registra oportunidades.
-- Para habilitar execução real, LIVE_TRADING=1.
-"""
-
-import os
-import sys
-import json
-import time
-import signal
-import logging
-import subprocess
+import os,sys,json,time,signal,logging,subprocess
+from decimal import Decimal
+from datetime import datetime,timedelta,timezone
 from pathlib import Path
-from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from urllib.request import Request,urlopen
+from urllib.parse import urlencode
 
-# ============================================================
-# 1. DIRETÓRIO FIXO DO PROJETO
-# ============================================================
-
-BASE_DIR = Path(__file__).resolve().parent
-
-STATE_FILE = BASE_DIR / "state.json"
-TRADES_FILE = BASE_DIR / "trades.jsonl"
-LOG_FILE = BASE_DIR / "bot.log"
-
-# ============================================================
-# 2. CONFIGURAÇÕES
-# ============================================================
-
-HOST = os.getenv(
-    "CLOB_HOST",
-    "https://clob.polymarket.com"
-)
-
-GAMMA_HOST = os.getenv(
-    "GAMMA_HOST",
-    "https://gamma-api.polymarket.com"
-)
-
-CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))
-
-PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
-
-LIVE_TRADING = (
-    os.getenv("LIVE_TRADING", "0").strip().lower()
-    in ("1", "true", "yes", "on")
-)
-
-ACTIVE_ASSET = os.getenv(
-    "ACTIVE_ASSET",
-    "BTC"
-)
-
-POLL_SECONDS = int(
-    os.getenv("POLL_SECONDS", "15")
-)
-
-# ============================================================
-# 3. DEPENDÊNCIAS
-# ============================================================
-
-def import_dependencies():
-
+def sdk():
     try:
-        import requests
-        from eth_account import Account
+        import polymarket
     except ImportError:
+        subprocess.check_call([sys.executable,"-m","pip","install","--no-cache-dir","polymarket-client==0.3.0b1"])
+        os.execv(sys.executable,[sys.executable]+sys.argv)
+sdk()
+from polymarket import SecureClient
 
-        print(
-            "Dependências ausentes. "
-            "Instalando automaticamente..."
-        )
+TZ=ZoneInfo("America/Sao_Paulo"); ET=ZoneInfo("America/New_York"); UTC=timezone.utc
+GAMMA="https://gamma-api.polymarket.com"; BINANCE="https://api.binance.com"
+PK=os.getenv("PRIVATE_KEY","").strip()
+WALLET=os.getenv("POLYMARKET_DEPOSIT_WALLET","").strip()
+LIVE=os.getenv("LIVE_TRADING","0").lower() in ("1","true","yes","on")
+INITIAL=Decimal(os.getenv("INITIAL_BANKROLL","15"))
+BASE=Decimal(os.getenv("BASE_ENTRY","0.10"))
+EXTRA=Decimal(os.getenv("DIRECTIONAL_EXTRA","0.25"))
+MAX=Decimal(os.getenv("MAX_ENTRY","1000"))
+TARGET=Decimal(os.getenv("TARGET_BANKROLL","200000"))
+ENTRY=int(os.getenv("ENTRY_SECONDS","15")); POLL=float(os.getenv("POLL_SECONDS","0.5"))
+TFS={"5m":5,"15m":15,"1h":60}
+ROOT=Path(__file__).resolve().parent; STATE=ROOT/"state.json"; TRADES=ROOT/"trades.jsonl"
+logging.basicConfig(level=logging.INFO,format="%(asctime)s | %(levelname)s | %(message)s",handlers=[logging.StreamHandler(sys.stdout)])
+log=logging.getLogger("bot"); STOP=False
 
-        packages = [
-            "requests",
-            "eth-account",
-            "py-clob-client-v2",
-        ]
-
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--no-cache-dir",
-                *packages,
-            ]
-        )
-
-        import requests
-        from eth_account import Account
-
+def D(x): return Decimal(str(x))
+def get(url,p=None):
+    if p:url+="?"+urlencode(p)
+    with urlopen(Request(url,headers={"User-Agent":"btc-bot/4"}),timeout=12) as r:return json.loads(r.read())
+def js(x):
+    if isinstance(x,list):return x
+    if isinstance(x,str):
+        try:return json.loads(x)
+        except:return [x]
+    return []
+def fresh():
+    s={"version":4,"strategies":{}}
+    for tf in TFS:
+        for ses in ("24h","day"):
+            n=f"{tf}_{ses}"
+            s["strategies"][n]={"name":n,"tf":tf,"session":ses,"bankroll":str(INITIAL),"loss_streak":0,"wins":0,"losses":0,"trades":0,"last_trigger":"","pending":None}
+    return s
+def load():
+    if not STATE.exists():return fresh()
     try:
-        from py_clob_client_v2 import ClobClient
-    except ImportError as e:
-        raise RuntimeError(
-            "Não foi possível importar py_clob_client_v2. "
-            f"Erro: {e}"
-        )
+        old=json.loads(STATE.read_text()); new=fresh()
+        for k,v in old.get("strategies",{}).items():
+            if k in new["strategies"]:new["strategies"][k].update(v)
+        return new
+    except:return fresh()
+def save(s):
+    t=STATE.with_suffix(".tmp"); t.write_text(json.dumps(s,indent=2)); t.replace(STATE)
+def audit(x):
+    with TRADES.open("a") as f:f.write(json.dumps(x,default=str)+"\n")
+def ema(v,n):
+    k=2/(n+1); e=float(v[0]); out=[]
+    for x in v:e=float(x)*k+e*(1-k);out.append(e)
+    return out
+def signal(tf):
+    rows=get(BINANCE+"/api/v3/klines",{"symbol":"BTCUSDT","interval":tf,"limit":120})
+    now=int(time.time()*1000); c=[r for r in rows if int(r[6])<now]
+    close=[float(r[4]) for r in c]; fast=ema(close,7); slow=ema(close,21)
+    mac=[a-b for a,b in zip(fast,slow)]; sig=ema(mac,9); m,s=mac[-1],sig[-1]
+    d="UP" if m>s and m>0 else "DOWN" if m<s and m<0 else None
+    dirs=["UP" if float(r[4])>=float(r[1]) else "DOWN" for r in c[-2:]]
+    return d,(d is not None and dirs==[d,d]),m,s
+def bounds(now,mins):
+    x=now.astimezone(TZ)
+    if mins==60:a=x.replace(minute=0,second=0,microsecond=0);return a,a+timedelta(hours=1)
+    a=x.replace(minute=(x.minute//mins)*mins,second=0,microsecond=0);return a,a+timedelta(minutes=mins)
+def slug(tf,start):
+    if tf!="1h":return f"btc-updown-{tf}-{int(start.astimezone(UTC).timestamp())}"
+    e=start.astimezone(ET); return f"bitcoin-up-or-down-{e.strftime('%B').lower()}-{e.day}-{e.year}-{e.strftime('%I').lstrip('0')}{e.strftime('%p').lower()}-et"
+def event(sl):
+    try:return get(GAMMA+"/events/slug/"+sl)
+    except:return None
+def market(ev):
+    if not ev:return None
+    for m in ev.get("markets",[]) or [ev]:
+        o=js(m.get("outcomes")); t=js(m.get("clobTokenIds"))
+        if len(o)!=len(t):continue
+        z={str(a).upper():str(b) for a,b in zip(o,t)}
+        up=z.get("UP") or z.get("YES"); dn=z.get("DOWN") or z.get("NO")
+        if up and dn:return {"up":up,"down":dn,"closed":bool(m.get("closed")),"outcomes":o,"prices":js(m.get("outcomePrices"))}
+def winner(sl):
+    m=market(event(sl))
+    if not m or not m["closed"] or len(m["outcomes"])!=len(m["prices"]):return None
+    z=[]
+    for o,p in zip(m["outcomes"],m["prices"]):
+        try:z.append((D(p),str(o).upper()))
+        except:pass
+    if not z:return None
+    p,o=max(z)
+    if p<D(".95"):return None
+    return "UP" if o in ("UP","YES") else "DOWN" if o in ("DOWN","NO") else None
+def allowed(st,now):
+    return st["session"]=="24h" or 10<=now.astimezone(TZ).hour<16
+def amount(st):return min(BASE*(D(2)**int(st["loss_streak"])),MAX)
 
-    return requests, Account, ClobClient
-
-
-requests, Account, ClobClient = import_dependencies()
-
-# ============================================================
-# 4. LOG
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(
-            LOG_FILE,
-            encoding="utf-8"
-        ),
-    ],
-)
-
-log = logging.getLogger("POLYMARKET-BOT")
-
-# ============================================================
-# 5. ESTADO
-# ============================================================
-
-def load_state():
-
-    if not STATE_FILE.exists():
-
-        return {
-            "started_at": None,
-            "last_scan": None,
-            "markets_found": 0,
-            "last_market": None,
-            "last_error": None,
-        }
-
-    try:
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            return json.load(f)
-
-    except Exception as e:
-
-        log.warning(
-            "Não foi possível carregar state.json: %s",
-            e,
-        )
-
-        return {
-            "started_at": None,
-            "last_scan": None,
-            "markets_found": 0,
-            "last_market": None,
-            "last_error": str(e),
-        }
-
-
-def save_state(state):
-
-    temp = STATE_FILE.with_suffix(".tmp")
-
-    try:
-
-        with open(
-            temp,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            json.dump(
-                state,
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-
-        temp.replace(STATE_FILE)
-
-    except Exception as e:
-
-        log.error(
-            "Erro salvando state.json: %s",
-            e,
-        )
-
-
-def record_trade(data):
-
-    try:
-
-        with open(
-            TRADES_FILE,
-            "a",
-            encoding="utf-8"
-        ) as f:
-
-            f.write(
-                json.dumps(
-                    data,
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-
-    except Exception as e:
-
-        log.error(
-            "Erro salvando trades.jsonl: %s",
-            e,
-        )
-
-# ============================================================
-# 6. CLOB
-# ============================================================
-
-class PolymarketBot:
-
+class Bot:
     def __init__(self):
-
-        self.state = load_state()
-
-        self.state["started_at"] = (
-            datetime.now(timezone.utc)
-            .isoformat()
-        )
-
-        if not PRIVATE_KEY:
-
-            raise RuntimeError(
-                "PRIVATE_KEY não está configurada "
-                "nas Variables do Railway."
-            )
-
-        self.signer = Account.from_key(
-            PRIVATE_KEY
-        )
-
-        self.signer_address = (
-            self.signer.address
-        )
-
-        log.info(
-            "Signer: %s",
-            self.signer_address,
-        )
-
-        log.info(
-            "Inicializando CLOB..."
-        )
-
-        try:
-
-            self.client = ClobClient(
-                host=HOST,
-                chain_id=CHAIN_ID,
-                key=PRIVATE_KEY,
-            )
-
-        except TypeError:
-
-            self.client = ClobClient(
-                host=HOST,
-                chain_id=CHAIN_ID,
-                key=PRIVATE_KEY,
-            )
-
-        log.info(
-            "Obtendo credenciais CLOB..."
-        )
-
-        try:
-
-            creds = (
-                self.client
-                .create_or_derive_api_key()
-            )
-
-            self.client = ClobClient(
-                host=HOST,
-                chain_id=CHAIN_ID,
-                key=PRIVATE_KEY,
-                creds=creds,
-            )
-
-            log.info(
-                "CLOB autenticado."
-            )
-
+        self.s=load(); self.c=None
+        if LIVE:
+            if not PK or not WALLET:raise RuntimeError("Configure PRIVATE_KEY e POLYMARKET_DEPOSIT_WALLET")
+            self.c=SecureClient.create(private_key=PK,wallet=WALLET)
+            log.info("REAL | signer=%s wallet=%s type=%s",self.c.signer,self.c.wallet,self.c.wallet_type)
+        else:log.info("SIMULACAO")
+    def resolve(self,st):
+        p=st.get("pending")
+        if not p:return
+        w=winner(p["slug"])
+        if not w:return
+        ok=w==p["direction"]; st["trades"]+=1
+        if ok:st["wins"]+=1;st["loss_streak"]=0
+        else:st["losses"]+=1;st["loss_streak"]+=1
+        audit({"type":"resolution","strategy":st["name"],"slug":p["slug"],"winner":w,"signal":p["direction"],"win":ok,"ts":datetime.now(UTC).isoformat()})
+        st["pending"]=None;save(self.s)
+        log.info("%s | %s | %s",st["name"],w,"WIN" if ok else "LOSS")
+    def buy(self,token,usd):
+        if not LIVE:return {"simulation":True,"token":token,"amount":str(usd)}
+        return self.c.place_market_order(token_id=token,side="BUY",amount=usd,order_type="FAK")
+    def enter(self,st,start,d):
+        sl=slug(st["tf"],start); m=market(event(sl))
+        if not m:log.warning("%s | mercado nao encontrado %s",st["name"],sl);return
+        b=amount(st); da=b+EXTRA; oa=b
+        if da+oa>D(st["bankroll"]):log.warning("%s | entrada > bankroll logico",st["name"]);return
+        if D(st["bankroll"])>=TARGET:return
+        dt=m["up"] if d=="UP" else m["down"]; ot=m["down"] if d=="UP" else m["up"]
+        log.info("%s | %s | DIR $%s + OPP $%s | %s",st["name"],d,da,oa,sl)
+        r1=self.buy(dt,da)
+        try:r2=self.buy(ot,oa)
         except Exception as e:
-
-            log.warning(
-                "Falha na criação/derivação "
-                "da API key: %s",
-                e,
-            )
-
-            log.info(
-                "Tentando continuar com "
-                "cliente CLOB inicial."
-            )
-
-    # ========================================================
-    # CONEXÃO
-    # ========================================================
-
-    def test_connection(self):
-
-        try:
-
-            response = requests.get(
-                HOST + "/time",
-                timeout=15,
-            )
-
-            response.raise_for_status()
-
-            log.info(
-                "CLOB online. Server time: %s",
-                response.text,
-            )
-
-            return True
-
-        except Exception as e:
-
-            log.error(
-                "Falha CLOB: %s",
-                e,
-            )
-
-            return False
-
-    # ========================================================
-    # GAMMA
-    # ========================================================
-
-    def get_markets_page(
-        self,
-        offset=0,
-        limit=100,
-    ):
-
-        params = {
-            "active": "true",
-            "closed": "false",
-            "limit": limit,
-            "offset": offset,
-        }
-
-        response = requests.get(
-            GAMMA_HOST + "/markets",
-            params=params,
-            timeout=20,
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if isinstance(data, dict):
-
-            markets = (
-                data.get("data")
-                or data.get("markets")
-                or []
-            )
-
-        elif isinstance(data, list):
-
-            markets = data
-
-        else:
-
-            markets = []
-
-        return markets
-
-    # ========================================================
-    # BUSCA BTC
-    # ========================================================
-
-    def find_btc_markets(self):
-
-        found = []
-
-        # Gamma rejeitou offset 2100 anteriormente.
-        # Portanto trabalhamos em páginas menores.
-
-        offsets = range(0, 2100, 100)
-
-        for offset in offsets:
-
-            try:
-
-                markets = self.get_markets_page(
-                    offset=offset,
-                    limit=100,
-                )
-
-            except requests.HTTPError as e:
-
-                log.warning(
-                    "Gamma rejeitou offset=%s: %s",
-                    offset,
-                    e,
-                )
-
-                break
-
-            except Exception as e:
-
-                log.warning(
-                    "Erro Gamma offset=%s: %s",
-                    offset,
-                    e,
-                )
-
-                break
-
-            if not markets:
-
-                break
-
-            for market in markets:
-
-                text = " ".join(
-                    str(
-                        market.get(field, "")
-                    )
-                    for field in (
-                        "question",
-                        "title",
-                        "slug",
-                        "description",
-                    )
-                ).lower()
-
-                if (
-                    "bitcoin" in text
-                    or "btc" in text
-                ):
-
-                    found.append(
-                        market
-                    )
-
-        return found
-
-    # ========================================================
-    # FILTRO BTC CURTO
-    # ========================================================
-
-    @staticmethod
-    def is_short_btc_market(market):
-
-        text = " ".join(
-            str(
-                market.get(field, "")
-            )
-            for field in (
-                "question",
-                "title",
-                "slug",
-                "description",
-            )
-        ).lower()
-
-        short_terms = [
-            "5m",
-            "5-min",
-            "5 min",
-            "5 minute",
-            "5 minutes",
-            "15m",
-            "15-min",
-            "15 min",
-            "15 minute",
-            "15 minutes",
-            "1h",
-            "1-hour",
-            "1 hour",
-            "hourly",
-        ]
-
-        return any(
-            term in text
-            for term in short_terms
-        )
-
-    # ========================================================
-    # INSPEÇÃO DOS MERCADOS
-    # ========================================================
-
-    def scan(self):
-
-        log.info(
-            "Buscando mercados BTC..."
-        )
-
-        markets = (
-            self.find_btc_markets()
-        )
-
-        self.state[
-            "markets_found"
-        ] = len(markets)
-
-        self.state[
-            "last_scan"
-        ] = datetime.now(
-            timezone.utc
-        ).isoformat()
-
-        if not markets:
-
-            log.warning(
-                "Nenhum mercado BTC encontrado "
-                "na busca atual."
-            )
-
-            save_state(self.state)
-
-            return []
-
-        log.info(
-            "Mercados BTC encontrados: %s",
-            len(markets),
-        )
-
-        short_markets = [
-            m
-            for m in markets
-            if self.is_short_btc_market(m)
-        ]
-
-        if short_markets:
-
-            log.info(
-                "Mercados BTC de curto prazo: %s",
-                len(short_markets),
-            )
-
-        for market in (
-            short_markets[:10]
-            if short_markets
-            else markets[:10]
-        ):
-
-            question = (
-                market.get("question")
-                or market.get("title")
-                or "Sem título"
-            )
-
-            slug = market.get(
-                "slug",
-                "",
-            )
-
-            end = (
-                market.get("endDate")
-                or market.get("endDateIso")
-            )
-
-            tokens = (
-                market.get("clobTokenIds")
-                or market.get("clob_token_ids")
-            )
-
-            log.info(
-                "BTC | %s",
-                question,
-            )
-
-            log.info(
-                "SLUG | %s",
-                slug,
-            )
-
-            log.info(
-                "END | %s",
-                end,
-            )
-
-            log.info(
-                "TOKENS | %s",
-                tokens,
-            )
-
-            self.state[
-                "last_market"
-            ] = {
-                "question": question,
-                "slug": slug,
-                "end": end,
-                "tokens": tokens,
-            }
-
-        save_state(self.state)
-
-        return short_markets or markets
-
-    # ========================================================
-    # LOOP
-    # ========================================================
-
+            audit({"type":"PAIR_ERROR","strategy":st["name"],"slug":sl,"first":str(r1),"error":repr(e),"ts":datetime.now(UTC).isoformat()});raise
+        st["pending"]={"slug":sl,"direction":d,"directional_amount":str(da),"opposite_amount":str(oa),"live":LIVE}
+        audit({"type":"entry","strategy":st["name"],"slug":sl,"direction":d,"r1":str(r1),"r2":str(r2),"live":LIVE,"ts":datetime.now(UTC).isoformat()});save(self.s)
+    def tick(self,st,now):
+        self.resolve(st)
+        if st.get("pending") or not allowed(st,now):return
+        start,nxt=bounds(now,TFS[st["tf"]]); sec=(nxt-now.astimezone(TZ)).total_seconds()
+        if not ENTRY-1.2<=sec<=ENTRY+.8:return
+        key=nxt.astimezone(UTC).isoformat()
+        if st["last_trigger"]==key:return
+        st["last_trigger"]=key;save(self.s)
+        d,two,m,s=signal(st["tf"])
+        if not d:log.info("%s | sem sinal MACD",st["name"]);return
+        if st["loss_streak"] and not two:log.info("%s | aguardando 2 velas %s",st["name"],d);return
+        self.enter(st,start,d)
     def run(self):
+        log.info("POLYMARKET BTC V4 | LIVE=%s | 6 estrategias | MACD 7/21/9 | T-%ss",LIVE,ENTRY)
+        hb=0
+        while not STOP:
+            now=datetime.now(UTC)
+            for st in self.s["strategies"].values():
+                try:self.tick(st,now)
+                except Exception as e:log.exception("%s | %s",st["name"],e)
+            if time.time()-hb>30:log.info("HEARTBEAT | LIVE=%s",LIVE);hb=time.time()
+            time.sleep(POLL)
+    def close(self):
+        if self.c:self.c.close()
 
-        log.info(
-            "=========================================="
-        )
-
-        log.info(
-            "POLYMARKET BTC BOT"
-        )
-
-        log.info(
-            "LIVE_TRADING: %s",
-            LIVE_TRADING,
-        )
-
-        log.info(
-            "Signer: %s",
-            self.signer_address,
-        )
-
-        log.info(
-            "=========================================="
-        )
-
-        if LIVE_TRADING:
-
-            log.warning(
-                "!!! LIVE TRADING ATIVADO !!!"
-            )
-
-        else:
-
-            log.info(
-                "MODO MONITORAMENTO: "
-                "nenhuma ordem será enviada."
-            )
-
-        if not self.test_connection():
-
-            raise RuntimeError(
-                "CLOB indisponível."
-            )
-
-        log.info(
-            "Loop iniciado."
-        )
-
-        while True:
-
-            try:
-
-                now = datetime.now(
-                    timezone.utc
-                )
-
-                log.info(
-                    "Bot ativo | UTC %s",
-                    now.strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
-                )
-
-                markets = self.scan()
-
-                log.info(
-                    "Scan concluído | BTC=%s",
-                    len(markets),
-                )
-
-                time.sleep(
-                    POLL_SECONDS
-                )
-
-            except KeyboardInterrupt:
-
-                log.info(
-                    "Interrompido pelo usuário."
-                )
-
-                break
-
-            except Exception as e:
-
-                log.exception(
-                    "Erro no ciclo: %s",
-                    e,
-                )
-
-                self.state[
-                    "last_error"
-                ] = str(e)
-
-                save_state(
-                    self.state
-                )
-
-                time.sleep(
-                    POLL_SECONDS
-                )
-
-# ============================================================
-# 7. SHUTDOWN
-# ============================================================
-
-BOT = None
-
-
-def shutdown(
-    signum,
-    frame,
-):
-
-    log.info(
-        "Sinal recebido. Encerrando..."
-    )
-
-    if BOT is not None:
-
-        try:
-            save_state(
-                BOT.state
-            )
-        except Exception:
-            pass
-
-    raise SystemExit(0)
-
-
-signal.signal(
-    signal.SIGTERM,
-    shutdown,
-)
-
-signal.signal(
-    signal.SIGINT,
-    shutdown,
-)
-
-# ============================================================
-# 8. MAIN
-# ============================================================
-
-if __name__ == "__main__":
-
-    try:
-
-        BOT = PolymarketBot()
-
-        BOT.run()
-
-    except Exception as e:
-
-        log.exception(
-            "BOT NÃO INICIADO: %s",
-            e,
-        )
-
-        sys.exit(1)
+def stop(*_):
+    global STOP;STOP=True
+signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
+if __name__=="__main__":
+    b=Bot()
+    try:b.run()
+    finally:b.close()
