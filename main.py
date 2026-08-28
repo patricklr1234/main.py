@@ -3,6 +3,7 @@ import os,sys,json,time,signal as signal_module,logging,subprocess
 from decimal import Decimal
 from datetime import datetime,timedelta,timezone
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, wait
 from zoneinfo import ZoneInfo
 from urllib.request import Request,urlopen
 from urllib.parse import urlencode
@@ -21,9 +22,9 @@ GAMMA="https://gamma-api.polymarket.com"; BINANCE="https://api.binance.com"
 PK=os.getenv("PRIVATE_KEY","").strip()
 WALLET=os.getenv("POLYMARKET_DEPOSIT_WALLET","").strip()
 LIVE=os.getenv("LIVE_TRADING","0").lower() in ("1","true","yes","on")
-INITIAL=Decimal(os.getenv("INITIAL_BANKROLL","15"))
-BASE=Decimal(os.getenv("BASE_ENTRY","0.10"))
-EXTRA=Decimal(os.getenv("DIRECTIONAL_EXTRA","0.25"))
+INITIAL=Decimal(os.getenv("INITIAL_BANKROLL","12.00"))
+BASE=Decimal(os.getenv("BASE_ENTRY","5.00"))
+EXTRA=Decimal(os.getenv("DIRECTIONAL_EXTRA","0.10"))
 MAX=Decimal(os.getenv("MAX_ENTRY","1000"))
 TARGET=Decimal(os.getenv("TARGET_BANKROLL","200000"))
 ENTRY=int(os.getenv("ENTRY_SECONDS","15")); POLL=float(os.getenv("POLL_SECONDS","0.5"))
@@ -45,7 +46,7 @@ def js(x):
         except:return [x]
     return []
 def fresh():
-    s={"version":4,"strategies":{}}
+    s={"version":6,"strategies":{}}
     for tf in TFS:
         for ses in ("24h","day"):
             n=f"{tf}_{ses}"
@@ -142,11 +143,29 @@ class Bot:
             log.error("%s | ORDEM BLOQUEADA: stake DIR $%s / OPP $%s abaixo do minimo do mercado %s. Nenhum dinheiro enviado.",st["name"],da,oa,min_order)
             audit({"type":"blocked_min_order","strategy":st["name"],"slug":sl,"directional_amount":str(da),"opposite_amount":str(oa),"minimum_order_size":str(min_order),"ts":datetime.now(UTC).isoformat()})
             return
-        log.info("%s | %s | DIR $%s + OPP $%s | %s",st["name"],d,da,oa,sl)
-        r1=self.buy(dt,da)
-        try:r2=self.buy(ot,oa)
-        except Exception as e:
-            audit({"type":"PAIR_ERROR","strategy":st["name"],"slug":sl,"first":str(r1),"error":repr(e),"ts":datetime.now(UTC).isoformat()});raise
+        log.info("%s | %s | PAR SIMULTANEO: DIR $%s + OPP $%s | %s",st["name"],d,da,oa,sl)
+        if not LIVE:
+            r1=self.buy(dt,da); r2=self.buy(ot,oa)
+        else:
+            # Dispara as duas BUYs de outcomes opostos em paralelo.
+            # Na Polymarket, comprar UP e DOWN é a forma correta de obter exposição nos dois lados;
+            # uma SELL exige possuir shares daquele outcome previamente.
+            with ThreadPoolExecutor(max_workers=2,thread_name_prefix="pair") as ex:
+                f_dir=ex.submit(self.buy,dt,da)
+                f_opp=ex.submit(self.buy,ot,oa)
+                wait([f_dir,f_opp])
+                e1=f_dir.exception(); e2=f_opp.exception()
+                r1=None if e1 else f_dir.result()
+                r2=None if e2 else f_opp.result()
+                if e1 or e2:
+                    audit({"type":"PAIR_ERROR","strategy":st["name"],"slug":sl,
+                           "directional_result":str(r1),"opposite_result":str(r2),
+                           "directional_error":repr(e1) if e1 else None,
+                           "opposite_error":repr(e2) if e2 else None,
+                           "ts":datetime.now(UTC).isoformat()})
+                    log.error("%s | PAR INCOMPLETO | DIR erro=%s | OPP erro=%s",st["name"],e1,e2)
+                    # Não cria pending silenciosamente: registra a falha para intervenção/controle.
+                    return
         st["pending"]={"slug":sl,"direction":d,"directional_amount":str(da),"opposite_amount":str(oa),"live":LIVE}
         audit({"type":"entry","strategy":st["name"],"slug":sl,"direction":d,"r1":str(r1),"r2":str(r2),"live":LIVE,"ts":datetime.now(UTC).isoformat()});save(self.s)
     def tick(self,st,now):
@@ -162,7 +181,7 @@ class Bot:
         if st["loss_streak"] and not two:log.info("%s | aguardando 2 velas %s",st["name"],d);return
         self.enter(st,start,d)
     def run(self):
-        log.info("POLYMARKET BTC V4.1 | LIVE=%s | 6 estrategias | MACD 7/21/9 | T-%ss | DATA=%s",LIVE,ENTRY,ROOT)
+        log.info("POLYMARKET BTC V6 FINAL | LIVE=%s | 6 estrategias | MACD 7/21/9 | T-%ss | DATA=%s",LIVE,ENTRY,ROOT)
         hb=0
         while not STOP:
             now=datetime.now(UTC)
