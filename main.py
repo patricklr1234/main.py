@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os,sys,json,time,signal,logging,subprocess
+import os,sys,json,time,signal as signal_module,logging,subprocess
 from decimal import Decimal
 from datetime import datetime,timedelta,timezone
 from pathlib import Path
@@ -65,7 +65,7 @@ def ema(v,n):
     k=2/(n+1); e=float(v[0]); out=[]
     for x in v:e=float(x)*k+e*(1-k);out.append(e)
     return out
-def signal(tf):
+def trading_signal(tf):
     rows=get(BINANCE+"/api/v3/klines",{"symbol":"BTCUSDT","interval":tf,"limit":120})
     now=int(time.time()*1000); c=[r for r in rows if int(r[6])<now]
     close=[float(r[4]) for r in c]; fast=ema(close,7); slow=ema(close,21)
@@ -150,7 +150,7 @@ class Bot:
         key=nxt.astimezone(UTC).isoformat()
         if st["last_trigger"]==key:return
         st["last_trigger"]=key;save(self.s)
-        d,two,m,s=signal(st["tf"])
+        d,two,m,s=trading_signal(st["tf"])
         if not d:log.info("%s | sem sinal MACD",st["name"]);return
         if st["loss_streak"] and not two:log.info("%s | aguardando 2 velas %s",st["name"],d);return
         self.enter(st,start,d)
@@ -169,7 +169,7 @@ class Bot:
 
 def stop(*_):
     global STOP;STOP=True
-signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
+signal_module.signal(signal_module.SIGTERM,stop);signal_module.signal(signal_module.SIGINT,stop)
 if __name__=="__main__":
     b=Bot()
     try:b.run()
