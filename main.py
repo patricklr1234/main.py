@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V19 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
+# POLYMARKET BTC V20 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -41,7 +41,7 @@ from urllib.parse import urlencode
 # SIZING
 #   - caixa inicial independente: US$12
 #   - lado oposto: minimum_order_size do mercado (EM SHARES)
-#   - diferencial direcional inicial: US$0.10
+#   - diferencial direcional inicial: US$0.25
 #   - lucro acumulado > US$5:
 #         diferencial = 1% do bankroll, arredondado para cima ao centavo
 #   - bankroll > US$1000:
@@ -56,6 +56,13 @@ from urllib.parse import urlencode
 #   - cada saque reduz proporcionalmente os 6 bankrolls logicos
 #   - trades, fills, ordens abertas, splits, merges e redeems NAO contam como saque
 #   - eventos ja processados sao persistidos para nunca descontar duas vezes
+#
+# RESGATE AUTOMATICO V20
+#   - quando a rodada resolve e ha shares vencedoras, enfileira condition_id
+#   - chama SecureClient.redeem_positions(condition_id=...) via credencial gasless
+#   - espera a transacao e registra sucesso
+#   - em falha temporaria, mantem fila persistente e tenta novamente
+#   - evita resgate duplicado do mesmo condition_id
 # ============================================================
 
 
@@ -114,7 +121,7 @@ BUILDER_SECRET = os.getenv("POLYMARKET_BUILDER_SECRET", "").strip()
 BUILDER_PASSPHRASE = os.getenv("POLYMARKET_BUILDER_PASSPHRASE", "").strip()
 
 INITIAL = Decimal(os.getenv("INITIAL_BANKROLL", "12.00"))
-INITIAL_EDGE = Decimal(os.getenv("INITIAL_EDGE", "0.10"))
+INITIAL_EDGE = Decimal("0.25")  # FIXO V20: diferencial inicial de US$0.25
 PROFIT_SWITCH = Decimal(os.getenv("PROFIT_SWITCH", "5.00"))
 HIGH_BANKROLL_EDGE = Decimal(os.getenv("HIGH_BANKROLL_EDGE", "10.00"))
 MAX_ENTRY = Decimal(os.getenv("MAX_ENTRY", "1000.00"))
@@ -187,7 +194,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 19,
+        "version": 20,
         "strategies": {},
         "capital_reconciliation": {
             "initialized": False,
@@ -196,6 +203,11 @@ def fresh():
             "processed_withdrawals": [],
             "total_withdrawn_applied": "0",
             "last_withdrawal": None,
+        },
+        "redemption_reconciliation": {
+            "processed_condition_ids": [],
+            "queue": [],
+            "last_redeem": None,
         },
     }
     for tf in TFS:
@@ -273,7 +285,26 @@ def load():
                 if field in tracker:
                     dst_tracker[field] = tracker[field]
 
-        new["version"] = 16
+        redemption = old.get("redemption_reconciliation")
+        if isinstance(redemption, dict):
+            dst_redemption = new["redemption_reconciliation"]
+            for field in ("processed_condition_ids", "queue", "last_redeem"):
+                if field in redemption:
+                    dst_redemption[field] = redemption[field]
+
+        # Migracao V20: estados antigos podiam ter congelado a base inicial em
+        # US$0.10. Na faixa inicial (lucro <= US$5), converte essa base antiga
+        # para US$0.25, inclusive se ja houver loss_streak em andamento.
+        for st in new["strategies"].values():
+            try:
+                frozen = st.get("martingale_base_edge")
+                profit = D(st["bankroll"]) - INITIAL
+                if frozen not in (None, "", "None") and D(frozen) == D("0.10") and profit <= PROFIT_SWITCH:
+                    st["martingale_base_edge"] = str(INITIAL_EDGE)
+            except Exception:
+                pass
+
+        new["version"] = 20
         save(new)
         return new
     except Exception:
@@ -494,7 +525,7 @@ def sizing(st, min_shares, limit_price):
     O lado oposto usa exatamente o minimo de shares do mercado.
     O diferencial do lado direcional e definido em USDC.
 
-    MARTINGALE V19:
+    MARTINGALE V20:
     - a base e calculada apenas no inicio de uma sequencia;
     - essa base fica CONGELADA durante todas as perdas do ciclo;
     - o multiplicador 2**loss_streak e aplicado sobre a base congelada;
@@ -650,12 +681,180 @@ class Bot:
             log.info("SIMULACAO")
 
         self.last_withdrawal_sync = 0.0
+        self.last_redemption_sync = 0.0
         self.last_balance_sync = 0.0
         self.last_balance_snapshot = None
         self.initialize_withdrawal_tracker()
 
         if LIVE:
             self.sync_balance(force=True)
+
+    # -------------------- AUTOMATIC POSITION REDEMPTION --------------------
+
+    def enqueue_redemption(self, pending, winning_shares):
+        """Persist a resolved winning condition for gasless redemption.
+
+        Logical PnL accounting is independent from the on-chain redemption.  The
+        queue prevents a temporary relayer/market-finalization error from losing
+        the redemption request when the strategy moves on to its next round.
+        """
+        if not LIVE or D(winning_shares) <= 0:
+            return
+
+        rec = self.s.setdefault("redemption_reconciliation", {
+            "processed_condition_ids": [], "queue": [], "last_redeem": None
+        })
+        processed = {str(x) for x in rec.get("processed_condition_ids", [])}
+        queue = rec.setdefault("queue", [])
+
+        condition_id = str(pending.get("condition_id") or "").strip()
+        slug = str(pending.get("slug") or "").strip()
+
+        if not condition_id and slug:
+            try:
+                mm = market(event(slug))
+                if mm:
+                    condition_id = str(mm.get("condition_id") or "").strip()
+            except Exception:
+                condition_id = ""
+
+        if condition_id and condition_id in processed:
+            return
+        if any(
+            (condition_id and str(item.get("condition_id") or "") == condition_id)
+            or (not condition_id and slug and str(item.get("slug") or "") == slug)
+            for item in queue if isinstance(item, dict)
+        ):
+            return
+
+        queue.append({
+            "condition_id": condition_id,
+            "slug": slug,
+            "winning_shares": str(winning_shares),
+            "attempts": 0,
+            "next_try_epoch": 0,
+            "queued_at": datetime.now(UTC).isoformat(),
+        })
+        save(self.s)
+        log.info(
+            "RESGATE | ENFILEIRADO | condition_id=%s | slug=%s | winning_shares=%s",
+            condition_id or "PENDENTE",
+            slug,
+            winning_shares,
+        )
+
+    def process_redemptions(self, force=False):
+        """Redeem resolved winning positions through the official gasless SDK.
+
+        redeem_positions(condition_id=...) redeems the wallet's redeemable
+        position for that market condition.  Failures stay persisted and are
+        retried; a successful condition is never intentionally submitted twice.
+        """
+        if not LIVE or not self.c:
+            return
+
+        now_mono = time.monotonic()
+        if not force and now_mono - self.last_redemption_sync < 5.0:
+            return
+        self.last_redemption_sync = now_mono
+
+        rec = self.s.setdefault("redemption_reconciliation", {
+            "processed_condition_ids": [], "queue": [], "last_redeem": None
+        })
+        processed = {str(x) for x in rec.get("processed_condition_ids", [])}
+        queue = rec.setdefault("queue", [])
+        if not queue:
+            return
+
+        changed = False
+        now_epoch = time.time()
+        kept = []
+
+        # Processa no maximo 3 por passagem para nao atrasar o loop de trading.
+        processed_now = 0
+        for item in list(queue):
+            if not isinstance(item, dict):
+                changed = True
+                continue
+            if processed_now >= 3:
+                kept.append(item)
+                continue
+            if float(item.get("next_try_epoch") or 0) > now_epoch:
+                kept.append(item)
+                continue
+
+            condition_id = str(item.get("condition_id") or "").strip()
+            slug = str(item.get("slug") or "").strip()
+
+            if not condition_id and slug:
+                try:
+                    mm = market(event(slug))
+                    if mm:
+                        condition_id = str(mm.get("condition_id") or "").strip()
+                        item["condition_id"] = condition_id
+                        changed = True
+                except Exception:
+                    pass
+
+            if not condition_id:
+                item["attempts"] = int(item.get("attempts") or 0) + 1
+                item["next_try_epoch"] = now_epoch + 15
+                kept.append(item)
+                changed = True
+                log.warning("RESGATE | condition_id ainda indisponivel | slug=%s", slug)
+                continue
+
+            if condition_id in processed:
+                changed = True
+                continue
+
+            processed_now += 1
+            try:
+                handle = self.c.redeem_positions(condition_id=condition_id)
+                outcome = handle.wait()
+                processed.add(condition_id)
+                rec["last_redeem"] = {
+                    "condition_id": condition_id,
+                    "slug": slug,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "outcome": str(outcome),
+                }
+                audit({
+                    "type": "automatic_redeem",
+                    "condition_id": condition_id,
+                    "slug": slug,
+                    "winning_shares": str(item.get("winning_shares") or "0"),
+                    "outcome": str(outcome),
+                    "ts": datetime.now(UTC).isoformat(),
+                })
+                log.info(
+                    "RESGATE AUTOMATICO OK | condition_id=%s | slug=%s | outcome=%s",
+                    condition_id,
+                    slug,
+                    outcome,
+                )
+                changed = True
+            except Exception as exc:
+                item["attempts"] = int(item.get("attempts") or 0) + 1
+                # Backoff curto, limitado a 60s: mercados podem estar resolvidos
+                # na Gamma antes de o redeem on-chain ficar imediatamente pronto.
+                delay = min(60, 5 * max(1, item["attempts"]))
+                item["next_try_epoch"] = now_epoch + delay
+                item["last_error"] = repr(exc)
+                kept.append(item)
+                changed = True
+                log.warning(
+                    "RESGATE AUTOMATICO PENDENTE | condition_id=%s | tentativa=%s | retry=%ss | erro=%r",
+                    condition_id,
+                    item["attempts"],
+                    delay,
+                    exc,
+                )
+
+        if changed:
+            rec["processed_condition_ids"] = list(processed)[-5000:]
+            rec["queue"] = kept
+            save(self.s)
 
     # -------------------- REAL WALLET BALANCE --------------------
 
@@ -1438,6 +1637,7 @@ class Bot:
             "phase": "waiting_both_prices",
             "strategy": st["name"],
             "slug": sl,
+            "condition_id": m.get("condition_id") or "",
             "round_start": round_start.astimezone(UTC).isoformat(),
             "round_end": round_end.astimezone(UTC).isoformat(),
             "direction": direction,
@@ -1873,6 +2073,10 @@ class Bot:
         pnl = winning_shares - dir_spent - opp_spent
         bankroll = D(st["bankroll"]) + pnl
 
+        # O resultado logico e contabilizado imediatamente; se houver shares
+        # vencedoras, o resgate real fica persistido numa fila com retry automatico.
+        self.enqueue_redemption(p, winning_shares)
+
         st["bankroll"] = str(bankroll)
         st["realized_pnl"] = str(D(st.get("realized_pnl", "0")) + pnl)
         st["trades"] += 1
@@ -2002,19 +2206,20 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=18 | ENTRY_SECONDS=%s", ENTRY_SECONDS)
+        log.info("STARTUP OK | codigo carregado | versao=20 | ENTRY_SECONDS=%s | INITIAL_EDGE=%s", ENTRY_SECONDS, INITIAL_EDGE)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V19 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V20 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | SO ENVIA SE AMBOS<=%s ANTES DO INICIO | "
             "PARTIAL=PROPORCIONAL | SE 1 FULL: OUTRO 100%% ATE FINAL | "
-            "SAQUES=AUTO_PROPORCIONAL | BALANCE=MONITORADO | MARTINGALE_BASE=CONGELADA_POR_CICLO | TARGET=%s | DATA=%s",
+            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO | BALANCE=MONITORADO | MARTINGALE_BASE=CONGELADA_POR_CICLO | EDGE_INICIAL=%s | TARGET=%s | DATA=%s",
             LIVE,
             gasless_mode,
             INITIAL,
             ENTRY_SECONDS,
             MAX_BUY_PRICE,
+            INITIAL_EDGE,
             TARGET,
             ROOT,
         )
@@ -2024,12 +2229,14 @@ class Bot:
         # Primeira consulta logo apos o startup; baseline impede desconto retroativo.
         self.sync_withdrawals(force=True)
         self.sync_balance(force=True)
+        self.process_redemptions(force=True)
 
         while not STOP:
             now = datetime.now(UTC)
 
             self.sync_withdrawals()
             self.sync_balance()
+            self.process_redemptions()
 
             for st in self.s["strategies"].values():
                 try:
