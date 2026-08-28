@@ -107,7 +107,16 @@ def winner(sl):
     return "UP" if o in ("UP","YES") else "DOWN" if o in ("DOWN","NO") else None
 def allowed(st,now):
     return st["session"]=="24h" or 10<=now.astimezone(TZ).hour<16
-def amount(st):return min(BASE*(D(2)**int(st["loss_streak"])),MAX)
+def amounts(st):
+    # Martingale somente no diferencial direcional:
+    # loss 0: BASE + EXTRA
+    # loss 1: BASE + EXTRA*2
+    # loss 2: BASE + EXTRA*4 ...
+    # O lado oposto permanece sempre em BASE.
+    extra=min(EXTRA*(D(2)**int(st["loss_streak"])),MAX)
+    opposite=BASE
+    directional=min(BASE+extra,MAX)
+    return directional,opposite
 
 class Bot:
     def __init__(self):
@@ -134,7 +143,7 @@ class Bot:
     def enter(self,st,start,d):
         sl=slug(st["tf"],start); m=market(event(sl))
         if not m:log.warning("%s | mercado nao encontrado %s",st["name"],sl);return
-        b=amount(st); da=b+EXTRA; oa=b
+        da,oa=amounts(st)
         if da+oa>D(st["bankroll"]):log.warning("%s | entrada > bankroll logico",st["name"]);return
         if D(st["bankroll"])>=TARGET:return
         dt=m["up"] if d=="UP" else m["down"]; ot=m["down"] if d=="UP" else m["up"]
@@ -181,7 +190,7 @@ class Bot:
         if st["loss_streak"] and not two:log.info("%s | aguardando 2 velas %s",st["name"],d);return
         self.enter(st,start,d)
     def run(self):
-        log.info("POLYMARKET BTC V6 FINAL | LIVE=%s | 6 estrategias | MACD 7/21/9 | T-%ss | DATA=%s",LIVE,ENTRY,ROOT)
+        log.info("POLYMARKET BTC V7 FINAL MARTINGALE-DIFERENCIAL | LIVE=%s | 6 estrategias | MACD 7/21/9 | T-%ss | DATA=%s",LIVE,ENTRY,ROOT)
         hb=0
         while not STOP:
             now=datetime.now(UTC)
