@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V25 FINAL - RECOVERY DEFICIT + TARGET LIQUIDO + AUTO-REDEEM
+# POLYMARKET BTC V26 FINAL - CAPITAL MINIMO + LIMITES DINAMICOS + RECOVERY DEFICIT + AUTO-REDEEM
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -38,7 +38,7 @@ from urllib.parse import urlencode
 #   - se houve fill unilateral/parcial, ele NAO pode ser "cancelado";
 #     a exposicao executada e registrada e acompanhada ate a resolucao
 #
-# SIZING V25
+# SIZING V26
 #   - caixa inicial independente: US$12
 #   - lado oposto: minimum_order_size do mercado (EM SHARES)
 #   - lucro-base liquido: 5m=US$0.25 | 15m=US$0.50 | 1h=US$0.75
@@ -152,7 +152,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v25")
+log = logging.getLogger("btc-polymarket-v26")
 STOP = False
 
 
@@ -173,6 +173,15 @@ def floor_to_step(value, step):
     return units * step
 
 
+def ceil_to_step(value, step):
+    value = D(value)
+    step = D(step)
+    if step <= 0:
+        return value
+    units = (value / step).to_integral_value(rounding=ROUND_CEILING)
+    return units * step
+
+
 def floor_6(x):
     return D(x).quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
 
@@ -185,7 +194,7 @@ def get(url, params=None):
     if params:
         url += "?" + urlencode(params)
     with urlopen(
-        Request(url, headers={"User-Agent": "btc-polymarket-v25"}),
+        Request(url, headers={"User-Agent": "btc-polymarket-v26"}),
         timeout=12,
     ) as r:
         return json.loads(r.read())
@@ -204,7 +213,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 25,
+        "version": 26,
         "strategies": {},
         "capital_reconciliation": {
             "initialized": False,
@@ -331,7 +340,7 @@ def load():
                     elif pnl > 0:
                         rebuilt[name] = max(D("0"), rebuilt[name] - pnl)
             except Exception:
-                log.exception("MIGRACAO V25 | falha ao reconstruir recovery_deficit pelo audit")
+                log.exception("MIGRACAO V26 | falha ao reconstruir recovery_deficit pelo audit")
 
         for name in needs_rebuild:
             st = new["strategies"][name]
@@ -349,7 +358,7 @@ def load():
             st["recovery_deficit"] = str(max(D("0"), deficit))
             st["martingale_base_edge"] = None
 
-        new["version"] = 25
+        new["version"] = 26
         save(new)
         return new
     except Exception:
@@ -566,7 +575,7 @@ def base_edge(st):
 
 def recovery_target(st):
     """
-    Meta liquida V25.
+    Meta liquida V26.
 
     Sem deficit: lucro-base do timeframe.
     Com deficit: TODO o prejuizo ainda nao recuperado + lucro-base.
@@ -580,69 +589,49 @@ def recovery_target(st):
     return base, deficit, deficit + base
 
 
-def sizing(st, min_shares, limit_price):
+def sizing(st, min_shares, directional_limit_price, opposite_limit_price):
     """
-    Dimensiona a perna direcional para garantir a META LIQUIDA no pior preco
-    permitido, assumindo fill integral das duas pernas.
+    V26: dimensionamento de CAPITAL MINIMO usando os limites reais de cada perna.
 
-    Se qd = shares direcionais, qo = shares opostas e p = limit_price:
-        lucro se direcao vencer = qd - qd*p - qo*p
+    O contrato define o minimo em SHARES (orderMinSize), nao em USD.
+    A perna oposta usa exatamente esse minimo. A perna direcional recebe somente
+    as shares adicionais necessarias para atingir a meta liquida do ciclo.
+
+    Se qd = shares direcionais, qo = shares opostas, pd = limite DIR e
+    po = limite OPP:
+        lucro se a direcao vencer = qd*(1-pd) - qo*po
 
     Logo:
-        qd >= (target + qo*p) / (1-p)
+        qd >= (target + qo*po) / (1-pd)
 
-    Usa ROUND_CEILING em 6 casas para nunca arredondar a meta para baixo.
+    Usar os limites reais, em vez de assumir 0.55 nas duas pernas, reduz o
+    capital ao menor valor compativel com orderMinSize e com a meta liquida.
     """
     min_shares = D(min_shares)
-    limit_price = D(limit_price)
-    if min_shares <= 0 or limit_price <= 0 or limit_price >= 1:
-        raise ValueError("min_shares/limit_price invalidos para sizing")
+    pd = D(directional_limit_price)
+    po = D(opposite_limit_price)
+    if min_shares <= 0 or pd <= 0 or pd >= 1 or po <= 0 or po >= 1:
+        raise ValueError("min_shares/precos invalidos para sizing")
 
     opposite_shares = min_shares
-    opposite_max_spend = opposite_shares * limit_price
+    opposite_max_spend = opposite_shares * po
 
     base, deficit, target = recovery_target(st)
-    directional_shares = ceil_6((target + opposite_max_spend) / (D("1") - limit_price))
+    directional_shares = ceil_6((target + opposite_max_spend) / (D("1") - pd))
     directional_shares = max(directional_shares, min_shares)
 
-    directional_max_spend = directional_shares * limit_price
+    directional_max_spend = directional_shares * pd
     guaranteed_net_at_limit = directional_shares - directional_max_spend - opposite_max_spend
 
+    blocked = None
     if opposite_max_spend > MAX_ENTRY or directional_max_spend > MAX_ENTRY:
-        return {
-            "blocked": True,
-            "reason": "MAX_ENTRY",
-            "base_profit": base,
-            "recovery_deficit": deficit,
-            "target_net_profit": target,
-            "opposite_shares": opposite_shares,
-            "directional_shares": directional_shares,
-            "opposite_max_spend": opposite_max_spend,
-            "directional_max_spend": directional_max_spend,
-            "guaranteed_net_at_limit": guaranteed_net_at_limit,
-            "edge": target,
-            "martingale_base_edge": base,
-        }
-
-    if guaranteed_net_at_limit < target:
-        return {
-            "blocked": True,
-            "reason": "TARGET_NOT_GUARANTEED",
-            "base_profit": base,
-            "recovery_deficit": deficit,
-            "target_net_profit": target,
-            "opposite_shares": opposite_shares,
-            "directional_shares": directional_shares,
-            "opposite_max_spend": opposite_max_spend,
-            "directional_max_spend": directional_max_spend,
-            "guaranteed_net_at_limit": guaranteed_net_at_limit,
-            "edge": target,
-            "martingale_base_edge": base,
-        }
+        blocked = "MAX_ENTRY"
+    elif guaranteed_net_at_limit < target:
+        blocked = "TARGET_NOT_GUARANTEED"
 
     return {
-        "blocked": False,
-        "reason": None,
+        "blocked": bool(blocked),
+        "reason": blocked,
         "base_profit": base,
         "recovery_deficit": deficit,
         "target_net_profit": target,
@@ -653,6 +642,8 @@ def sizing(st, min_shares, limit_price):
         "guaranteed_net_at_limit": guaranteed_net_at_limit,
         "edge": target,
         "martingale_base_edge": base,
+        "directional_limit_price": pd,
+        "opposite_limit_price": po,
     }
 
 
@@ -943,7 +934,7 @@ class Bot:
 
     def process_redemptions(self, force=False):
         """
-        V25/V22: nao envia redeem_positions() manualmente para Deposit Wallet.
+        V26/V22: nao envia redeem_positions() manualmente para Deposit Wallet.
         O operator oficial faz o auto-redeem; esta fila apenas reconcilia a
         posicao ate ela desaparecer. Isso evita o POST /submit que ja se mostrou
         sujeito a revert no relayer.
@@ -1339,7 +1330,7 @@ class Bot:
                 })
                 req = Request(
                     f"https://data-api.polymarket.com/activity?{params}",
-                    headers={"User-Agent": "btc-polymarket-v25"},
+                    headers={"User-Agent": "btc-polymarket-v26"},
                 )
                 with urlopen(req, timeout=15) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -1614,7 +1605,7 @@ class Bot:
 
         resp = self.place_gtc_limit(
             p[f"{leg}_token"],
-            D(p["limit_price"]),
+            D(p.get(f"{leg}_limit_price") or p["limit_price"]),
             shares,
         )
 
@@ -1759,15 +1750,14 @@ class Bot:
             return
 
         prices = m.get("price_map", {})
-        limit_price = D(p["limit_price"])
-
         for leg in ("directional", "opposite"):
             if D(p.get(f"{leg}_shares_filled", "0")) > 0:
                 continue
 
             side = p[f"{leg}_side"]
             px = prices.get(side)
-            if px is None or px > limit_price:
+            leg_limit = D(p.get(f"{leg}_limit_price") or p["limit_price"])
+            if px is None or px > leg_limit:
                 continue
 
             requested = D(p[f"{leg}_shares_requested"])
@@ -1815,34 +1805,15 @@ class Bot:
             )
             return
 
-        limit_price = floor_to_step(MAX_BUY_PRICE, tick)
-        if limit_price <= 0:
+        max_limit_price = floor_to_step(MAX_BUY_PRICE, tick)
+        if max_limit_price <= 0:
             return
 
-        sz = sizing(st, min_shares, limit_price)
-        worst_total = sz["directional_max_spend"] + sz["opposite_max_spend"]
-
-        if sz.get("blocked"):
-            log.warning(
-                "%s | BLOQUEADO V25: sizing impossivel | motivo=%s | base=%s | deficit=%s | target_liquido=%s | dir_spend=%s | opp_spend=%s",
-                st["name"], sz.get("reason"), sz["base_profit"], sz["recovery_deficit"],
-                sz["target_net_profit"], sz["directional_max_spend"], sz["opposite_max_spend"],
-            )
-            return
-
-        if worst_total > D(st["bankroll"]):
-            log.warning(
-                "%s | BLOQUEADO V25: pior gasto %s > bankroll %s | deficit=%s | target_liquido=%s",
-                st["name"], worst_total, st["bankroll"], sz["recovery_deficit"], sz["target_net_profit"],
-            )
-            return
-
+        # V26: o sizing e feito SOMENTE quando ambos os precos estiverem validos.
+        # Assim usamos o menor limite real de cada perna, em vez de dimensionar
+        # conservadoramente como se as duas fossem executar a 0.55.
+        base_profit, recovery_deficit, target_net_profit = recovery_target(st)
         st["martingale_base_edge"] = None
-        log.info(
-            "%s | SIZING V25 | BASE=%s | DEFICIT_RECUPERAR=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=%s | GASTO_MAX=%s | LUCRO_MIN_NO_LIMITE=%s",
-            st["name"], sz["base_profit"], sz["recovery_deficit"], sz["target_net_profit"],
-            sz["directional_shares"], sz["opposite_shares"], worst_total, sz["guaranteed_net_at_limit"],
-        )
 
         directional_token = m["up"] if direction == "UP" else m["down"]
         opposite_token = m["down"] if direction == "UP" else m["up"]
@@ -1864,19 +1835,22 @@ class Bot:
             "opposite_token": opposite_token,
             "directional_order_id": None,
             "opposite_order_id": None,
-            "directional_shares_requested": str(sz["directional_shares"]),
-            "opposite_shares_requested": str(sz["opposite_shares"]),
+            "directional_shares_requested": "0",
+            "opposite_shares_requested": "0",
             "directional_shares_filled": "0",
             "opposite_shares_filled": "0",
             "directional_spent": "0",
             "opposite_spent": "0",
-            "limit_price": str(limit_price),
+            "limit_price": str(max_limit_price),  # teto global de entrada
+            "directional_limit_price": None,
+            "opposite_limit_price": None,
             "minimum_order_shares": str(min_shares),
-            "edge_at_limit": str(sz["edge"]),
-            "base_profit_target": str(sz["base_profit"]),
-            "recovery_deficit_before": str(sz["recovery_deficit"]),
-            "target_net_profit": str(sz["target_net_profit"]),
-            "guaranteed_net_at_limit": str(sz["guaranteed_net_at_limit"]),
+            "tick_size": str(tick),
+            "edge_at_limit": str(target_net_profit),
+            "base_profit_target": str(base_profit),
+            "recovery_deficit_before": str(recovery_deficit),
+            "target_net_profit": str(target_net_profit),
+            "guaranteed_net_at_limit": None,
             "martingale_base_edge": None,
             "signal_locked_at": datetime.now(UTC).isoformat(),
             "live": LIVE,
@@ -1888,7 +1862,7 @@ class Bot:
             "%s | SINAL TRAVADO %s | aguardando AMBOS <= %s ate %s | %s",
             st["name"],
             direction,
-            limit_price,
+            max_limit_price,
             round_start.isoformat(),
             sl,
         )
@@ -1927,13 +1901,13 @@ class Bot:
         prices = m.get("price_map", {})
         dp = prices.get(p["directional_side"])
         op = prices.get(p["opposite_side"])
-        limit_price = D(p["limit_price"])
+        max_limit_price = D(p["limit_price"])
 
         both_ok = (
             dp is not None
             and op is not None
-            and D(dp) <= limit_price
-            and D(op) <= limit_price
+            and D(dp) <= max_limit_price
+            and D(op) <= max_limit_price
         )
 
         if not both_ok:
@@ -1944,19 +1918,56 @@ class Bot:
                     st["name"],
                     dp,
                     op,
-                    limit_price,
+                    max_limit_price,
                 )
                 p["last_wait_log"] = time.time()
                 save(self.s)
             return
 
-        # Somente AQUI as duas ordens sao criadas.
+        # Somente AQUI calculamos o capital e criamos as duas ordens.
+        tick = D(p.get("tick_size") or "0.01")
+        dir_limit = ceil_to_step(D(dp), tick)
+        opp_limit = ceil_to_step(D(op), tick)
+        if dir_limit > max_limit_price or opp_limit > max_limit_price:
+            return
+
+        sz = sizing(st, D(p["minimum_order_shares"]), dir_limit, opp_limit)
+        worst_total = sz["directional_max_spend"] + sz["opposite_max_spend"]
+        if sz.get("blocked"):
+            log.warning(
+                "%s | BLOQUEADO V26 | motivo=%s | DIR_LIMIT=%s | OPP_LIMIT=%s | base=%s | deficit=%s | target=%s",
+                st["name"], sz.get("reason"), dir_limit, opp_limit, sz["base_profit"],
+                sz["recovery_deficit"], sz["target_net_profit"],
+            )
+            st["pending"] = None
+            save(self.s)
+            return
+        if worst_total > D(st["bankroll"]):
+            log.warning(
+                "%s | BLOQUEADO V26: gasto max %s > bankroll %s | deficit=%s | target=%s",
+                st["name"], worst_total, st["bankroll"], sz["recovery_deficit"], sz["target_net_profit"],
+            )
+            st["pending"] = None
+            save(self.s)
+            return
+
+        p["directional_limit_price"] = str(dir_limit)
+        p["opposite_limit_price"] = str(opp_limit)
+        p["directional_shares_requested"] = str(sz["directional_shares"])
+        p["opposite_shares_requested"] = str(sz["opposite_shares"])
+        p["guaranteed_net_at_limit"] = str(sz["guaranteed_net_at_limit"])
+        p["edge_at_limit"] = str(sz["edge"])
+        save(self.s)
+
         log.info(
-            "%s | CONDICAO DE PRECO OK | DIR=%s OPP=%s <= %s | enviando par",
-            st["name"],
-            dp,
-            op,
-            limit_price,
+            "%s | SIZING V26 MIN-CAPITAL | MIN_SHARES=%s | DIR_PX=%s | OPP_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=%s | GASTO_MAX=%s | LUCRO_MIN=%s",
+            st["name"], p["minimum_order_shares"], dir_limit, opp_limit, sz["base_profit"],
+            sz["recovery_deficit"], sz["target_net_profit"], sz["directional_shares"],
+            sz["opposite_shares"], worst_total, sz["guaranteed_net_at_limit"],
+        )
+        log.info(
+            "%s | CONDICAO DE PRECO OK | DIR=%s OPP=%s | limites reais DIR=%s OPP=%s | enviando par",
+            st["name"], dp, op, dir_limit, opp_limit,
         )
 
         r_dir = r_opp = None
@@ -1967,20 +1978,22 @@ class Bot:
         # a Barrier reduz ao minimo a diferenca local entre os dois envios.
         start_barrier = Barrier(3)
 
-        def send_leg(token, shares):
+        def send_leg(token, shares, price):
             start_barrier.wait()
-            return self.place_gtc_limit(token, limit_price, D(shares))
+            return self.place_gtc_limit(token, D(price), D(shares))
 
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-v131") as ex:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-v26") as ex:
             f_dir = ex.submit(
                 send_leg,
                 p["directional_token"],
                 p["directional_shares_requested"],
+                p["directional_limit_price"],
             )
             f_opp = ex.submit(
                 send_leg,
                 p["opposite_token"],
                 p["opposite_shares_requested"],
+                p["opposite_limit_price"],
             )
 
             # Os dois workers ja estao posicionados na barreira; esta liberacao
@@ -2042,7 +2055,9 @@ class Bot:
             "opposite_order_id": p["opposite_order_id"],
             "directional_snapshot_price": str(dp),
             "opposite_snapshot_price": str(op),
-            "limit_price": str(limit_price),
+            "max_limit_price": str(max_limit_price),
+            "directional_limit_price": str(dir_limit),
+            "opposite_limit_price": str(opp_limit),
             "ts": now.isoformat(),
         })
 
@@ -2061,7 +2076,7 @@ class Bot:
             try:
                 resp = self.place_gtc_limit(
                     p[f"{leg}_token"],
-                    D(p["limit_price"]),
+                    D(p.get(f"{leg}_limit_price") or p["limit_price"]),
                     D(p[f"{leg}_shares_requested"]),
                 )
                 oid = order_id_of(resp)
@@ -2213,7 +2228,7 @@ class Bot:
                     st["name"],
                     filled_leg,
                     missing_leg,
-                    p["limit_price"],
+                    p.get(f"{missing_leg}_limit_price") or p["limit_price"],
                 )
                 return
 
@@ -2435,14 +2450,14 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=25 | ENTRY_SECONDS=%s | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=DEFICIT_ACUMULADO+BASE", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H)
+        log.info("STARTUP OK | codigo carregado | versao=26 | ENTRY_SECONDS=%s | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=DEFICIT_ACUMULADO+BASE", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V25 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V26 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | SO ENVIA SE AMBOS<=%s ANTES DO INICIO | "
             "PARTIAL=PROPORCIONAL | SE 1 FULL: OUTRO 100%% ATE FINAL | "
-            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO | MARTINGALE=DEFICIT_ACUMULADO+BASE | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
+            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO | MARTINGALE=DEFICIT_ACUMULADO+BASE | SIZING=MIN_CAPITAL_PRECO_REAL | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
             LIVE,
             gasless_mode,
             INITIAL,
