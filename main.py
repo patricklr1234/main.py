@@ -11,7 +11,7 @@ def sdk():
     try:
         import polymarket
     except ImportError:
-        subprocess.check_call([sys.executable,"-m","pip","install","--no-cache-dir","polymarket-client==0.3.0b1"])
+        subprocess.check_call([sys.executable,"-m","pip","install","--no-cache-dir","--root-user-action=ignore","polymarket-client==0.3.0b1"])
         os.execv(sys.executable,[sys.executable]+sys.argv)
 sdk()
 from polymarket import SecureClient
@@ -28,7 +28,9 @@ MAX=Decimal(os.getenv("MAX_ENTRY","1000"))
 TARGET=Decimal(os.getenv("TARGET_BANKROLL","200000"))
 ENTRY=int(os.getenv("ENTRY_SECONDS","15")); POLL=float(os.getenv("POLL_SECONDS","0.5"))
 TFS={"5m":5,"15m":15,"1h":60}
-ROOT=Path(__file__).resolve().parent; STATE=ROOT/"state.json"; TRADES=ROOT/"trades.jsonl"
+DEFAULT_ROOT=Path("/data") if Path("/data").exists() else Path(__file__).resolve().parent
+ROOT=Path(os.getenv("BOT_DIR",str(DEFAULT_ROOT))).resolve(); ROOT.mkdir(parents=True,exist_ok=True)
+STATE=ROOT/"state.json"; TRADES=ROOT/"trades.jsonl"
 logging.basicConfig(level=logging.INFO,format="%(asctime)s | %(levelname)s | %(message)s",handlers=[logging.StreamHandler(sys.stdout)])
 log=logging.getLogger("bot"); STOP=False
 
@@ -90,7 +92,7 @@ def market(ev):
         if len(o)!=len(t):continue
         z={str(a).upper():str(b) for a,b in zip(o,t)}
         up=z.get("UP") or z.get("YES"); dn=z.get("DOWN") or z.get("NO")
-        if up and dn:return {"up":up,"down":dn,"closed":bool(m.get("closed")),"outcomes":o,"prices":js(m.get("outcomePrices"))}
+        if up and dn:return {"up":up,"down":dn,"closed":bool(m.get("closed")),"outcomes":o,"prices":js(m.get("outcomePrices")),"min_order":D(m.get("orderMinSize") or 0)}
 def winner(sl):
     m=market(event(sl))
     if not m or not m["closed"] or len(m["outcomes"])!=len(m["prices"]):return None
@@ -135,6 +137,11 @@ class Bot:
         if da+oa>D(st["bankroll"]):log.warning("%s | entrada > bankroll logico",st["name"]);return
         if D(st["bankroll"])>=TARGET:return
         dt=m["up"] if d=="UP" else m["down"]; ot=m["down"] if d=="UP" else m["up"]
+        min_order=D(m.get("min_order") or 0)
+        if LIVE and min_order>0 and (da<min_order or oa<min_order):
+            log.error("%s | ORDEM BLOQUEADA: stake DIR $%s / OPP $%s abaixo do minimo do mercado %s. Nenhum dinheiro enviado.",st["name"],da,oa,min_order)
+            audit({"type":"blocked_min_order","strategy":st["name"],"slug":sl,"directional_amount":str(da),"opposite_amount":str(oa),"minimum_order_size":str(min_order),"ts":datetime.now(UTC).isoformat()})
+            return
         log.info("%s | %s | DIR $%s + OPP $%s | %s",st["name"],d,da,oa,sl)
         r1=self.buy(dt,da)
         try:r2=self.buy(ot,oa)
@@ -155,7 +162,7 @@ class Bot:
         if st["loss_streak"] and not two:log.info("%s | aguardando 2 velas %s",st["name"],d);return
         self.enter(st,start,d)
     def run(self):
-        log.info("POLYMARKET BTC V4 | LIVE=%s | 6 estrategias | MACD 7/21/9 | T-%ss",LIVE,ENTRY)
+        log.info("POLYMARKET BTC V4.1 | LIVE=%s | 6 estrategias | MACD 7/21/9 | T-%ss | DATA=%s",LIVE,ENTRY,ROOT)
         hb=0
         while not STOP:
             now=datetime.now(UTC)
