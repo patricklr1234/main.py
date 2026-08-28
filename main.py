@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V21 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
+# POLYMARKET BTC V23 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -41,12 +41,16 @@ from urllib.parse import urlencode
 # SIZING
 #   - caixa inicial independente: US$12
 #   - lado oposto: minimum_order_size do mercado (EM SHARES)
-#   - diferencial direcional inicial: US$0.25
+#   - diferencial direcional inicial por timeframe:
+#         5m  = US$0.25
+#         15m = US$0.50
+#         1h  = US$0.75
 #   - lucro acumulado > US$5:
 #         diferencial = 1% do bankroll, arredondado para cima ao centavo
 #   - bankroll > US$1000:
 #         diferencial-base = US$10
-#   - martingale dobra SOMENTE o diferencial
+#   - apos LOSS financeiro, a proxima vantagem direcional = 2x a PERDA REAL
+#     da operacao anterior; cada nova perda substitui a referencia pelo PNL real
 #   - maximo de US$1000 de gasto teorico por perna
 #   - objetivo: US$200,000 por robo
 #
@@ -57,11 +61,11 @@ from urllib.parse import urlencode
 #   - trades, fills, ordens abertas, splits, merges e redeems NAO contam como saque
 #   - eventos ja processados sao persistidos para nunca descontar duas vezes
 #
-# RESGATE AUTOMATICO V20
+# RESGATE AUTOMATICO V23
 #   - quando a rodada resolve e ha shares vencedoras, enfileira condition_id
-#   - chama SecureClient.redeem_positions(condition_id=...) via credencial gasless
-#   - espera a transacao e registra sucesso
-#   - em falha temporaria, mantem fila persistente e tenta novamente
+#   - garante setup_trading_approvals() para o auto-redeem operator oficial
+#   - NAO forca redeem_positions() via relayer-v2 para Deposit Wallet
+#   - monitora Positions API ate a posicao desaparecer e reconcilia com 2 checks
 #   - evita resgate duplicado do mesmo condition_id
 # ============================================================
 
@@ -121,7 +125,14 @@ BUILDER_SECRET = os.getenv("POLYMARKET_BUILDER_SECRET", "").strip()
 BUILDER_PASSPHRASE = os.getenv("POLYMARKET_BUILDER_PASSPHRASE", "").strip()
 
 INITIAL = Decimal(os.getenv("INITIAL_BANKROLL", "12.00"))
-INITIAL_EDGE = Decimal("0.25")  # FIXO V20: diferencial inicial de US$0.25
+INITIAL_EDGE_5M = Decimal("0.25")
+INITIAL_EDGE_15M = Decimal("0.50")
+INITIAL_EDGE_1H = Decimal("0.75")
+INITIAL_EDGE_BY_TF = {
+    "5m": INITIAL_EDGE_5M,
+    "15m": INITIAL_EDGE_15M,
+    "1h": INITIAL_EDGE_1H,
+}
 PROFIT_SWITCH = Decimal(os.getenv("PROFIT_SWITCH", "5.00"))
 HIGH_BANKROLL_EDGE = Decimal(os.getenv("HIGH_BANKROLL_EDGE", "10.00"))
 MAX_ENTRY = Decimal(os.getenv("MAX_ENTRY", "1000.00"))
@@ -146,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v21")
+log = logging.getLogger("btc-polymarket-v23")
 STOP = False
 
 
@@ -175,7 +186,7 @@ def get(url, params=None):
     if params:
         url += "?" + urlencode(params)
     with urlopen(
-        Request(url, headers={"User-Agent": "btc-polymarket-v21"}),
+        Request(url, headers={"User-Agent": "btc-polymarket-v23"}),
         timeout=12,
     ) as r:
         return json.loads(r.read())
@@ -194,7 +205,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 21,
+        "version": 23,
         "strategies": {},
         "capital_reconciliation": {
             "initialized": False,
@@ -219,7 +230,7 @@ def fresh():
                 "session": session,
                 "bankroll": str(INITIAL),
                 "loss_streak": 0,
-                "martingale_base_edge": None,
+                "martingale_loss_reference": None,
                 "wins": 0,
                 "losses": 0,
                 "trades": 0,
@@ -251,7 +262,7 @@ def load():
             for field in (
                 "bankroll",
                 "loss_streak",
-                "martingale_base_edge",
+                "martingale_loss_reference",
                 "wins",
                 "losses",
                 "trades",
@@ -292,19 +303,26 @@ def load():
                 if field in redemption:
                     dst_redemption[field] = redemption[field]
 
-        # Migracao V20: estados antigos podiam ter congelado a base inicial em
-        # US$0.10. Na faixa inicial (lucro <= US$5), converte essa base antiga
-        # para US$0.25, inclusive se ja houver loss_streak em andamento.
-        for st in new["strategies"].values():
-            try:
-                frozen = st.get("martingale_base_edge")
-                profit = D(st["bankroll"]) - INITIAL
-                if frozen not in (None, "", "None") and D(frozen) == D("0.10") and profit <= PROFIT_SWITCH:
-                    st["martingale_base_edge"] = str(INITIAL_EDGE)
-            except Exception:
-                pass
+        # Migracao V23: o Martingale deixou de usar base congelada e passou a
+        # usar 2x a perda financeira REAL da ultima operacao perdida.
+        # Se vier de V22 com uma sequencia ativa, nao existe no state antigo o
+        # PNL da ultima perda. Nesse caso preservamos aproximadamente o proximo
+        # degrau antigo ate que uma nova LOSS real forneca a referencia exata.
+        for name, st in new["strategies"].items():
+            old_st = old.get("strategies", {}).get(name, {})
+            if st.get("martingale_loss_reference") in (None, "", "None"):
+                old_frozen = old_st.get("martingale_base_edge")
+                try:
+                    ls = int(st.get("loss_streak", 0) or 0)
+                    if ls > 0 and old_frozen not in (None, "", "None"):
+                        estimated_last_loss = D(old_frozen) * (D(2) ** max(0, ls - 1))
+                        st["martingale_loss_reference"] = str(estimated_last_loss)
+                except Exception:
+                    pass
+            if int(st.get("loss_streak", 0) or 0) == 0:
+                st["martingale_loss_reference"] = None
 
-        new["version"] = 21
+        new["version"] = 23
         save(new)
         return new
     except Exception:
@@ -515,7 +533,7 @@ def base_edge(st):
     if profit > PROFIT_SWITCH:
         return ceil_cent(b * D("0.01"))
 
-    return INITIAL_EDGE
+    return INITIAL_EDGE_BY_TF.get(st.get("tf"), INITIAL_EDGE_5M)
 
 
 def sizing(st, min_shares, limit_price):
@@ -525,11 +543,13 @@ def sizing(st, min_shares, limit_price):
     O lado oposto usa exatamente o minimo de shares do mercado.
     O diferencial do lado direcional e definido em USDC.
 
-    MARTINGALE V20:
-    - a base e calculada apenas no inicio de uma sequencia;
-    - essa base fica CONGELADA durante todas as perdas do ciclo;
-    - o multiplicador 2**loss_streak e aplicado sobre a base congelada;
-    - apos uma vitoria, a base e apagada e sera recalculada na proxima entrada.
+    MARTINGALE V23:
+    - sem LOSS financeiro pendente, usa a base do timeframe (ou a regra
+      dinamica de bankroll ja existente);
+    - depois de uma LOSS financeira, a proxima vantagem direcional e
+      exatamente 2x o modulo do PNL real perdido na operacao anterior;
+    - se perder novamente, a nova perda real substitui a referencia;
+    - apos WIN direcional, a referencia de perda e apagada.
 
     Como a ordem e LIMIT @ <=0.55, o gasto maximo teorico e:
         shares * limit_price
@@ -540,16 +560,13 @@ def sizing(st, min_shares, limit_price):
     opposite_shares = min_shares
     opposite_max_spend = opposite_shares * limit_price
 
-    frozen = st.get("martingale_base_edge")
-    if frozen in (None, "", "None"):
-        # Calcula a candidata, mas so a persiste quando a entrada e realmente
-        # preparada e passa pelas validacoes de mercado/capital.
-        frozen = base_edge(st)
+    loss_ref = st.get("martingale_loss_reference")
+    if int(st.get("loss_streak", 0) or 0) > 0 and loss_ref not in (None, "", "None"):
+        edge = D(loss_ref) * D(2)
     else:
-        frozen = D(frozen)
+        edge = base_edge(st)
 
-    edge = frozen * (D(2) ** int(st["loss_streak"]))
-    edge = min(edge, MAX_ENTRY)
+    edge = min(max(D("0"), edge), MAX_ENTRY)
 
     directional_max_spend_target = min(
         opposite_max_spend + edge,
@@ -571,7 +588,7 @@ def sizing(st, min_shares, limit_price):
         "opposite_max_spend": opposite_max_spend,
         "directional_max_spend": directional_max_spend,
         "edge": actual_edge_at_limit,
-        "martingale_base_edge": frozen,
+        "martingale_loss_reference": st.get("martingale_loss_reference"),
     }
 
 
@@ -690,6 +707,42 @@ class Bot:
             self.sync_balance(force=True)
 
     # -------------------- AUTOMATIC POSITION REDEMPTION --------------------
+
+    def ensure_auto_redeem_operator(self):
+        """Ensure the official Polymarket trading approvals are present.
+
+        For Deposit Wallets the official SDK includes ERC-1155 approval for the
+        current auto-redeem operator.  V22 uses that operator instead of forcing
+        redeem_positions() through relayer-v2, because the latter can be rejected
+        server-side even while the Data API reports redeemable=True.
+        """
+        if not LIVE or not self.c:
+            return False
+
+        setup = getattr(self.c, "setup_trading_approvals", None)
+        if not callable(setup):
+            log.error(
+                "AUTO-REDEEM OPERATOR | SDK sem setup_trading_approvals; "
+                "mantendo somente monitoramento de posicoes"
+            )
+            return False
+
+        try:
+            handle = setup()
+            outcome = handle.wait() if handle is not None and hasattr(handle, "wait") else handle
+            log.info(
+                "AUTO-REDEEM OPERATOR | APROVACOES OK | outcome=%s",
+                outcome,
+            )
+            return True
+        except Exception as exc:
+            # Nao derruba o bot nem impede trading.  O estado fica auditavel e a
+            # reconciliacao continua observando a Data API sem martelar /submit.
+            log.warning(
+                "AUTO-REDEEM OPERATOR | NAO FOI POSSIVEL CONFIRMAR APROVACOES | erro=%r",
+                exc,
+            )
+            return False
 
     def enqueue_redemption(self, pending, winning_shares):
         """Persist a resolved winning condition for gasless redemption.
@@ -846,15 +899,22 @@ class Bot:
         })
 
     def process_redemptions(self, force=False):
-        """Redeem only positions that the Positions API still marks redeemable.
+        """Reconcile resolved positions using Polymarket's auto-redeem operator.
 
-        V21 prevents repeated relayer submissions against already-settled positions:
-        1) inspect the wallet's current position for the condition;
-        2) submit redeem only when redeemable=True and size>0;
-        3) keep a non-redeemable live position queued with a slower retry;
-        4) require two consecutive ABSENT observations before treating a condition
-           as already redeemed/settled;
-        5) after a relayer revert, re-inspect before scheduling another submit.
+        V22 deliberately does NOT call SecureClient.redeem_positions() for a
+        Deposit Wallet.  Live evidence showed the public Data API reporting the
+        position as redeemable while relayer-v2 rejected the redeem batch with
+        ``batch would revert: execution reverted``.  The official SDK separately
+        provisions an auto-redeem operator through setup_trading_approvals().
+
+        The queue therefore becomes a reconciliation monitor:
+          * REDEEMABLE -> wait for the official operator; no POST /submit;
+          * NOT_READY  -> wait for market/finality state;
+          * ABSENT     -> require two consecutive observations, then reconcile;
+          * ERROR      -> keep queued and retry later.
+
+        This prevents repeated known-bad relayer submissions from blocking the
+        trading loop while retaining an auditable persistent queue.
         """
         if not LIVE or not self.c:
             return
@@ -902,11 +962,10 @@ class Bot:
                     pass
 
             if not condition_id:
-                item["attempts"] = int(item.get("attempts") or 0) + 1
-                item["next_try_epoch"] = now_epoch + 30
+                item["next_try_epoch"] = now_epoch + 60
                 kept.append(item)
                 changed = True
-                log.warning("RESGATE | condition_id ainda indisponivel | slug=%s", slug)
+                log.warning("RESGATE | condition_id ainda indisponivel | slug=%s | retry=60s", slug)
                 continue
 
             if condition_id in processed:
@@ -919,14 +978,13 @@ class Bot:
 
             if status == "ERROR":
                 item["inspection_errors"] = int(item.get("inspection_errors") or 0) + 1
-                item["next_try_epoch"] = now_epoch + 60
+                item["next_try_epoch"] = now_epoch + 120
                 item["last_error"] = inspection.get("error")
                 kept.append(item)
                 changed = True
                 log.warning(
-                    "RESGATE | PRE-CHECK FALHOU | condition_id=%s | retry=60s | erro=%s",
-                    condition_id,
-                    inspection.get("error"),
+                    "RESGATE | MONITOR FALHOU | condition_id=%s | retry=120s | erro=%s",
+                    condition_id, inspection.get("error"),
                 )
                 continue
 
@@ -938,12 +996,12 @@ class Bot:
                 if absent_n >= 2:
                     self._finish_redemption_reconciliation(
                         rec, processed, item,
-                        reason="already_settled_or_no_open_position",
+                        reason="auto_redeem_operator_settled_or_position_absent",
                         inspection=inspection,
                     )
                     log.info(
-                        "RESGATE RECONCILIADO | condition_id=%s | sem posicao aberta em 2 verificacoes; "
-                        "considerado ja liquidado/resgatado",
+                        "RESGATE AUTO-OPERATOR RECONCILIADO | condition_id=%s | "
+                        "posicao ausente em 2 verificacoes",
                         condition_id,
                     )
                     continue
@@ -951,117 +1009,52 @@ class Bot:
                 item["next_try_epoch"] = now_epoch + 30
                 kept.append(item)
                 log.info(
-                    "RESGATE | SEM POSICAO ABERTA | condition_id=%s | confirmacao=1/2 | retry=30s",
+                    "RESGATE | POSICAO SUMIU | condition_id=%s | confirmacao=1/2 | retry=30s",
                     condition_id,
                 )
                 continue
 
-            # Qualquer posicao reaparecendo zera a confirmacao de ausencia.
             if item.get("absent_confirmations"):
                 item["absent_confirmations"] = 0
                 changed = True
 
             if status == "NOT_READY":
                 item["not_ready_checks"] = int(item.get("not_ready_checks") or 0) + 1
-                # Nao martela o relayer: a posicao existe, mas a Data API ainda nao a
-                # classifica como redeemable. Reconsulta em 60s sem POST /submit.
                 item["next_try_epoch"] = now_epoch + 60
                 kept.append(item)
                 changed = True
                 log.info(
-                    "RESGATE | AINDA NAO RESGATAVEL | condition_id=%s | size=%s | retry=60s",
-                    condition_id,
-                    inspection.get("total_size"),
+                    "RESGATE | AINDA NAO RESGATAVEL | condition_id=%s | size=%s | "
+                    "AUTO-OPERATOR aguardando | retry=60s",
+                    condition_id, inspection.get("total_size"),
                 )
                 continue
 
-            # Somente REDEEMABLE chega ao relayer.
-            try:
-                log.info(
-                    "RESGATE | PRE-CHECK OK | condition_id=%s | redeemable_size=%s | enviando ao relayer",
-                    condition_id,
-                    inspection.get("redeemable_size"),
-                )
-                handle = self.c.redeem_positions(condition_id=condition_id)
-                outcome = handle.wait()
-                self._finish_redemption_reconciliation(
-                    rec, processed, item,
-                    reason="redeem_submitted_successfully",
-                    inspection=inspection,
-                    outcome=outcome,
-                )
-                log.info(
-                    "RESGATE AUTOMATICO OK | condition_id=%s | slug=%s | outcome=%s",
-                    condition_id,
-                    slug,
-                    outcome,
-                )
-                changed = True
-                continue
+            # REDEEMABLE: a responsabilidade de execucao fica com o operador
+            # oficial previamente aprovado.  Nao envia POST /submit manual.
+            first_redeemable = float(item.get("first_redeemable_epoch") or 0)
+            if first_redeemable <= 0:
+                item["first_redeemable_epoch"] = now_epoch
+                first_redeemable = now_epoch
+            item["auto_operator_checks"] = int(item.get("auto_operator_checks") or 0) + 1
+            elapsed = max(0, int(now_epoch - first_redeemable))
+            delay = 60 if elapsed < 600 else 120
+            item["next_try_epoch"] = now_epoch + delay
+            kept.append(item)
+            changed = True
 
-            except Exception as exc:
-                item["attempts"] = int(item.get("attempts") or 0) + 1
-                item["last_error"] = repr(exc)
-
-                # Uma falha pode ser corrida com auto-settlement/auto-redeem. Rele a
-                # posicao imediatamente e, sobretudo, NAO repete POST em poucos segundos.
-                post = self._inspect_redeemable_position(condition_id)
-                post_status = post.get("status")
-
-                if post_status == "ABSENT":
-                    item["absent_confirmations"] = int(item.get("absent_confirmations") or 0) + 1
-                    item["next_try_epoch"] = now_epoch + 30
-                    kept.append(item)
-                    changed = True
-                    log.warning(
-                        "RESGATE | RELAYER REVERTEU MAS POSICAO SUMIU | condition_id=%s | "
-                        "confirmacao=%s/2 | retry somente pre-check em 30s | erro=%r",
-                        condition_id,
-                        item["absent_confirmations"],
-                        exc,
-                    )
-                    continue
-
-                if post_status == "NOT_READY":
-                    item["next_try_epoch"] = now_epoch + 60
-                    kept.append(item)
-                    changed = True
-                    log.warning(
-                        "RESGATE | RELAYER REVERTEU E POSICAO NAO ESTA REDEEMABLE | "
-                        "condition_id=%s | retry=60s sem novo POST ate novo pre-check | erro=%r",
-                        condition_id,
-                        exc,
-                    )
-                    continue
-
-                if post_status == "ERROR":
-                    delay = min(300, 60 * max(1, item["attempts"]))
-                    item["next_try_epoch"] = now_epoch + delay
-                    kept.append(item)
-                    changed = True
-                    log.warning(
-                        "RESGATE AUTOMATICO PENDENTE | condition_id=%s | tentativa=%s | "
-                        "pre-check pos-falha indisponivel | retry=%ss | erro=%r",
-                        condition_id,
-                        item["attempts"],
-                        delay,
-                        exc,
-                    )
-                    continue
-
-                # Se continua REDEEMABLE, conserva na fila, mas com backoff longo.
-                # Repetir a cada 5-20s foi exatamente o comportamento indesejado da V20.
-                delay = min(600, 60 * (2 ** min(item["attempts"] - 1, 3)))
-                item["next_try_epoch"] = now_epoch + delay
-                kept.append(item)
-                changed = True
+            if elapsed >= 1800 and elapsed % 600 < delay:
                 log.warning(
-                    "RESGATE AUTOMATICO PENDENTE | condition_id=%s | continua redeemable | "
-                    "tentativa=%s | retry=%ss | erro=%r",
-                    condition_id,
-                    item["attempts"],
-                    delay,
-                    exc,
+                    "RESGATE | AUTO-OPERATOR AINDA PENDENTE HA %ss | condition_id=%s | "
+                    "redeemable_size=%s | nenhum POST manual sera enviado; "
+                    "se persistir, requer suporte/relayer Polymarket",
+                    elapsed, condition_id, inspection.get("redeemable_size"),
+                )
+            else:
+                log.info(
+                    "RESGATE | REDEEMABLE CONFIRMADO | condition_id=%s | redeemable_size=%s | "
+                    "AUTO-OPERATOR aguardando | retry=%ss | sem POST /submit",
+                    condition_id, inspection.get("redeemable_size"), delay,
                 )
 
         if changed:
@@ -1343,7 +1336,7 @@ class Bot:
                 })
                 req = Request(
                     f"https://data-api.polymarket.com/activity?{params}",
-                    headers={"User-Agent": "btc-polymarket-v21"},
+                    headers={"User-Agent": "btc-polymarket-v23"},
                 )
                 with urlopen(req, timeout=15) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -1835,11 +1828,6 @@ class Bot:
             )
             return
 
-        # A sequencia de Martingale passa a existir a partir daqui: mercado,
-        # sizing e capital ja foram validados. Congela/persiste a base do ciclo.
-        if st.get("martingale_base_edge") in (None, "", "None"):
-            st["martingale_base_edge"] = str(sz["martingale_base_edge"])
-
         directional_token = m["up"] if direction == "UP" else m["down"]
         opposite_token = m["down"] if direction == "UP" else m["up"]
         opposite_direction = "DOWN" if direction == "UP" else "UP"
@@ -1869,7 +1857,7 @@ class Bot:
             "limit_price": str(limit_price),
             "minimum_order_shares": str(min_shares),
             "edge_at_limit": str(sz["edge"]),
-            "martingale_base_edge": str(st["martingale_base_edge"]),
+            "martingale_loss_reference": st.get("martingale_loss_reference"),
             "signal_locked_at": datetime.now(UTC).isoformat(),
             "live": LIVE,
             "last_wait_log": 0,
@@ -2298,16 +2286,14 @@ class Bot:
         if directional_win:
             st["wins"] += 1
             st["loss_streak"] = 0
-            # Encerra o ciclo. A proxima entrada calcula uma nova base
-            # usando o bankroll atualizado naquele momento.
-            st["martingale_base_edge"] = None
+            st["martingale_loss_reference"] = None
         else:
             st["losses"] += 1
-            # A base do ciclo permanece congelada. Em estados migrados antigos,
-            # garante uma base valida antes de incrementar a sequencia.
-            if st.get("martingale_base_edge") in (None, "", "None"):
-                st["martingale_base_edge"] = str(base_edge(st))
             st["loss_streak"] += 1
+            # V23: a proxima entrada dobra a PERDA FINANCEIRA REAL desta
+            # operacao, e nao uma base teorica. Se o PNL nao for negativo,
+            # nao ha perda financeira a recuperar e a referencia fica vazia.
+            st["martingale_loss_reference"] = str(abs(pnl)) if pnl < 0 else None
 
         audit({
             "type": "resolution",
@@ -2323,7 +2309,7 @@ class Bot:
             "pnl": str(pnl),
             "bankroll_after": str(bankroll),
             "loss_streak_after": st["loss_streak"],
-            "martingale_base_edge_after": st.get("martingale_base_edge"),
+            "martingale_loss_reference_after": st.get("martingale_loss_reference"),
             "ts": datetime.now(UTC).isoformat(),
         })
 
@@ -2331,14 +2317,14 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | WINNER=%s | %s | PNL=%s | BANKROLL=%s | loss_streak=%s | martingale_base=%s",
+            "%s | WINNER=%s | %s | PNL=%s | BANKROLL=%s | loss_streak=%s | martingale_loss_ref=%s",
             st["name"],
             w,
             "WIN" if directional_win else "LOSS",
             pnl,
             bankroll,
             st["loss_streak"],
-            st.get("martingale_base_edge"),
+            st.get("martingale_loss_reference"),
         )
 
     # ------------------------- LOOP -------------------------
@@ -2407,37 +2393,49 @@ class Bot:
             return
 
         log.info(
-            "%s | SINAL APROVADO | direction=%s | dirs=%s | macd=%s | signal=%s | loss_streak=%s | martingale_base=%s",
+            "%s | SINAL APROVADO | direction=%s | dirs=%s | macd=%s | signal=%s | loss_streak=%s | martingale_loss_ref=%s",
             st["name"],
             direction,
             dirs,
             macd,
             sig,
             st["loss_streak"],
-            st.get("martingale_base_edge"),
+            st.get("martingale_loss_reference"),
         )
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=21 | ENTRY_SECONDS=%s | INITIAL_EDGE=%s", ENTRY_SECONDS, INITIAL_EDGE)
+        log.info(
+            "STARTUP OK | codigo carregado | versao=23 | ENTRY_SECONDS=%s | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s",
+            ENTRY_SECONDS,
+            INITIAL_EDGE_5M,
+            INITIAL_EDGE_15M,
+            INITIAL_EDGE_1H,
+        )
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V21 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V23 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | SO ENVIA SE AMBOS<=%s ANTES DO INICIO | "
             "PARTIAL=PROPORCIONAL | SE 1 FULL: OUTRO 100%% ATE FINAL | "
-            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_PRECHECK | BALANCE=MONITORADO | MARTINGALE_BASE=CONGELADA_POR_CICLO | EDGE_INICIAL=%s | TARGET=%s | DATA=%s",
+            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO | MARTINGALE=2X_PERDA_REAL | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
             LIVE,
             gasless_mode,
             INITIAL,
             ENTRY_SECONDS,
             MAX_BUY_PRICE,
-            INITIAL_EDGE,
+            INITIAL_EDGE_5M,
+            INITIAL_EDGE_15M,
+            INITIAL_EDGE_1H,
             TARGET,
             ROOT,
         )
 
         hb = 0
+
+        # V23: garante as aprovacoes oficiais (incluindo o auto-redeem operator)
+        # antes de iniciar o loop. Falha aqui nao derruba o trading.
+        self.ensure_auto_redeem_operator()
 
         # Primeira consulta logo apos o startup; baseline impede desconto retroativo.
         self.sync_withdrawals(force=True)
@@ -2461,7 +2459,7 @@ class Bot:
                 summary = " | ".join(
                     f'{st["name"]}:bank={st["bankroll"]},'
                     f'L={st["loss_streak"]},'
-                    f'MB={st.get("martingale_base_edge") or "-"},'
+                    f'MR={st.get("martingale_loss_reference") or "-"},'
                     f'phase={(st.get("pending") or {}).get("phase","-")}'
                     for st in self.s["strategies"].values()
                 )
