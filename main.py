@@ -6,6 +6,7 @@ import time
 import signal as signal_module
 import logging
 import subprocess
+import importlib
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,13 +16,13 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V12 FINAL - PROPORTIONAL PARTIAL FILL
+# POLYMARKET BTC V13 FINAL - T-30 + PROPORTIONAL PARTIAL FILL
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
 #
 # SINAL
-#   - entrada T-15s para a PROXIMA rodada
+#   - entrada T-30s para a PROXIMA rodada
 #   - ultimo candle FECHADO + MACD 7/21/9 na mesma direcao
 #   - depois de LOSS: exige 2 candles FECHADOS consecutivos
 #     na mesma direcao + MACD alinhado
@@ -53,17 +54,29 @@ from urllib.parse import urlencode
 def ensure_sdk():
     try:
         import polymarket  # noqa: F401
+        print("BOOTSTRAP | polymarket SDK ja disponivel", flush=True)
+        return
     except ImportError:
-        subprocess.check_call([
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--no-cache-dir",
-            "--root-user-action=ignore",
-            "polymarket-client==0.3.0b1",
-        ])
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        print("BOOTSTRAP | instalando polymarket-client==0.3.0b1", flush=True)
+
+    subprocess.check_call([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "--root-user-action=ignore",
+        "polymarket-client==0.3.0b1",
+    ])
+    importlib.invalidate_caches()
+
+    try:
+        import polymarket  # noqa: F401
+        print("BOOTSTRAP | SDK instalado e importado com sucesso", flush=True)
+    except ImportError as exc:
+        raise RuntimeError(
+            "polymarket-client foi instalado, mas o modulo polymarket nao pode ser importado"
+        ) from exc
 
 
 ensure_sdk()
@@ -89,7 +102,7 @@ HIGH_BANKROLL_EDGE = Decimal(os.getenv("HIGH_BANKROLL_EDGE", "10.00"))
 MAX_ENTRY = Decimal(os.getenv("MAX_ENTRY", "1000.00"))
 TARGET = Decimal(os.getenv("TARGET_BANKROLL", "200000.00"))
 
-ENTRY_SECONDS = int(os.getenv("ENTRY_SECONDS", "15"))
+ENTRY_SECONDS = 30  # FIXO: trava o sinal 30s antes da proxima rodada
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "0.5"))
 MAX_BUY_PRICE = Decimal(os.getenv("MAX_BUY_PRICE", "0.55"))
 
@@ -106,7 +119,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v12")
+log = logging.getLogger("btc-polymarket-v13")
 STOP = False
 
 
@@ -135,7 +148,7 @@ def get(url, params=None):
     if params:
         url += "?" + urlencode(params)
     with urlopen(
-        Request(url, headers={"User-Agent": "btc-polymarket-v12"}),
+        Request(url, headers={"User-Agent": "btc-polymarket-v13"}),
         timeout=12,
     ) as r:
         return json.loads(r.read())
@@ -153,7 +166,7 @@ def js(x):
 
 
 def fresh():
-    s = {"version": 12, "strategies": {}}
+    s = {"version": 13, "strategies": {}}
     for tf in TFS:
         for session in ("24h", "day"):
             name = f"{tf}_{session}"
@@ -213,7 +226,7 @@ def load():
                 p.setdefault("directional_shares", "0")
                 p.setdefault("opposite_shares", "0")
 
-        new["version"] = 12
+        new["version"] = 13
         save(new)
         return new
     except Exception:
@@ -831,10 +844,10 @@ class Bot:
 
     def prepare_entry_window(self, st, round_start, direction):
         """
-        Em T-15 o sinal fica TRAVADO.
+        Em T-30 o sinal fica TRAVADO.
         Nenhuma ordem e enviada ainda.
 
-        Do T-15 ate o inicio:
+        Do T-30 ate o inicio:
           - monitora os DOIS precos
           - somente quando AMBOS estiverem <= 0.55 simultaneamente,
             envia as duas BUY LIMIT GTC
@@ -927,7 +940,7 @@ class Bot:
             sl,
         )
 
-        # Tenta imediatamente no proprio T-15.
+        # Tenta imediatamente no proprio T-30.
         self.wait_for_both_prices(st, datetime.now(UTC))
 
     def wait_for_both_prices(self, st, now):
@@ -997,7 +1010,7 @@ class Bot:
         e_dir = e_opp = None
 
         if LIVE:
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-v11") as ex:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-v13") as ex:
                 f_dir = ex.submit(
                     self.place_gtc_limit,
                     p["directional_token"],
@@ -1049,6 +1062,15 @@ class Bot:
         p["orders_sent_at"] = now.isoformat()
         p["directional_error"] = repr(e_dir) if e_dir else rejected_reason(r_dir)
         p["opposite_error"] = repr(e_opp) if e_opp else rejected_reason(r_opp)
+
+        log.info(
+            "%s | RESULTADO ENVIO PAR | DIR order_id=%s | OPP order_id=%s | DIR_ERR=%s | OPP_ERR=%s",
+            st["name"],
+            p["directional_order_id"],
+            p["opposite_order_id"],
+            p["directional_error"],
+            p["opposite_error"],
+        )
 
         # Se as duas ordens foram aceitas, seguem GTC.
         # Se uma falhou na postagem, a outra NAO e cancelada:
@@ -1384,7 +1406,7 @@ class Bot:
         _, next_start = bounds(now, TFS[st["tf"]])
         seconds_to_next = (next_start - now.astimezone(TZ)).total_seconds()
 
-        # Captura o sinal apenas no T-15.
+        # Captura o sinal apenas no T-30.
         if not ENTRY_SECONDS - 1.2 <= seconds_to_next <= ENTRY_SECONDS + 0.8:
             return
 
@@ -1397,6 +1419,13 @@ class Bot:
 
         st["last_trigger"] = key
         save(self.s)
+
+        log.info(
+            "%s | JANELA T-%ss ATINGIDA | proxima rodada=%s | avaliando candle+MACD",
+            st["name"],
+            ENTRY_SECONDS,
+            next_start.isoformat(),
+        )
 
         direction, two_same, macd, sig, dirs = trading_signal(st["tf"])
 
@@ -1420,11 +1449,21 @@ class Bot:
             )
             return
 
+        log.info(
+            "%s | SINAL APROVADO | direction=%s | dirs=%s | macd=%s | signal=%s | loss_streak=%s",
+            st["name"],
+            direction,
+            dirs,
+            macd,
+            sig,
+            st["loss_streak"],
+        )
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
+        log.info("STARTUP OK | codigo carregado | versao=13 | ENTRY_SECONDS=%s", ENTRY_SECONDS)
         log.info(
-            "POLYMARKET BTC V12 FINAL | LIVE=%s | 6 ROBOS | "
+            "POLYMARKET BTC V13 FINAL | LIVE=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | SO ENVIA SE AMBOS<=%s ANTES DO INICIO | "
             "PARTIAL=PROPORCIONAL | SE 1 FULL: OUTRO 100%% ATE FINAL | TARGET=%s | DATA=%s",
