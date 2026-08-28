@@ -11,12 +11,13 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait
+from threading import Barrier
 from zoneinfo import ZoneInfo
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V13 FINAL - T-30 + PROPORTIONAL PARTIAL FILL
+# POLYMARKET BTC V14 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -48,6 +49,13 @@ from urllib.parse import urlencode
 #   - martingale dobra SOMENTE o diferencial
 #   - maximo de US$1000 de gasto teorico por perna
 #   - objetivo: US$200,000 por robo
+#
+# RECONCILIACAO DE SAQUES
+#   - consulta a atividade WITHDRAWAL da propria carteira Polymarket
+#   - aplica somente saques posteriores ao primeiro startup da V14
+#   - cada saque reduz proporcionalmente os 6 bankrolls logicos
+#   - trades, fills, ordens abertas, splits, merges e redeems NAO contam como saque
+#   - eventos ja processados sao persistidos para nunca descontar duas vezes
 # ============================================================
 
 
@@ -101,6 +109,7 @@ PROFIT_SWITCH = Decimal(os.getenv("PROFIT_SWITCH", "5.00"))
 HIGH_BANKROLL_EDGE = Decimal(os.getenv("HIGH_BANKROLL_EDGE", "10.00"))
 MAX_ENTRY = Decimal(os.getenv("MAX_ENTRY", "1000.00"))
 TARGET = Decimal(os.getenv("TARGET_BANKROLL", "200000.00"))
+WITHDRAWAL_SYNC_SECONDS = float(os.getenv("WITHDRAWAL_SYNC_SECONDS", "20"))
 
 ENTRY_SECONDS = 30  # FIXO: trava o sinal 30s antes da proxima rodada
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "0.5"))
@@ -119,7 +128,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v13")
+log = logging.getLogger("btc-polymarket-v14")
 STOP = False
 
 
@@ -148,7 +157,7 @@ def get(url, params=None):
     if params:
         url += "?" + urlencode(params)
     with urlopen(
-        Request(url, headers={"User-Agent": "btc-polymarket-v13"}),
+        Request(url, headers={"User-Agent": "btc-polymarket-v14"}),
         timeout=12,
     ) as r:
         return json.loads(r.read())
@@ -166,7 +175,18 @@ def js(x):
 
 
 def fresh():
-    s = {"version": 13, "strategies": {}}
+    s = {
+        "version": 14,
+        "strategies": {},
+        "capital_reconciliation": {
+            "initialized": False,
+            "baseline_epoch": 0,
+            "last_success_epoch": 0,
+            "processed_withdrawals": [],
+            "total_withdrawn_applied": "0",
+            "last_withdrawal": None,
+        },
+    }
     for tf in TFS:
         for session in ("24h", "day"):
             name = f"{tf}_{session}"
@@ -226,7 +246,21 @@ def load():
                 p.setdefault("directional_shares", "0")
                 p.setdefault("opposite_shares", "0")
 
-        new["version"] = 13
+        tracker = old.get("capital_reconciliation")
+        if isinstance(tracker, dict):
+            dst_tracker = new["capital_reconciliation"]
+            for field in (
+                "initialized",
+                "baseline_epoch",
+                "last_success_epoch",
+                "processed_withdrawals",
+                "total_withdrawn_applied",
+                "last_withdrawal",
+            ):
+                if field in tracker:
+                    dst_tracker[field] = tracker[field]
+
+        new["version"] = 14
         save(new)
         return new
     except Exception:
@@ -521,6 +555,224 @@ class Bot:
             )
         else:
             log.info("SIMULACAO")
+
+        self.last_withdrawal_sync = 0.0
+        self.initialize_withdrawal_tracker()
+
+    # -------------------- CAPITAL / WITHDRAWALS --------------------
+
+    def initialize_withdrawal_tracker(self):
+        tracker = self.s.setdefault("capital_reconciliation", {})
+        tracker.setdefault("initialized", False)
+        tracker.setdefault("baseline_epoch", 0)
+        tracker.setdefault("last_success_epoch", 0)
+        tracker.setdefault("processed_withdrawals", [])
+        tracker.setdefault("total_withdrawn_applied", "0")
+        tracker.setdefault("last_withdrawal", None)
+
+        if not tracker.get("initialized"):
+            now_epoch = int(time.time())
+            tracker["initialized"] = True
+            tracker["baseline_epoch"] = now_epoch
+            tracker["last_success_epoch"] = now_epoch
+            tracker["processed_withdrawals"] = []
+            save(self.s)
+            log.info(
+                "SAQUES | baseline criado em %s | saques anteriores a este startup nao serao descontados",
+                datetime.fromtimestamp(now_epoch, UTC).isoformat(),
+            )
+        else:
+            log.info(
+                "SAQUES | tracker restaurado | baseline=%s | total_descontado=%s",
+                tracker.get("baseline_epoch"),
+                tracker.get("total_withdrawn_applied", "0"),
+            )
+
+    @staticmethod
+    def withdrawal_key(activity):
+        tx = str(getattr(activity, "transaction_hash", "") or "")
+        ts = getattr(activity, "timestamp", None)
+        amount = D(getattr(activity, "amount", 0) or 0)
+        ts_text = ts.isoformat() if hasattr(ts, "isoformat") else str(ts or "")
+        return f"{tx}|{ts_text}|{amount}"
+
+    def apply_withdrawal(self, amount, activity):
+        amount = D(amount)
+        if amount <= 0:
+            return D("0")
+
+        strategies = list(self.s["strategies"].values())
+        bankrolls = [max(D("0"), D(st["bankroll"])) for st in strategies]
+        total = sum(bankrolls, D("0"))
+
+        if total <= 0:
+            log.warning(
+                "SAQUE DETECTADO | amount=%s | bankroll logico total ja esta zerado",
+                amount,
+            )
+            return D("0")
+
+        applied = min(amount, total)
+        remaining = applied
+        positive_indexes = [i for i, b in enumerate(bankrolls) if b > 0]
+
+        adjustments = {}
+        for pos, idx in enumerate(positive_indexes):
+            st = strategies[idx]
+            before = bankrolls[idx]
+
+            if pos == len(positive_indexes) - 1:
+                cut = min(before, remaining)
+            else:
+                cut = floor_6(applied * before / total)
+                cut = min(before, cut, remaining)
+
+            after = max(D("0"), before - cut)
+            st["bankroll"] = str(after)
+            remaining -= cut
+            adjustments[st["name"]] = {
+                "before": str(before),
+                "deduction": str(cut),
+                "after": str(after),
+            }
+
+        # Se arredondamentos de 6 casas deixarem residuo, tira do maior bankroll disponivel.
+        if remaining > 0:
+            for st in sorted(strategies, key=lambda x: D(x["bankroll"]), reverse=True):
+                available = D(st["bankroll"])
+                if available <= 0:
+                    continue
+                extra = min(available, remaining)
+                before2 = available
+                st["bankroll"] = str(before2 - extra)
+                adj = adjustments.setdefault(st["name"], {
+                    "before": str(before2),
+                    "deduction": "0",
+                    "after": str(before2),
+                })
+                adj["deduction"] = str(D(adj["deduction"]) + extra)
+                adj["after"] = str(D(st["bankroll"]))
+                remaining -= extra
+                if remaining <= 0:
+                    break
+
+        effective_applied = applied - max(D("0"), remaining)
+        tracker = self.s["capital_reconciliation"]
+        tracker["total_withdrawn_applied"] = str(
+            D(tracker.get("total_withdrawn_applied", "0")) + effective_applied
+        )
+
+        ts = getattr(activity, "timestamp", None)
+        tx = str(getattr(activity, "transaction_hash", "") or "")
+        tracker["last_withdrawal"] = {
+            "amount": str(amount),
+            "applied": str(effective_applied),
+            "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts or ""),
+            "transaction_hash": tx,
+        }
+
+        audit({
+            "type": "withdrawal_reconciliation",
+            "amount": str(amount),
+            "applied": str(effective_applied),
+            "logical_total_before": str(total),
+            "logical_total_after": str(total - effective_applied),
+            "transaction_hash": tx,
+            "timestamp": tracker["last_withdrawal"]["timestamp"],
+            "adjustments": adjustments,
+        })
+
+        log.warning(
+            "SAQUE DETECTADO | amount=%s | aplicado=%s | bankroll_total %s -> %s | tx=%s",
+            amount,
+            effective_applied,
+            total,
+            total - effective_applied,
+            tx or "-",
+        )
+        for name, adj in adjustments.items():
+            log.warning(
+                "SAQUE AJUSTE | %s | %s - %s = %s",
+                name,
+                adj["before"],
+                adj["deduction"],
+                adj["after"],
+            )
+
+        return effective_applied
+
+    def sync_withdrawals(self, force=False):
+        if not LIVE or not self.c:
+            return
+
+        now_monotonic = time.monotonic()
+        if not force and now_monotonic - self.last_withdrawal_sync < WITHDRAWAL_SYNC_SECONDS:
+            return
+        self.last_withdrawal_sync = now_monotonic
+
+        tracker = self.s["capital_reconciliation"]
+        baseline = int(tracker.get("baseline_epoch", 0) or 0)
+        last_success = int(tracker.get("last_success_epoch", baseline) or baseline)
+        now_epoch = int(time.time())
+
+        # Janela com overlap de 1h para absorver atraso eventual da Data API.
+        # O conjunto processed_withdrawals impede qualquer desconto duplicado.
+        start_epoch = max(baseline, last_success - 3600)
+        processed = set(str(x) for x in tracker.get("processed_withdrawals", []))
+        found = []
+
+        try:
+            paginator = self.c.list_activity(
+                activity_types=("WITHDRAWAL",),
+                start=start_epoch,
+                end=now_epoch,
+                page_size=100,
+            )
+
+            count = 0
+            for page in paginator:
+                for activity in page.items:
+                    count += 1
+                    if count > 1000:
+                        raise RuntimeError("mais de 1000 saques na janela de reconciliacao")
+
+                    if str(getattr(activity, "type", "")) != "WITHDRAWAL":
+                        continue
+
+                    ts = getattr(activity, "timestamp", None)
+                    if ts is None:
+                        continue
+                    ts_epoch = int(ts.timestamp())
+                    if ts_epoch <= baseline:
+                        continue
+
+                    amount = D(getattr(activity, "amount", 0) or 0)
+                    if amount <= 0:
+                        continue
+
+                    key = self.withdrawal_key(activity)
+                    if key in processed:
+                        continue
+
+                    found.append((ts_epoch, key, activity, amount))
+
+            # Processa cronologicamente para o historico ficar deterministico.
+            found.sort(key=lambda x: (x[0], x[1]))
+            for _ts_epoch, key, activity, amount in found:
+                self.apply_withdrawal(amount, activity)
+                processed.add(key)
+
+            # Retem chaves recentes; 2000 e muito acima do uso esperado e evita crescimento infinito.
+            tracker["processed_withdrawals"] = list(processed)[-2000:]
+            tracker["last_success_epoch"] = now_epoch
+            save(self.s)
+
+            if found:
+                log.info("SAQUES | reconciliados=%s | scan_ate=%s", len(found), now_epoch)
+
+        except Exception:
+            # Nao altera last_success_epoch em caso de falha; assim a proxima tentativa cobre a mesma janela.
+            log.exception("SAQUES | falha ao consultar/reconciliar withdrawals; sera tentado novamente")
 
     # ------------------------- ORDERS -------------------------
 
@@ -1009,40 +1261,39 @@ class Bot:
         r_dir = r_opp = None
         e_dir = e_opp = None
 
-        if LIVE:
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-v13") as ex:
-                f_dir = ex.submit(
-                    self.place_gtc_limit,
-                    p["directional_token"],
-                    limit_price,
-                    D(p["directional_shares_requested"]),
-                )
-                f_opp = ex.submit(
-                    self.place_gtc_limit,
-                    p["opposite_token"],
-                    limit_price,
-                    D(p["opposite_shares_requested"]),
-                )
-                wait([f_dir, f_opp])
+        # Disparo sincronizado do par. Cada perna usa uma requisicao separada,
+        # portanto a exchange nao oferece atomicidade entre os dois outcomes;
+        # a Barrier reduz ao minimo a diferenca local entre os dois envios.
+        start_barrier = Barrier(3)
 
-                e_dir = f_dir.exception()
-                e_opp = f_opp.exception()
+        def send_leg(token, shares):
+            start_barrier.wait()
+            return self.place_gtc_limit(token, limit_price, D(shares))
 
-                if e_dir is None:
-                    r_dir = f_dir.result()
-                if e_opp is None:
-                    r_opp = f_opp.result()
-        else:
-            r_dir = self.place_gtc_limit(
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-v131") as ex:
+            f_dir = ex.submit(
+                send_leg,
                 p["directional_token"],
-                limit_price,
-                D(p["directional_shares_requested"]),
+                p["directional_shares_requested"],
             )
-            r_opp = self.place_gtc_limit(
+            f_opp = ex.submit(
+                send_leg,
                 p["opposite_token"],
-                limit_price,
-                D(p["opposite_shares_requested"]),
+                p["opposite_shares_requested"],
             )
+
+            # Os dois workers ja estao posicionados na barreira; esta liberacao
+            # faz as duas chamadas partirem juntas, tanto em LIVE quanto em SIM.
+            start_barrier.wait()
+            wait([f_dir, f_opp])
+
+            e_dir = f_dir.exception()
+            e_opp = f_opp.exception()
+
+            if e_dir is None:
+                r_dir = f_dir.result()
+            if e_opp is None:
+                r_opp = f_opp.result()
 
         dir_oid = (
             r_dir.get("order_id")
@@ -1461,12 +1712,13 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=13 | ENTRY_SECONDS=%s", ENTRY_SECONDS)
+        log.info("STARTUP OK | codigo carregado | versao=14 | ENTRY_SECONDS=%s", ENTRY_SECONDS)
         log.info(
-            "POLYMARKET BTC V13 FINAL | LIVE=%s | 6 ROBOS | "
+            "POLYMARKET BTC V14 FINAL | LIVE=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | SO ENVIA SE AMBOS<=%s ANTES DO INICIO | "
-            "PARTIAL=PROPORCIONAL | SE 1 FULL: OUTRO 100%% ATE FINAL | TARGET=%s | DATA=%s",
+            "PARTIAL=PROPORCIONAL | SE 1 FULL: OUTRO 100%% ATE FINAL | "
+            "SAQUES=AUTO_PROPORCIONAL | TARGET=%s | DATA=%s",
             LIVE,
             INITIAL,
             ENTRY_SECONDS,
@@ -1477,8 +1729,13 @@ class Bot:
 
         hb = 0
 
+        # Primeira consulta logo apos o startup; baseline impede desconto retroativo.
+        self.sync_withdrawals(force=True)
+
         while not STOP:
             now = datetime.now(UTC)
+
+            self.sync_withdrawals()
 
             for st in self.s["strategies"].values():
                 try:
@@ -1493,7 +1750,13 @@ class Bot:
                     f'phase={(st.get("pending") or {}).get("phase","-")}'
                     for st in self.s["strategies"].values()
                 )
-                log.info("HEARTBEAT | LIVE=%s | %s", LIVE, summary)
+                recon = self.s.get("capital_reconciliation", {})
+                log.info(
+                    "HEARTBEAT | LIVE=%s | withdrawn_applied=%s | %s",
+                    LIVE,
+                    recon.get("total_withdrawn_applied", "0"),
+                    summary,
+                )
                 hb = time.time()
 
             time.sleep(POLL_SECONDS)
