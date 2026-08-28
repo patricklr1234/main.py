@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V17 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
+# POLYMARKET BTC V18 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -89,7 +89,7 @@ def ensure_sdk():
 
 ensure_sdk()
 
-from polymarket import SecureClient, AssetType  # noqa: E402
+from polymarket import SecureClient, BuilderApiKey, RelayerApiKey  # noqa: E402
 
 
 TZ = ZoneInfo("America/Sao_Paulo")
@@ -102,6 +102,16 @@ BINANCE = "https://api.binance.com"
 PK = (os.getenv("POLYMARKET_PRIVATE_KEY") or os.getenv("PRIVATE_KEY") or "").strip()
 WALLET = os.getenv("POLYMARKET_DEPOSIT_WALLET", "").strip()
 LIVE = os.getenv("LIVE_TRADING", "0").lower() in ("1", "true", "yes", "on")
+
+# Credencial opcional/necessaria para operacoes gasless (Deposit Wallet).
+# Prioridade: RELAYER, se os 2 campos existirem; caso contrario BUILDER,
+# se os 3 campos existirem. Nenhum segredo e impresso nos logs.
+RELAYER_API_KEY = os.getenv("POLYMARKET_RELAYER_API_KEY", "").strip()
+RELAYER_API_KEY_ADDRESS = os.getenv("POLYMARKET_RELAYER_API_KEY_ADDRESS", "").strip()
+
+BUILDER_API_KEY = os.getenv("POLYMARKET_BUILDER_API_KEY", "").strip()
+BUILDER_SECRET = os.getenv("POLYMARKET_BUILDER_SECRET", "").strip()
+BUILDER_PASSPHRASE = os.getenv("POLYMARKET_BUILDER_PASSPHRASE", "").strip()
 
 INITIAL = Decimal(os.getenv("INITIAL_BANKROLL", "12.00"))
 INITIAL_EDGE = Decimal(os.getenv("INITIAL_EDGE", "0.10"))
@@ -129,7 +139,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v16")
+log = logging.getLogger("btc-polymarket-v18")
 STOP = False
 
 
@@ -158,7 +168,7 @@ def get(url, params=None):
     if params:
         url += "?" + urlencode(params)
     with urlopen(
-        Request(url, headers={"User-Agent": "btc-polymarket-v16"}),
+        Request(url, headers={"User-Agent": "btc-polymarket-v18"}),
         timeout=12,
     ) as r:
         return json.loads(r.read())
@@ -177,7 +187,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 17,
+        "version": 18,
         "strategies": {},
         "capital_reconciliation": {
             "initialized": False,
@@ -484,7 +494,7 @@ def sizing(st, min_shares, limit_price):
     O lado oposto usa exatamente o minimo de shares do mercado.
     O diferencial do lado direcional e definido em USDC.
 
-    MARTINGALE V17:
+    MARTINGALE V18:
     - a base e calculada apenas no inicio de uma sequencia;
     - essa base fica CONGELADA durante todas as perdas do ciclo;
     - o multiplicador 2**loss_streak e aplicado sobre a base congelada;
@@ -553,6 +563,64 @@ def rejected_reason(resp):
     return f"{getattr(resp, 'code', 'unknown')}: {getattr(resp, 'message', str(resp))}"
 
 
+
+def build_gasless_api_key():
+    """
+    Monta a credencial que o SDK oficial usa para transacoes gasless/relayer.
+
+    Aceita UM dos dois formatos:
+      RELAYER:
+        POLYMARKET_RELAYER_API_KEY
+        POLYMARKET_RELAYER_API_KEY_ADDRESS
+
+      BUILDER:
+        POLYMARKET_BUILDER_API_KEY
+        POLYMARKET_BUILDER_SECRET
+        POLYMARKET_BUILDER_PASSPHRASE
+
+    RELAYER tem prioridade quando ambos os conjuntos estiverem configurados.
+    """
+    relayer_any = bool(RELAYER_API_KEY or RELAYER_API_KEY_ADDRESS)
+    relayer_all = bool(RELAYER_API_KEY and RELAYER_API_KEY_ADDRESS)
+
+    builder_any = bool(BUILDER_API_KEY or BUILDER_SECRET or BUILDER_PASSPHRASE)
+    builder_all = bool(BUILDER_API_KEY and BUILDER_SECRET and BUILDER_PASSPHRASE)
+
+    if relayer_any and not relayer_all:
+        raise RuntimeError(
+            "Credencial RELAYER incompleta. Configure as duas variaveis: "
+            "POLYMARKET_RELAYER_API_KEY e POLYMARKET_RELAYER_API_KEY_ADDRESS."
+        )
+
+    if builder_any and not builder_all:
+        raise RuntimeError(
+            "Credencial BUILDER incompleta. Configure as tres variaveis: "
+            "POLYMARKET_BUILDER_API_KEY, POLYMARKET_BUILDER_SECRET e "
+            "POLYMARKET_BUILDER_PASSPHRASE."
+        )
+
+    if relayer_all:
+        return (
+            RelayerApiKey(
+                key=RELAYER_API_KEY,
+                address=RELAYER_API_KEY_ADDRESS,
+            ),
+            "RELAYER",
+        )
+
+    if builder_all:
+        return (
+            BuilderApiKey(
+                key=BUILDER_API_KEY,
+                secret=BUILDER_SECRET,
+                passphrase=BUILDER_PASSPHRASE,
+            ),
+            "BUILDER",
+        )
+
+    return None, "NONE"
+
+
 class Bot:
     def __init__(self):
         self.s = load()
@@ -564,12 +632,19 @@ class Bot:
                     "Configure POLYMARKET_PRIVATE_KEY/PRIVATE_KEY "
                     "e POLYMARKET_DEPOSIT_WALLET"
                 )
-            self.c = SecureClient.create(private_key=PK, wallet=WALLET)
+            gasless_api_key, gasless_mode = build_gasless_api_key()
+
+            self.c = SecureClient.create(
+                private_key=PK,
+                wallet=WALLET,
+                api_key=gasless_api_key,
+            )
             log.info(
-                "REAL | signer=%s wallet=%s type=%s",
+                "REAL | signer=%s wallet=%s type=%s | gasless_auth=%s",
                 self.c.signer,
                 self.c.wallet,
                 self.c.wallet_type,
+                gasless_mode,
             )
         else:
             log.info("SIMULACAO")
@@ -630,6 +705,41 @@ class Bot:
                 balance,
                 allowances,
             )
+
+            # Diagnostico objetivo para Deposit Wallet: se todos os allowances
+            # conhecidos estiverem zerados e nenhuma credencial gasless foi
+            # configurada, a primeira ordem seria inevitavelmente rejeitada.
+            try:
+                allowance_values = []
+                if isinstance(allowances, dict):
+                    for value in allowances.values():
+                        try:
+                            allowance_values.append(D(value))
+                        except Exception:
+                            pass
+
+                all_zero = bool(allowance_values) and all(v <= 0 for v in allowance_values)
+                gasless_api_key, gasless_mode = build_gasless_api_key()
+
+                if all_zero and gasless_api_key is None:
+                    log.error(
+                        "ALLOWANCE BLOQUEADO | todos os allowances de COLLATERAL estao em 0 "
+                        "| configure RELAYER (2 vars) ou BUILDER (3 vars) no Railway "
+                        "antes de permitir ordens LIVE"
+                    )
+                elif all_zero and gasless_api_key is not None:
+                    log.warning(
+                        "ALLOWANCE=0 | gasless_auth=%s configurada; o SDK tentara "
+                        "aprovar automaticamente no primeiro envio de ordem",
+                        gasless_mode,
+                    )
+                elif allowance_values:
+                    log.info(
+                        "ALLOWANCE PRONTO | ao menos um spender possui allowance > 0"
+                    )
+            except Exception:
+                log.exception("ALLOWANCE DIAGNOSTICO ERRO")
+
             return self.last_balance_snapshot
 
         except Exception:
@@ -875,6 +985,25 @@ class Bot:
                 "price": str(price),
                 "size": str(shares),
             }
+
+        if LIVE:
+            snap = self.last_balance_snapshot or self.sync_balance(force=True)
+            if snap:
+                allowances = snap.get("allowances")
+                vals = []
+                if isinstance(allowances, dict):
+                    for value in allowances.values():
+                        try:
+                            vals.append(D(value))
+                        except Exception:
+                            pass
+                all_zero = bool(vals) and all(v <= 0 for v in vals)
+                gasless_api_key, gasless_mode = build_gasless_api_key()
+                if all_zero and gasless_api_key is None:
+                    raise RuntimeError(
+                        "ALLOWANCE=0 e nenhuma credencial gasless configurada. "
+                        "Configure RELAYER ou BUILDER no Railway."
+                    )
 
         try:
             return self.c.place_limit_order(
@@ -1832,14 +1961,16 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=17 | ENTRY_SECONDS=%s", ENTRY_SECONDS)
+        log.info("STARTUP OK | codigo carregado | versao=18 | ENTRY_SECONDS=%s", ENTRY_SECONDS)
+        _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V17 FINAL | LIVE=%s | 6 ROBOS | "
+            "POLYMARKET BTC V18 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | SO ENVIA SE AMBOS<=%s ANTES DO INICIO | "
             "PARTIAL=PROPORCIONAL | SE 1 FULL: OUTRO 100%% ATE FINAL | "
             "SAQUES=AUTO_PROPORCIONAL | BALANCE=MONITORADO | MARTINGALE_BASE=CONGELADA_POR_CICLO | TARGET=%s | DATA=%s",
             LIVE,
+            gasless_mode,
             INITIAL,
             ENTRY_SECONDS,
             MAX_BUY_PRICE,
