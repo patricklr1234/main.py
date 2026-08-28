@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V16 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
+# POLYMARKET BTC V17 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -177,7 +177,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 16,
+        "version": 17,
         "strategies": {},
         "capital_reconciliation": {
             "initialized": False,
@@ -484,7 +484,7 @@ def sizing(st, min_shares, limit_price):
     O lado oposto usa exatamente o minimo de shares do mercado.
     O diferencial do lado direcional e definido em USDC.
 
-    MARTINGALE V16:
+    MARTINGALE V17:
     - a base e calculada apenas no inicio de uma sequencia;
     - essa base fica CONGELADA durante todas as perdas do ciclo;
     - o multiplicador 2**loss_streak e aplicado sobre a base congelada;
@@ -610,7 +610,7 @@ class Bot:
         self.last_balance_sync = now_monotonic
 
         try:
-            info = self.c.get_balance_allowance(asset_type=AssetType.COLLATERAL)
+            info = self.c.get_balance_allowance(asset_type="COLLATERAL")
 
             balance = self._obj_field(info, "balance", default=None)
             allowances = self._obj_field(info, "allowances", "allowance", default=None)
@@ -876,13 +876,31 @@ class Bot:
                 "size": str(shares),
             }
 
-        return self.c.place_limit_order(
-            token_id=token,
-            price=price,
-            size=shares,
-            side="BUY",
-            post_only=False,
-        )
+        try:
+            return self.c.place_limit_order(
+                token_id=token,
+                price=price,
+                size=shares,
+                side="BUY",
+                post_only=False,
+            )
+        except Exception as exc:
+            log.exception(
+                "ORDEM REJEITADA | token=%s | price=%s | shares=%s | erro=%s | tipo=%s",
+                token,
+                price,
+                shares,
+                exc,
+                type(exc).__name__,
+            )
+            # Forca uma leitura de saldo/allowance logo apos a rejeicao.
+            # Se a leitura tambem falhar, sync_balance registra o traceback
+            # separadamente sem esconder o motivo original da ordem.
+            try:
+                self.sync_balance(force=True)
+            except Exception:
+                pass
+            raise
 
     def cancel_ids(self, ids):
         ids = [str(x) for x in ids if x]
@@ -1814,9 +1832,9 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=16 | ENTRY_SECONDS=%s", ENTRY_SECONDS)
+        log.info("STARTUP OK | codigo carregado | versao=17 | ENTRY_SECONDS=%s", ENTRY_SECONDS)
         log.info(
-            "POLYMARKET BTC V16 FINAL | LIVE=%s | 6 ROBOS | "
+            "POLYMARKET BTC V17 FINAL | LIVE=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | SO ENVIA SE AMBOS<=%s ANTES DO INICIO | "
             "PARTIAL=PROPORCIONAL | SE 1 FULL: OUTRO 100%% ATE FINAL | "
