@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V21 FINAL - T-30 + ENVIO SIMULTANEO + SAQUES AUTOMATICOS + PROPORTIONAL PARTIAL FILL
+# POLYMARKET BTC V25 FINAL - RECOVERY DEFICIT + TARGET LIQUIDO + AUTO-REDEEM
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -38,15 +38,16 @@ from urllib.parse import urlencode
 #   - se houve fill unilateral/parcial, ele NAO pode ser "cancelado";
 #     a exposicao executada e registrada e acompanhada ate a resolucao
 #
-# SIZING
+# SIZING V25
 #   - caixa inicial independente: US$12
 #   - lado oposto: minimum_order_size do mercado (EM SHARES)
-#   - diferencial direcional inicial: US$0.25
-#   - lucro acumulado > US$5:
-#         diferencial = 1% do bankroll, arredondado para cima ao centavo
-#   - bankroll > US$1000:
-#         diferencial-base = US$10
-#   - martingale dobra SOMENTE o diferencial
+#   - lucro-base liquido: 5m=US$0.25 | 15m=US$0.50 | 1h=US$0.75
+#   - recovery_deficit acumula todo PNL negativo ainda nao recuperado
+#   - proxima meta liquida = recovery_deficit + lucro-base do timeframe
+#   - PNL positivo abate o deficit; o deficit nunca fica negativo
+#   - lucro acumulado > US$5: lucro-base = 1% do bankroll (ceil cent)
+#   - bankroll > US$1000: lucro-base = US$10
+#   - sizing garante a meta no pior preco limite, assumindo fill integral
 #   - maximo de US$1000 de gasto teorico por perna
 #   - objetivo: US$200,000 por robo
 #
@@ -57,11 +58,11 @@ from urllib.parse import urlencode
 #   - trades, fills, ordens abertas, splits, merges e redeems NAO contam como saque
 #   - eventos ja processados sao persistidos para nunca descontar duas vezes
 #
-# RESGATE AUTOMATICO V20
+# RESGATE AUTOMATICO V25
 #   - quando a rodada resolve e ha shares vencedoras, enfileira condition_id
-#   - chama SecureClient.redeem_positions(condition_id=...) via credencial gasless
-#   - espera a transacao e registra sucesso
-#   - em falha temporaria, mantem fila persistente e tenta novamente
+#   - setup_trading_approvals habilita o auto-redeem operator oficial
+#   - nao envia redeem_positions()/POST /submit manualmente
+#   - reconcilia ate a posicao desaparecer em 2 verificacoes
 #   - evita resgate duplicado do mesmo condition_id
 # ============================================================
 
@@ -121,7 +122,12 @@ BUILDER_SECRET = os.getenv("POLYMARKET_BUILDER_SECRET", "").strip()
 BUILDER_PASSPHRASE = os.getenv("POLYMARKET_BUILDER_PASSPHRASE", "").strip()
 
 INITIAL = Decimal(os.getenv("INITIAL_BANKROLL", "12.00"))
-INITIAL_EDGE = Decimal("0.25")  # FIXO V20: diferencial inicial de US$0.25
+EDGE_5M = Decimal("0.25")
+EDGE_15M = Decimal("0.50")
+EDGE_1H = Decimal("0.75")
+BASE_EDGE_BY_TF = {"5m": EDGE_5M, "15m": EDGE_15M, "1h": EDGE_1H}
+# Compatibilidade nominal com estados/logs antigos; sizing V25 usa BASE_EDGE_BY_TF.
+INITIAL_EDGE = EDGE_5M
 PROFIT_SWITCH = Decimal(os.getenv("PROFIT_SWITCH", "5.00"))
 HIGH_BANKROLL_EDGE = Decimal(os.getenv("HIGH_BANKROLL_EDGE", "10.00"))
 MAX_ENTRY = Decimal(os.getenv("MAX_ENTRY", "1000.00"))
@@ -146,7 +152,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v21")
+log = logging.getLogger("btc-polymarket-v25")
 STOP = False
 
 
@@ -171,11 +177,15 @@ def floor_6(x):
     return D(x).quantize(Decimal("0.000001"), rounding=ROUND_FLOOR)
 
 
+def ceil_6(x):
+    return D(x).quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
+
+
 def get(url, params=None):
     if params:
         url += "?" + urlencode(params)
     with urlopen(
-        Request(url, headers={"User-Agent": "btc-polymarket-v21"}),
+        Request(url, headers={"User-Agent": "btc-polymarket-v25"}),
         timeout=12,
     ) as r:
         return json.loads(r.read())
@@ -194,7 +204,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 21,
+        "version": 25,
         "strategies": {},
         "capital_reconciliation": {
             "initialized": False,
@@ -219,7 +229,8 @@ def fresh():
                 "session": session,
                 "bankroll": str(INITIAL),
                 "loss_streak": 0,
-                "martingale_base_edge": None,
+                "martingale_base_edge": None,  # legado; V25 usa recovery_deficit
+                "recovery_deficit": "0",
                 "wins": 0,
                 "losses": 0,
                 "trades": 0,
@@ -252,6 +263,7 @@ def load():
                 "bankroll",
                 "loss_streak",
                 "martingale_base_edge",
+                "recovery_deficit",
                 "wins",
                 "losses",
                 "trades",
@@ -292,19 +304,52 @@ def load():
                 if field in redemption:
                     dst_redemption[field] = redemption[field]
 
-        # Migracao V20: estados antigos podiam ter congelado a base inicial em
-        # US$0.10. Na faixa inicial (lucro <= US$5), converte essa base antiga
-        # para US$0.25, inclusive se ja houver loss_streak em andamento.
-        for st in new["strategies"].values():
+        # Migracao V25: cria um deficit financeiro persistente para cada robo.
+        # Se o estado antigo ainda nao tinha esse campo, tenta reconstruir o
+        # drawdown nao recuperado a partir das resolucoes auditadas em trades.jsonl.
+        # Regra: LOSS adiciona abs(PNL); WIN financeiro abate o deficit; nunca < 0.
+        old_strategies = old.get("strategies", {}) if isinstance(old, dict) else {}
+        needs_rebuild = {
+            name for name in new["strategies"]
+            if "recovery_deficit" not in (old_strategies.get(name) or {})
+        }
+        rebuilt = {name: D("0") for name in needs_rebuild}
+        if needs_rebuild and TRADES.exists():
             try:
-                frozen = st.get("martingale_base_edge")
-                profit = D(st["bankroll"]) - INITIAL
-                if frozen not in (None, "", "None") and D(frozen) == D("0.10") and profit <= PROFIT_SWITCH:
-                    st["martingale_base_edge"] = str(INITIAL_EDGE)
+                for line in TRADES.read_text().splitlines():
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    if rec.get("type") != "resolution":
+                        continue
+                    name = str(rec.get("strategy") or "")
+                    if name not in rebuilt:
+                        continue
+                    pnl = D(rec.get("pnl") or "0")
+                    if pnl < 0:
+                        rebuilt[name] += -pnl
+                    elif pnl > 0:
+                        rebuilt[name] = max(D("0"), rebuilt[name] - pnl)
             except Exception:
-                pass
+                log.exception("MIGRACAO V25 | falha ao reconstruir recovery_deficit pelo audit")
 
-        new["version"] = 21
+        for name in needs_rebuild:
+            st = new["strategies"][name]
+            deficit = rebuilt.get(name, D("0"))
+            # Fallback conservador quando nao existe audit persistente: se o PnL
+            # logico acumulado do robo estiver negativo, pelo menos esse valor e
+            # carregado como deficit.
+            if deficit <= 0:
+                try:
+                    rpnl = D(st.get("realized_pnl", "0"))
+                    if rpnl < 0:
+                        deficit = -rpnl
+                except Exception:
+                    pass
+            st["recovery_deficit"] = str(max(D("0"), deficit))
+            st["martingale_base_edge"] = None
+
+        new["version"] = 25
         save(new)
         return new
     except Exception:
@@ -506,6 +551,7 @@ def session_allows_round(st, round_start):
 
 
 def base_edge(st):
+    """Lucro-base desejado para uma operacao normal deste robo."""
     b = D(st["bankroll"])
     profit = b - INITIAL
 
@@ -515,63 +561,98 @@ def base_edge(st):
     if profit > PROFIT_SWITCH:
         return ceil_cent(b * D("0.01"))
 
-    return INITIAL_EDGE
+    return BASE_EDGE_BY_TF.get(st.get("tf"), EDGE_5M)
+
+
+def recovery_target(st):
+    """
+    Meta liquida V25.
+
+    Sem deficit: lucro-base do timeframe.
+    Com deficit: TODO o prejuizo ainda nao recuperado + lucro-base.
+
+    Exemplo 5m:
+      deficit=0.27 -> target=0.27+0.25=0.52
+      nova perda=0.60 -> deficit=0.87 -> target=1.12
+    """
+    base = D(base_edge(st))
+    deficit = max(D("0"), D(st.get("recovery_deficit", "0") or "0"))
+    return base, deficit, deficit + base
 
 
 def sizing(st, min_shares, limit_price):
     """
-    min_shares: minimo do mercado em SHARES.
+    Dimensiona a perna direcional para garantir a META LIQUIDA no pior preco
+    permitido, assumindo fill integral das duas pernas.
 
-    O lado oposto usa exatamente o minimo de shares do mercado.
-    O diferencial do lado direcional e definido em USDC.
+    Se qd = shares direcionais, qo = shares opostas e p = limit_price:
+        lucro se direcao vencer = qd - qd*p - qo*p
 
-    MARTINGALE V20:
-    - a base e calculada apenas no inicio de uma sequencia;
-    - essa base fica CONGELADA durante todas as perdas do ciclo;
-    - o multiplicador 2**loss_streak e aplicado sobre a base congelada;
-    - apos uma vitoria, a base e apagada e sera recalculada na proxima entrada.
+    Logo:
+        qd >= (target + qo*p) / (1-p)
 
-    Como a ordem e LIMIT @ <=0.55, o gasto maximo teorico e:
-        shares * limit_price
+    Usa ROUND_CEILING em 6 casas para nunca arredondar a meta para baixo.
     """
     min_shares = D(min_shares)
     limit_price = D(limit_price)
+    if min_shares <= 0 or limit_price <= 0 or limit_price >= 1:
+        raise ValueError("min_shares/limit_price invalidos para sizing")
 
     opposite_shares = min_shares
     opposite_max_spend = opposite_shares * limit_price
 
-    frozen = st.get("martingale_base_edge")
-    if frozen in (None, "", "None"):
-        # Calcula a candidata, mas so a persiste quando a entrada e realmente
-        # preparada e passa pelas validacoes de mercado/capital.
-        frozen = base_edge(st)
-    else:
-        frozen = D(frozen)
-
-    edge = frozen * (D(2) ** int(st["loss_streak"]))
-    edge = min(edge, MAX_ENTRY)
-
-    directional_max_spend_target = min(
-        opposite_max_spend + edge,
-        MAX_ENTRY,
-    )
-    directional_shares = floor_6(directional_max_spend_target / limit_price)
-
-    # Garante minimo e nao passa do teto em USDC.
+    base, deficit, target = recovery_target(st)
+    directional_shares = ceil_6((target + opposite_max_spend) / (D("1") - limit_price))
     directional_shares = max(directional_shares, min_shares)
-    if directional_shares * limit_price > MAX_ENTRY:
-        directional_shares = floor_6(MAX_ENTRY / limit_price)
 
     directional_max_spend = directional_shares * limit_price
-    actual_edge_at_limit = max(D("0"), directional_max_spend - opposite_max_spend)
+    guaranteed_net_at_limit = directional_shares - directional_max_spend - opposite_max_spend
+
+    if opposite_max_spend > MAX_ENTRY or directional_max_spend > MAX_ENTRY:
+        return {
+            "blocked": True,
+            "reason": "MAX_ENTRY",
+            "base_profit": base,
+            "recovery_deficit": deficit,
+            "target_net_profit": target,
+            "opposite_shares": opposite_shares,
+            "directional_shares": directional_shares,
+            "opposite_max_spend": opposite_max_spend,
+            "directional_max_spend": directional_max_spend,
+            "guaranteed_net_at_limit": guaranteed_net_at_limit,
+            "edge": target,
+            "martingale_base_edge": base,
+        }
+
+    if guaranteed_net_at_limit < target:
+        return {
+            "blocked": True,
+            "reason": "TARGET_NOT_GUARANTEED",
+            "base_profit": base,
+            "recovery_deficit": deficit,
+            "target_net_profit": target,
+            "opposite_shares": opposite_shares,
+            "directional_shares": directional_shares,
+            "opposite_max_spend": opposite_max_spend,
+            "directional_max_spend": directional_max_spend,
+            "guaranteed_net_at_limit": guaranteed_net_at_limit,
+            "edge": target,
+            "martingale_base_edge": base,
+        }
 
     return {
+        "blocked": False,
+        "reason": None,
+        "base_profit": base,
+        "recovery_deficit": deficit,
+        "target_net_profit": target,
         "opposite_shares": opposite_shares,
         "directional_shares": directional_shares,
         "opposite_max_spend": opposite_max_spend,
         "directional_max_spend": directional_max_spend,
-        "edge": actual_edge_at_limit,
-        "martingale_base_edge": frozen,
+        "guaranteed_net_at_limit": guaranteed_net_at_limit,
+        "edge": target,
+        "martingale_base_edge": base,
     }
 
 
@@ -690,6 +771,21 @@ class Bot:
             self.sync_balance(force=True)
 
     # -------------------- AUTOMATIC POSITION REDEMPTION --------------------
+
+    def ensure_auto_redeem_operator(self):
+        """Best-effort setup of official trading/auto-redeem approvals."""
+        if not LIVE or not self.c:
+            return
+        fn = getattr(self.c, "setup_trading_approvals", None)
+        if not callable(fn):
+            log.warning("AUTO-REDEEM OPERATOR | SDK sem setup_trading_approvals; seguindo sem bloquear trading")
+            return
+        try:
+            handle = fn()
+            outcome = handle.wait() if hasattr(handle, "wait") else handle
+            log.info("AUTO-REDEEM OPERATOR | APROVACOES OK | outcome=%s", outcome)
+        except Exception as exc:
+            log.warning("AUTO-REDEEM OPERATOR | falha ao confirmar aprovacoes; trading continua | erro=%r", exc)
 
     def enqueue_redemption(self, pending, winning_shares):
         """Persist a resolved winning condition for gasless redemption.
@@ -846,15 +942,11 @@ class Bot:
         })
 
     def process_redemptions(self, force=False):
-        """Redeem only positions that the Positions API still marks redeemable.
-
-        V21 prevents repeated relayer submissions against already-settled positions:
-        1) inspect the wallet's current position for the condition;
-        2) submit redeem only when redeemable=True and size>0;
-        3) keep a non-redeemable live position queued with a slower retry;
-        4) require two consecutive ABSENT observations before treating a condition
-           as already redeemed/settled;
-        5) after a relayer revert, re-inspect before scheduling another submit.
+        """
+        V25/V22: nao envia redeem_positions() manualmente para Deposit Wallet.
+        O operator oficial faz o auto-redeem; esta fila apenas reconcilia a
+        posicao ate ela desaparecer. Isso evita o POST /submit que ja se mostrou
+        sujeito a revert no relayer.
         """
         if not LIVE or not self.c:
             return
@@ -890,7 +982,6 @@ class Bot:
 
             condition_id = str(item.get("condition_id") or "").strip()
             slug = str(item.get("slug") or "").strip()
-
             if not condition_id and slug:
                 try:
                     mm = market(event(slug))
@@ -902,13 +993,10 @@ class Bot:
                     pass
 
             if not condition_id:
-                item["attempts"] = int(item.get("attempts") or 0) + 1
                 item["next_try_epoch"] = now_epoch + 30
                 kept.append(item)
                 changed = True
-                log.warning("RESGATE | condition_id ainda indisponivel | slug=%s", slug)
                 continue
-
             if condition_id in processed:
                 changed = True
                 continue
@@ -918,151 +1006,59 @@ class Bot:
             status = inspection.get("status")
 
             if status == "ERROR":
-                item["inspection_errors"] = int(item.get("inspection_errors") or 0) + 1
-                item["next_try_epoch"] = now_epoch + 60
+                item["next_try_epoch"] = now_epoch + 120
                 item["last_error"] = inspection.get("error")
                 kept.append(item)
                 changed = True
-                log.warning(
-                    "RESGATE | PRE-CHECK FALHOU | condition_id=%s | retry=60s | erro=%s",
-                    condition_id,
-                    inspection.get("error"),
-                )
+                log.warning("RESGATE | PRE-CHECK FALHOU | condition_id=%s | retry=120s | erro=%s", condition_id, inspection.get("error"))
                 continue
 
             if status == "ABSENT":
-                absent_n = int(item.get("absent_confirmations") or 0) + 1
-                item["absent_confirmations"] = absent_n
+                n = int(item.get("absent_confirmations") or 0) + 1
+                item["absent_confirmations"] = n
                 changed = True
-
-                if absent_n >= 2:
+                if n >= 2:
                     self._finish_redemption_reconciliation(
                         rec, processed, item,
-                        reason="already_settled_or_no_open_position",
+                        reason="auto_operator_settled_or_no_open_position",
                         inspection=inspection,
                     )
-                    log.info(
-                        "RESGATE RECONCILIADO | condition_id=%s | sem posicao aberta em 2 verificacoes; "
-                        "considerado ja liquidado/resgatado",
-                        condition_id,
-                    )
+                    log.info("RESGATE RECONCILIADO | condition_id=%s | sem posicao aberta em 2 verificacoes; considerado ja liquidado/resgatado", condition_id)
                     continue
-
                 item["next_try_epoch"] = now_epoch + 30
                 kept.append(item)
-                log.info(
-                    "RESGATE | SEM POSICAO ABERTA | condition_id=%s | confirmacao=1/2 | retry=30s",
-                    condition_id,
-                )
+                log.info("RESGATE | SEM POSICAO ABERTA | condition_id=%s | confirmacao=1/2 | retry=30s", condition_id)
                 continue
 
-            # Qualquer posicao reaparecendo zera a confirmacao de ausencia.
             if item.get("absent_confirmations"):
                 item["absent_confirmations"] = 0
                 changed = True
 
             if status == "NOT_READY":
-                item["not_ready_checks"] = int(item.get("not_ready_checks") or 0) + 1
-                # Nao martela o relayer: a posicao existe, mas a Data API ainda nao a
-                # classifica como redeemable. Reconsulta em 60s sem POST /submit.
                 item["next_try_epoch"] = now_epoch + 60
                 kept.append(item)
                 changed = True
-                log.info(
-                    "RESGATE | AINDA NAO RESGATAVEL | condition_id=%s | size=%s | retry=60s",
-                    condition_id,
-                    inspection.get("total_size"),
-                )
+                log.info("RESGATE | AINDA NAO RESGATAVEL | condition_id=%s | size=%s | retry=60s", condition_id, inspection.get("total_size"))
                 continue
 
-            # Somente REDEEMABLE chega ao relayer.
+            # REDEEMABLE: deixa o operator oficial liquidar; zero POST /submit.
+            queued_at = item.get("queued_at")
+            age = 0
             try:
-                log.info(
-                    "RESGATE | PRE-CHECK OK | condition_id=%s | redeemable_size=%s | enviando ao relayer",
-                    condition_id,
-                    inspection.get("redeemable_size"),
-                )
-                handle = self.c.redeem_positions(condition_id=condition_id)
-                outcome = handle.wait()
-                self._finish_redemption_reconciliation(
-                    rec, processed, item,
-                    reason="redeem_submitted_successfully",
-                    inspection=inspection,
-                    outcome=outcome,
-                )
-                log.info(
-                    "RESGATE AUTOMATICO OK | condition_id=%s | slug=%s | outcome=%s",
-                    condition_id,
-                    slug,
-                    outcome,
-                )
-                changed = True
-                continue
-
-            except Exception as exc:
-                item["attempts"] = int(item.get("attempts") or 0) + 1
-                item["last_error"] = repr(exc)
-
-                # Uma falha pode ser corrida com auto-settlement/auto-redeem. Rele a
-                # posicao imediatamente e, sobretudo, NAO repete POST em poucos segundos.
-                post = self._inspect_redeemable_position(condition_id)
-                post_status = post.get("status")
-
-                if post_status == "ABSENT":
-                    item["absent_confirmations"] = int(item.get("absent_confirmations") or 0) + 1
-                    item["next_try_epoch"] = now_epoch + 30
-                    kept.append(item)
-                    changed = True
-                    log.warning(
-                        "RESGATE | RELAYER REVERTEU MAS POSICAO SUMIU | condition_id=%s | "
-                        "confirmacao=%s/2 | retry somente pre-check em 30s | erro=%r",
-                        condition_id,
-                        item["absent_confirmations"],
-                        exc,
-                    )
-                    continue
-
-                if post_status == "NOT_READY":
-                    item["next_try_epoch"] = now_epoch + 60
-                    kept.append(item)
-                    changed = True
-                    log.warning(
-                        "RESGATE | RELAYER REVERTEU E POSICAO NAO ESTA REDEEMABLE | "
-                        "condition_id=%s | retry=60s sem novo POST ate novo pre-check | erro=%r",
-                        condition_id,
-                        exc,
-                    )
-                    continue
-
-                if post_status == "ERROR":
-                    delay = min(300, 60 * max(1, item["attempts"]))
-                    item["next_try_epoch"] = now_epoch + delay
-                    kept.append(item)
-                    changed = True
-                    log.warning(
-                        "RESGATE AUTOMATICO PENDENTE | condition_id=%s | tentativa=%s | "
-                        "pre-check pos-falha indisponivel | retry=%ss | erro=%r",
-                        condition_id,
-                        item["attempts"],
-                        delay,
-                        exc,
-                    )
-                    continue
-
-                # Se continua REDEEMABLE, conserva na fila, mas com backoff longo.
-                # Repetir a cada 5-20s foi exatamente o comportamento indesejado da V20.
-                delay = min(600, 60 * (2 ** min(item["attempts"] - 1, 3)))
-                item["next_try_epoch"] = now_epoch + delay
-                kept.append(item)
-                changed = True
-                log.warning(
-                    "RESGATE AUTOMATICO PENDENTE | condition_id=%s | continua redeemable | "
-                    "tentativa=%s | retry=%ss | erro=%r",
-                    condition_id,
-                    item["attempts"],
-                    delay,
-                    exc,
-                )
+                age = max(0, now_epoch - datetime.fromisoformat(queued_at).timestamp()) if queued_at else 0
+            except Exception:
+                age = 0
+            delay = 120 if age >= 600 else 60
+            item["next_try_epoch"] = now_epoch + delay
+            kept.append(item)
+            changed = True
+            log.info(
+                "RESGATE | REDEEMABLE CONFIRMADO | condition_id=%s | redeemable_size=%s | AUTO-OPERATOR aguardando | sem POST /submit | retry=%ss",
+                condition_id, inspection.get("redeemable_size"), delay,
+            )
+            if age >= 1800 and not item.get("warned_30m"):
+                item["warned_30m"] = True
+                log.warning("AUTO-OPERATOR AINDA PENDENTE HA >30min | condition_id=%s | posicao continua redeemable", condition_id)
 
         if changed:
             rec["processed_condition_ids"] = list(processed)[-5000:]
@@ -1343,7 +1339,7 @@ class Bot:
                 })
                 req = Request(
                     f"https://data-api.polymarket.com/activity?{params}",
-                    headers={"User-Agent": "btc-polymarket-v21"},
+                    headers={"User-Agent": "btc-polymarket-v25"},
                 )
                 with urlopen(req, timeout=15) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -1826,19 +1822,27 @@ class Bot:
         sz = sizing(st, min_shares, limit_price)
         worst_total = sz["directional_max_spend"] + sz["opposite_max_spend"]
 
-        if worst_total > D(st["bankroll"]):
+        if sz.get("blocked"):
             log.warning(
-                "%s | BLOQUEADO: pior gasto %s > bankroll %s",
-                st["name"],
-                worst_total,
-                st["bankroll"],
+                "%s | BLOQUEADO V25: sizing impossivel | motivo=%s | base=%s | deficit=%s | target_liquido=%s | dir_spend=%s | opp_spend=%s",
+                st["name"], sz.get("reason"), sz["base_profit"], sz["recovery_deficit"],
+                sz["target_net_profit"], sz["directional_max_spend"], sz["opposite_max_spend"],
             )
             return
 
-        # A sequencia de Martingale passa a existir a partir daqui: mercado,
-        # sizing e capital ja foram validados. Congela/persiste a base do ciclo.
-        if st.get("martingale_base_edge") in (None, "", "None"):
-            st["martingale_base_edge"] = str(sz["martingale_base_edge"])
+        if worst_total > D(st["bankroll"]):
+            log.warning(
+                "%s | BLOQUEADO V25: pior gasto %s > bankroll %s | deficit=%s | target_liquido=%s",
+                st["name"], worst_total, st["bankroll"], sz["recovery_deficit"], sz["target_net_profit"],
+            )
+            return
+
+        st["martingale_base_edge"] = None
+        log.info(
+            "%s | SIZING V25 | BASE=%s | DEFICIT_RECUPERAR=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=%s | GASTO_MAX=%s | LUCRO_MIN_NO_LIMITE=%s",
+            st["name"], sz["base_profit"], sz["recovery_deficit"], sz["target_net_profit"],
+            sz["directional_shares"], sz["opposite_shares"], worst_total, sz["guaranteed_net_at_limit"],
+        )
 
         directional_token = m["up"] if direction == "UP" else m["down"]
         opposite_token = m["down"] if direction == "UP" else m["up"]
@@ -1869,7 +1873,11 @@ class Bot:
             "limit_price": str(limit_price),
             "minimum_order_shares": str(min_shares),
             "edge_at_limit": str(sz["edge"]),
-            "martingale_base_edge": str(st["martingale_base_edge"]),
+            "base_profit_target": str(sz["base_profit"]),
+            "recovery_deficit_before": str(sz["recovery_deficit"]),
+            "target_net_profit": str(sz["target_net_profit"]),
+            "guaranteed_net_at_limit": str(sz["guaranteed_net_at_limit"]),
+            "martingale_base_edge": None,
             "signal_locked_at": datetime.now(UTC).isoformat(),
             "live": LIVE,
             "last_wait_log": 0,
@@ -2295,18 +2303,21 @@ class Bot:
         st["trades"] += 1
 
         directional_win = (w == direction)
+        deficit_before = max(D("0"), D(st.get("recovery_deficit", "0") or "0"))
+        if pnl < 0:
+            deficit_after = deficit_before + (-pnl)
+        elif pnl > 0:
+            deficit_after = max(D("0"), deficit_before - pnl)
+        else:
+            deficit_after = deficit_before
+        st["recovery_deficit"] = str(deficit_after)
+        st["martingale_base_edge"] = None
+
         if directional_win:
             st["wins"] += 1
             st["loss_streak"] = 0
-            # Encerra o ciclo. A proxima entrada calcula uma nova base
-            # usando o bankroll atualizado naquele momento.
-            st["martingale_base_edge"] = None
         else:
             st["losses"] += 1
-            # A base do ciclo permanece congelada. Em estados migrados antigos,
-            # garante uma base valida antes de incrementar a sequencia.
-            if st.get("martingale_base_edge") in (None, "", "None"):
-                st["martingale_base_edge"] = str(base_edge(st))
             st["loss_streak"] += 1
 
         audit({
@@ -2324,6 +2335,10 @@ class Bot:
             "bankroll_after": str(bankroll),
             "loss_streak_after": st["loss_streak"],
             "martingale_base_edge_after": st.get("martingale_base_edge"),
+            "recovery_deficit_before": str(deficit_before),
+            "recovery_deficit_after": str(deficit_after),
+            "next_base_profit": str(base_edge(st)),
+            "next_target_if_signal": str(deficit_after + D(base_edge(st))),
             "ts": datetime.now(UTC).isoformat(),
         })
 
@@ -2331,14 +2346,15 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | WINNER=%s | %s | PNL=%s | BANKROLL=%s | loss_streak=%s | martingale_base=%s",
+            "%s | WINNER=%s | %s | PNL=%s | BANKROLL=%s | loss_streak=%s | DEFICIT_RECUPERAR=%s | PROX_TARGET=%s",
             st["name"],
             w,
             "WIN" if directional_win else "LOSS",
             pnl,
             bankroll,
             st["loss_streak"],
-            st.get("martingale_base_edge"),
+            st.get("recovery_deficit"),
+            D(st.get("recovery_deficit", "0")) + D(base_edge(st)),
         )
 
     # ------------------------- LOOP -------------------------
@@ -2407,37 +2423,42 @@ class Bot:
             return
 
         log.info(
-            "%s | SINAL APROVADO | direction=%s | dirs=%s | macd=%s | signal=%s | loss_streak=%s | martingale_base=%s",
+            "%s | SINAL APROVADO | direction=%s | dirs=%s | macd=%s | signal=%s | loss_streak=%s | recovery_deficit=%s",
             st["name"],
             direction,
             dirs,
             macd,
             sig,
             st["loss_streak"],
-            st.get("martingale_base_edge"),
+            st.get("recovery_deficit", "0"),
         )
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=21 | ENTRY_SECONDS=%s | INITIAL_EDGE=%s", ENTRY_SECONDS, INITIAL_EDGE)
+        log.info("STARTUP OK | codigo carregado | versao=25 | ENTRY_SECONDS=%s | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=DEFICIT_ACUMULADO+BASE", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V21 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V25 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | SO ENVIA SE AMBOS<=%s ANTES DO INICIO | "
             "PARTIAL=PROPORCIONAL | SE 1 FULL: OUTRO 100%% ATE FINAL | "
-            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_PRECHECK | BALANCE=MONITORADO | MARTINGALE_BASE=CONGELADA_POR_CICLO | EDGE_INICIAL=%s | TARGET=%s | DATA=%s",
+            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO | MARTINGALE=DEFICIT_ACUMULADO+BASE | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
             LIVE,
             gasless_mode,
             INITIAL,
             ENTRY_SECONDS,
             MAX_BUY_PRICE,
-            INITIAL_EDGE,
+            EDGE_5M,
+            EDGE_15M,
+            EDGE_1H,
             TARGET,
             ROOT,
         )
 
         hb = 0
+
+        # Confirma approvals do operator oficial antes das reconciliacoes.
+        self.ensure_auto_redeem_operator()
 
         # Primeira consulta logo apos o startup; baseline impede desconto retroativo.
         self.sync_withdrawals(force=True)
@@ -2461,7 +2482,7 @@ class Bot:
                 summary = " | ".join(
                     f'{st["name"]}:bank={st["bankroll"]},'
                     f'L={st["loss_streak"]},'
-                    f'MB={st.get("martingale_base_edge") or "-"},'
+                    f'RD={st.get("recovery_deficit", "0")},'
                     f'phase={(st.get("pending") or {}).get("phase","-")}'
                     for st in self.s["strategies"].values()
                 )
