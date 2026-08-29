@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-# V34 - RESET TOTAL UNICO + CONFIRMACAO MACD LIVE
+# V36 - RD/STOP LOSS FINANCEIRO EXPLICITO + PAR ATE DEFICIT >= USD1 + MACD LIVE
 # - inicia os 6 robos em bankroll 12, loss_streak 0 e recovery_deficit 0
 # - zera estatisticas logicas antigas (wins/losses/trades/realized_pnl/last_trigger)
 # - reset e aplicado uma unica vez e somente sem pending ativo
 # - mantem a confirmacao V33: MACD fechado + MACD ao vivo fortalecendo a direcao
+# - V36 registra PNL/STOP_LOSS/RD explicitamente e usa PNL liquido para loss_streak/martingale
 import os
 import sys
 import json
@@ -24,7 +25,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V34 FINAL - CONFIRMACAO MACD AO VIVO + RESET UNICO + CALENDARIO RESILIENTE
+# POLYMARKET BTC V36 FINAL - RD/STOP LOSS FINANCEIRO EXPLICITO + SWITCH PELO DEFICIT + MACD AO VIVO + RESET V34 PRESERVADO
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -36,10 +37,10 @@ from urllib.parse import urlencode
 #     na mesma direcao + MACD alinhado
 #
 # EXECUCAO
-#   - modo PAR enquanto a meta liquida estiver abaixo de US$1,00
-#   - modo DIRECIONAL-ONLY quando target >= US$1,00
-#   - fallback DIRECIONAL-ONLY se o par exceder o bankroll individual
-#     e a ponta direcional isolada couber no bankroll
+#   - modo PAR enquanto recovery_deficit < US$1,00
+#   - modo DIRECIONAL-ONLY somente quando recovery_deficit >= US$1,00
+#   - SEM fallback para DIRECIONAL-ONLY por falta de caixa: abaixo de US$1 de
+#     deficit, se o PAR nao couber no bankroll, a rodada e bloqueada
 #   - nenhuma ordem e enviada acima de 0.55
 #   - no modo PAR, duas BUY LIMIT GTC, uma em cada outcome
 #   - no modo DIRECIONAL-ONLY, envia somente a BUY da direcao do sinal
@@ -252,7 +253,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 34,
+        "version": 36,
         "strategies": {},
         "maintenance": {
             "applied_resets": [],
@@ -287,6 +288,9 @@ def fresh():
                 "losses": 0,
                 "trades": 0,
                 "realized_pnl": "0",
+                "last_pnl": "0",
+                "last_stop_loss": "0",
+                "last_result": "NONE",
                 "last_trigger": "",
                 "pending": None,
             }
@@ -320,6 +324,9 @@ def load():
                 "losses",
                 "trades",
                 "realized_pnl",
+                "last_pnl",
+                "last_stop_loss",
+                "last_result",
                 "last_trigger",
                 "pending",
             ):
@@ -408,7 +415,7 @@ def load():
             st["recovery_deficit"] = str(max(D("0"), deficit))
             st["martingale_base_edge"] = None
 
-        new["version"] = 34
+        new["version"] = 36
         save(new)
         return new
     except Exception:
@@ -480,6 +487,9 @@ def apply_one_time_all_robots_reset(s):
         st["losses"] = 0
         st["trades"] = 0
         st["realized_pnl"] = "0"
+        st["last_pnl"] = "0"
+        st["last_stop_loss"] = "0"
+        st["last_result"] = "NONE"
         st["last_trigger"] = ""
         st["pending"] = None
 
@@ -493,7 +503,7 @@ def apply_one_time_all_robots_reset(s):
         "reset_scope": "TOTAL_LOGICAL_STRATEGY_STATE",
         "before": before,
     }
-    s["version"] = 34
+    s["version"] = 36
     save(s)
 
     audit({
@@ -2382,19 +2392,21 @@ class Bot:
 
     def wait_for_both_prices(self, st, now):
         """
-        V29 - seleciona automaticamente entre PAR e DIRECIONAL-ONLY.
+        V35 - seleciona entre PAR e DIRECIONAL-ONLY pelo DEFICIT acumulado.
 
-        Regra principal solicitada:
-          target = recovery_deficit + lucro-base
-          min_notional_dir = US$1,00
+        Regra:
+          recovery_deficit < US$1,00:
+              usa obrigatoriamente o PAR (direcional + oposta).
 
-          se target >= US$1,00:
-              envia SOMENTE a ponta direcional
-          senao:
-              tenta o PAR com US$1,00 de protecao
+          recovery_deficit >= US$1,00:
+              passa para DIRECIONAL-ONLY.
 
-        Fallback adicional: se o PAR exceder o bankroll individual, mas a ponta
-        direcional isolada couber, usa DIRECIONAL-ONLY em vez de bloquear.
+        A meta financeira continua sendo:
+          target = recovery_deficit + lucro-base.
+
+        Importante: nao existe mais fallback para DIRECIONAL-ONLY quando o PAR
+        excede o bankroll. Abaixo do limiar de US$1 de deficit, ou entra em PAR
+        ou nao entra.
         """
         p = st.get("pending")
         if not p or p.get("phase") != "waiting_both_prices":
@@ -2448,10 +2460,11 @@ class Bot:
         dir_min_notional = MIN_LEG_USD
         p["directional_min_notional"] = str(dir_min_notional)
 
-        # MODE 1: a meta de recuperacao ja atingiu/superou o valor minimo
-        # negociavel do ativo direcional. A partir daqui nao compramos protecao.
-        use_single = target_net_profit >= dir_min_notional
-        single_reason = "TARGET_ATINGIU_MINIMO_ATIVO" if use_single else None
+        # V35: o switch depende SOMENTE do deficit financeiro acumulado.
+        # O lucro-base do timeframe nao antecipa mais a troca para uma ponta.
+        # Assim, todo ciclo novo (deficit=0) obrigatoriamente comeca em PAR.
+        use_single = recovery_deficit >= dir_min_notional
+        single_reason = "RECOVERY_DEFICIT_ATINGIU_USD1" if use_single else None
 
         pair_sz = None
         pair_total = None
@@ -2462,8 +2475,8 @@ class Bot:
             if not both_ok:
                 if time.time() - float(p.get("last_wait_log", 0)) >= 3:
                     log.info(
-                        "%s | AGUARDANDO PRECO V30 | modo=PAR | DIR=%s OPP=%s | precisa OPP<=%s | TARGET=%s < MIN_USD_PONTA=%s",
-                        st["name"], dp, op, max_limit_price, target_net_profit, dir_min_notional,
+                        "%s | AGUARDANDO PRECO V36 | modo=PAR | DIR=%s OPP=%s | precisa OPP<=%s | TARGET=%s | DEFICIT=%s < SWITCH_USD=%s",
+                        st["name"], dp, op, max_limit_price, target_net_profit, recovery_deficit, dir_min_notional,
                     )
                     p["last_wait_log"] = time.time()
                     save(self.s)
@@ -2476,23 +2489,17 @@ class Bot:
             pair_sz = sizing(st, min_shares, dir_limit, opp_limit)
             pair_total = pair_sz["directional_max_spend"] + pair_sz["opposite_max_spend"]
 
-            # Se o par estoura o caixa individual, tenta a ponta direcional
-            # isolada antes de desistir da entrada.
-            if not pair_sz.get("blocked") and pair_total > D(st["bankroll"]):
-                candidate = sizing_directional_only(st, min_shares, dir_limit)
-                if (
-                    not candidate.get("blocked")
-                    and candidate["directional_max_spend"] <= D(st["bankroll"])
-                ):
-                    use_single = True
-                    single_reason = "PAR_EXCEDE_BANKROLL"
+            # V35: SEM fallback para uma ponta por falta de caixa.
+            # Enquanto recovery_deficit < US$1, a estrategia permanece PAR.
+            # Se o PAR nao couber no bankroll individual, a rodada sera bloqueada
+            # mais abaixo em vez de transformar a entrada em direcional-only.
 
         if use_single:
             sz = sizing_directional_only(st, min_shares, dir_limit)
             total_spend = sz["directional_max_spend"]
             if sz.get("blocked"):
                 log.warning(
-                    "%s | BLOQUEADO V30 DIRECIONAL-ONLY | motivo=%s | DIR_LIMIT=%s | base=%s | deficit=%s | target=%s",
+                    "%s | BLOQUEADO V36 DIRECIONAL-ONLY | motivo=%s | DIR_LIMIT=%s | base=%s | deficit=%s | target=%s",
                     st["name"], sz.get("reason"), dir_limit, sz["base_profit"],
                     sz["recovery_deficit"], sz["target_net_profit"],
                 )
@@ -2501,7 +2508,7 @@ class Bot:
                 return
             if total_spend > D(st["bankroll"]):
                 log.warning(
-                    "%s | BLOQUEADO V30 DIRECIONAL-ONLY | gasto=%s > bankroll=%s | target=%s",
+                    "%s | BLOQUEADO V36 DIRECIONAL-ONLY | gasto=%s > bankroll=%s | target=%s",
                     st["name"], total_spend, st["bankroll"], sz["target_net_profit"],
                 )
                 st["pending"] = None
@@ -2519,7 +2526,7 @@ class Bot:
             save(self.s)
 
             log.info(
-                "%s | SIZING V30 DIRECIONAL-ONLY | MOTIVO=%s | MIN_SHARES_REPORTADO=%s | MIN_USD_PONTA=%s | DIR_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=0 | GASTO_MAX=%s | LUCRO_MIN=%s",
+                "%s | SIZING V36 DIRECIONAL-ONLY | MOTIVO=%s | MIN_SHARES_REPORTADO=%s | SWITCH_DEFICIT_USD=%s | DIR_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=0 | GASTO_MAX=%s | LUCRO_MIN=%s",
                 st["name"], single_reason, p["minimum_order_shares"], dir_min_notional,
                 dir_limit, sz["base_profit"], sz["recovery_deficit"], sz["target_net_profit"],
                 sz["directional_shares"], total_spend, sz["guaranteed_net_at_limit"],
@@ -2583,7 +2590,7 @@ class Bot:
         total_spend = pair_total
         if sz.get("blocked"):
             log.warning(
-                "%s | BLOQUEADO V30 PAR | motivo=%s | DIR_LIMIT=%s | OPP_LIMIT=%s | base=%s | deficit=%s | target=%s",
+                "%s | BLOQUEADO V36 PAR | motivo=%s | DIR_LIMIT=%s | OPP_LIMIT=%s | base=%s | deficit=%s | target=%s",
                 st["name"], sz.get("reason"), dir_limit, opp_limit, sz["base_profit"],
                 sz["recovery_deficit"], sz["target_net_profit"],
             )
@@ -2592,8 +2599,8 @@ class Bot:
             return
         if total_spend > D(st["bankroll"]):
             log.warning(
-                "%s | BLOQUEADO V30 PAR | gasto=%s > bankroll=%s | fallback direcional tambem nao coube | target=%s",
-                st["name"], total_spend, st["bankroll"], sz["target_net_profit"],
+                "%s | BLOQUEADO V36 PAR | gasto=%s > bankroll=%s | SEM_FALLBACK_DIRECIONAL | deficit=%s | target=%s",
+                st["name"], total_spend, st["bankroll"], sz["recovery_deficit"], sz["target_net_profit"],
             )
             st["pending"] = None
             save(self.s)
@@ -2610,7 +2617,7 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | SIZING V30 PAR-USD1 | MIN_SHARES_REPORTADO=%s | MIN_USD_PONTA=%s | DIR_PX=%s | OPP_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=%s | GASTO_MAX=%s | LUCRO_MIN=%s",
+            "%s | SIZING V36 PAR-USD1 | MIN_SHARES_REPORTADO=%s | MIN_USD_PONTA=%s | DIR_PX=%s | OPP_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=%s | GASTO_MAX=%s | LUCRO_MIN=%s",
             st["name"], p["minimum_order_shares"], dir_min_notional, dir_limit, opp_limit,
             sz["base_profit"], sz["recovery_deficit"], sz["target_net_profit"],
             sz["directional_shares"], sz["opposite_shares"], total_spend,
@@ -3010,22 +3017,34 @@ class Bot:
         st["trades"] += 1
 
         directional_win = (w == direction)
-        deficit_before = max(D("0"), D(st.get("recovery_deficit", "0") or "0"))
-        if pnl < 0:
-            deficit_after = deficit_before + (-pnl)
-        elif pnl > 0:
-            deficit_after = max(D("0"), deficit_before - pnl)
-        else:
-            deficit_after = deficit_before
-        st["recovery_deficit"] = str(deficit_after)
-        st["martingale_base_edge"] = None
 
-        if directional_win:
+        # V36: martingale/stop-loss passam a seguir EXCLUSIVAMENTE o resultado
+        # financeiro liquido da operacao, e nao apenas se a direcao do sinal venceu.
+        # Isso evita inconsistencias em PAR/parcial: uma direcao pode perder e o
+        # hedge ainda gerar PNL positivo, ou a direcao pode vencer com PNL liquido
+        # negativo por fills assimetricos.
+        deficit_before = max(D("0"), D(st.get("recovery_deficit", "0") or "0"))
+        stop_loss = max(D("0"), -pnl)
+
+        if pnl < 0:
+            financial_result = "LOSS"
+            deficit_after = deficit_before + stop_loss
+            st["losses"] += 1
+            st["loss_streak"] += 1
+        elif pnl > 0:
+            financial_result = "WIN"
+            deficit_after = max(D("0"), deficit_before - pnl)
             st["wins"] += 1
             st["loss_streak"] = 0
         else:
-            st["losses"] += 1
-            st["loss_streak"] += 1
+            financial_result = "FLAT"
+            deficit_after = deficit_before
+
+        st["recovery_deficit"] = str(deficit_after)
+        st["martingale_base_edge"] = None
+        st["last_pnl"] = str(pnl)
+        st["last_stop_loss"] = str(stop_loss)
+        st["last_result"] = financial_result
 
         audit({
             "type": "resolution",
@@ -3034,6 +3053,8 @@ class Bot:
             "winner": w,
             "signal": direction,
             "directional_win": directional_win,
+            "financial_result": financial_result,
+            "stop_loss": str(stop_loss),
             "directional_shares": str(dir_shares),
             "opposite_shares": str(opp_shares),
             "directional_spent": str(dir_spent),
@@ -3053,15 +3074,18 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | WINNER=%s | %s | PNL=%s | BANKROLL=%s | loss_streak=%s | DEFICIT_RECUPERAR=%s | PROX_TARGET=%s",
+            "%s | RESOLUCAO V36 | WINNER=%s | SINAL=%s | RESULTADO_FINANCEIRO=%s | PNL=%s | STOP_LOSS=%s | BANKROLL=%s | loss_streak=%s | RD_ANTES=%s | RD_DEPOIS=%s | PROX_TARGET=%s",
             st["name"],
             w,
-            "WIN" if directional_win else "LOSS",
+            direction,
+            financial_result,
             pnl,
+            stop_loss,
             bankroll,
             st["loss_streak"],
-            st.get("recovery_deficit"),
-            D(st.get("recovery_deficit", "0")) + D(base_edge(st)),
+            deficit_before,
+            deficit_after,
+            deficit_after + D(base_edge(st)),
         )
 
     # ------------------------- LOOP -------------------------
@@ -3174,13 +3198,13 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=34 | RESET_TOTAL_UNICO=V34 | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=DEFICIT_ACUMULADO+BASE | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=36 | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V34 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V36 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
-            "SWITCH_1PONTA=TARGET>=USD1 | FALLBACK_1PONTA=PAR>CAIXA | PARTIAL_PAR=PROPORCIONAL | "
+            "SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
             "DAY=SEG-SEX_10-16_BRT | NEWS=US_HIGH_3ESTRELAS_RESILIENTE | NEWS_5M15M=+-15M | NEWS_1H=+-60M | "
             "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO | MARTINGALE=DEFICIT_ACUMULADO+BASE | SIZING=USD1_POR_PONTA+AUTO_DIRECIONAL_ONLY | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
             LIVE,
@@ -3223,6 +3247,9 @@ class Bot:
                     f'{st["name"]}:bank={st["bankroll"]},'
                     f'L={st["loss_streak"]},'
                     f'RD={st.get("recovery_deficit", "0")},'
+                    f'PNL={st.get("last_pnl", "0")},'
+                    f'SL={st.get("last_stop_loss", "0")},'
+                    f'R={st.get("last_result", "NONE")},'
                     f'phase={(st.get("pending") or {}).get("phase","-")}'
                     for st in self.s["strategies"].values()
                 )
