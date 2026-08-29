@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# V34 - RESET TOTAL UNICO + CONFIRMACAO MACD LIVE
+# - inicia os 6 robos em bankroll 12, loss_streak 0 e recovery_deficit 0
+# - zera estatisticas logicas antigas (wins/losses/trades/realized_pnl/last_trigger)
+# - reset e aplicado uma unica vez e somente sem pending ativo
+# - mantem a confirmacao V33: MACD fechado + MACD ao vivo fortalecendo a direcao
 import os
 import sys
 import json
@@ -19,7 +24,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V32 FINAL - RESET UNICO DOS 6 ROBOS + CALENDARIO RESILIENTE
+# POLYMARKET BTC V34 FINAL - CONFIRMACAO MACD AO VIVO + RESET UNICO + CALENDARIO RESILIENTE
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -186,7 +191,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v32")
+log = logging.getLogger("btc-polymarket-v34")
 STOP = False
 
 
@@ -247,7 +252,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 32,
+        "version": 34,
         "strategies": {},
         "maintenance": {
             "applied_resets": [],
@@ -403,7 +408,7 @@ def load():
             st["recovery_deficit"] = str(max(D("0"), deficit))
             st["martingale_base_edge"] = None
 
-        new["version"] = 32
+        new["version"] = 34
         save(new)
         return new
     except Exception:
@@ -413,23 +418,46 @@ def load():
         return s
 
 
-ONE_TIME_RESET_ID = "v32_reset_all_robots_to_initial_12"
+ONE_TIME_RESET_ID = "v34_total_fresh_start_live_macd"
 
 
 def apply_one_time_all_robots_reset(s):
     """
-    V32: reset financeiro unico dos seis robos.
+    V34: reset TOTAL e unico dos seis robos para iniciar a nova metrica V33/V34
+    sem carregar qualquer martingale/deficit/estatistica logica anterior.
 
-    O marcador fica dentro do state.json persistente. Assim, o primeiro startup
-    que carregar a V32 aplica o reset e grava o ID; qualquer restart/redeploy
-    posterior detecta o marcador e NAO repete o reset.
+    O reset so e aplicado quando NAO existe pending em nenhum robo. Isso evita
+    apagar o acompanhamento de uma ordem/posicao real ainda aberta. Se houver
+    pending, o reset fica adiado e sera tentado novamente no proximo ciclo/startup.
 
-    Preservado de proposito: pending, wins/losses/trades, realized_pnl,
-    last_trigger, reconciliacao de saques e reconciliacao de resgates.
+    Resetado para cada robo:
+      - bankroll = INITIAL (12 USD)
+      - loss_streak = 0
+      - recovery_deficit = 0
+      - martingale_base_edge = None
+      - wins/losses/trades = 0
+      - realized_pnl = 0
+      - last_trigger = ""
+      - pending = None (somente porque o reset exige nenhum pending ativo)
+
+    Preservado: reconciliacao de saques, reconciliacao de resgates, cache de news
+    e o arquivo de auditoria trades.jsonl. O historico fica apenas como auditoria;
+    ele NAO alimenta o novo martingale porque recovery_deficit passa a existir = 0.
     """
     maintenance = s.setdefault("maintenance", {"applied_resets": [], "last_reset": None})
     applied = maintenance.setdefault("applied_resets", [])
     if ONE_TIME_RESET_ID in applied:
+        return False
+
+    active_pending = [
+        name for name, st in s.get("strategies", {}).items()
+        if isinstance(st.get("pending"), dict)
+    ]
+    if active_pending:
+        log.warning(
+            "RESET V34 TOTAL ADIADO | existem pending ativos=%s | reset sera aplicado quando todos encerrarem",
+            ",".join(sorted(active_pending)),
+        )
         return False
 
     before = {}
@@ -438,11 +466,22 @@ def apply_one_time_all_robots_reset(s):
             "bankroll": str(st.get("bankroll", "0")),
             "loss_streak": int(st.get("loss_streak", 0) or 0),
             "recovery_deficit": str(st.get("recovery_deficit", "0") or "0"),
+            "wins": int(st.get("wins", 0) or 0),
+            "losses": int(st.get("losses", 0) or 0),
+            "trades": int(st.get("trades", 0) or 0),
+            "realized_pnl": str(st.get("realized_pnl", "0") or "0"),
+            "last_trigger": str(st.get("last_trigger", "") or ""),
         }
         st["bankroll"] = str(INITIAL)
         st["loss_streak"] = 0
         st["recovery_deficit"] = "0"
         st["martingale_base_edge"] = None
+        st["wins"] = 0
+        st["losses"] = 0
+        st["trades"] = 0
+        st["realized_pnl"] = "0"
+        st["last_trigger"] = ""
+        st["pending"] = None
 
     ts = datetime.now(UTC).isoformat()
     applied.append(ONE_TIME_RESET_ID)
@@ -451,9 +490,10 @@ def apply_one_time_all_robots_reset(s):
         "timestamp": ts,
         "bankroll_each": str(INITIAL),
         "robots": sorted(s.get("strategies", {}).keys()),
+        "reset_scope": "TOTAL_LOGICAL_STRATEGY_STATE",
         "before": before,
     }
-    s["version"] = 32
+    s["version"] = 34
     save(s)
 
     audit({
@@ -462,10 +502,12 @@ def apply_one_time_all_robots_reset(s):
         "timestamp": ts,
         "bankroll_each": str(INITIAL),
         "robots": sorted(s.get("strategies", {}).keys()),
+        "reset_scope": "TOTAL_LOGICAL_STRATEGY_STATE",
         "before": before,
     })
     log.warning(
-        "RESET V32 APLICADO UMA UNICA VEZ | robos=%s | bankroll_cada=%s | loss_streak=0 | recovery_deficit=0 | marcador=%s",
+        "RESET V34 TOTAL APLICADO UMA UNICA VEZ | robos=%s | bankroll_cada=%s | "
+        "loss_streak=0 | recovery_deficit=0 | wins=0 | losses=0 | trades=0 | realized_pnl=0 | marcador=%s",
         len(s.get("strategies", {})), INITIAL, ONE_TIME_RESET_ID,
     )
     return True
@@ -488,18 +530,38 @@ def ema(values, n):
 
 def trading_signal(tf):
     """
-    V29 - direcao pelo candle ATUAL ainda aberto no T-30.
+    V33 - direcao pelo candle ATUAL aberto + confirmacao MACD ao vivo.
 
-    Entrada normal:
-      candle atual aberto == direcao MACD.
+    O MACD nao e uma cotacao de BTC e, portanto, nao faz sentido comparar
+    diretamente preco BTC (ex.: 60.000) com valor MACD (ex.: -25).
 
-    Apos loss:
-      candle anterior fechado + candle atual aberto precisam estar
-      na mesma direcao, e essa direcao precisa estar alinhada ao MACD.
+    Para impedir entrada com MACD "atrasado" durante uma reversao, V33 usa
+    duas leituras:
 
-    O MACD mantem a regra anterior e e calculado somente com candles
-    totalmente fechados, evitando contaminar o indicador com um candle
-    ainda em formacao.
+      1) MACD FECHADO: 7/21/9 somente com candles integralmente fechados.
+      2) MACD AO VIVO: o mesmo 7/21/9, acrescentando a cotacao atual do
+         candle em formacao como ultimo ponto.
+
+    Entrada UP somente quando:
+      - candle atual esta UP;
+      - MACD fechado esta UP (macd > signal e macd > 0);
+      - MACD ao vivo continua UP;
+      - a cotacao atual FORTALECE o MACD: live_macd > closed_macd e
+        live_hist > closed_hist.
+
+    Entrada DOWN somente quando:
+      - candle atual esta DOWN;
+      - MACD fechado esta DOWN (macd < signal e macd < 0);
+      - MACD ao vivo continua DOWN;
+      - a cotacao atual FORTALECE o MACD: live_macd < closed_macd e
+        live_hist < closed_hist.
+
+    Assim, se o MACD fechado ainda disser DOWN mas a cotacao estiver
+    revertendo para cima e enfraquecendo o movimento baixista, NAO entra.
+    O inverso vale para UP.
+
+    Apos loss, permanece a confirmacao adicional: candle anterior fechado
+    + candle atual aberto precisam estar na mesma direcao aprovada.
     """
     rows = get(
         BINANCE + "/api/v3/klines",
@@ -509,18 +571,30 @@ def trading_signal(tf):
     closed = [r for r in rows if int(r[6]) < now_ms]
     current = [r for r in rows if int(r[0]) <= now_ms <= int(r[6])]
     if len(closed) < 30 or not current:
-        return None, False, None, None, []
+        return None, False, None, None, [], None, None, None, None
 
     current_row = current[-1]
     previous_closed = closed[-1]
 
-    # MACD permanece como antes: apenas candles integralmente fechados.
     closes = [float(r[4]) for r in closed]
+
+    # MACD fechado: referencia estrutural, sem contaminar com candle aberto.
     fast = ema(closes, 7)
     slow = ema(closes, 21)
-    macd = [a - b for a, b in zip(fast, slow)]
-    signal_line = ema(macd, 9)
-    m, sig = macd[-1], signal_line[-1]
+    macd_series = [a - b for a, b in zip(fast, slow)]
+    signal_series = ema(macd_series, 9)
+    m, sig = macd_series[-1], signal_series[-1]
+    closed_hist = m - sig
+
+    # MACD ao vivo: incorpora a cotacao atual do candle em formacao.
+    current_price = float(current_row[4])
+    live_closes = closes + [current_price]
+    live_fast = ema(live_closes, 7)
+    live_slow = ema(live_closes, 21)
+    live_macd_series = [a - b for a, b in zip(live_fast, live_slow)]
+    live_signal_series = ema(live_macd_series, 9)
+    live_m, live_sig = live_macd_series[-1], live_signal_series[-1]
+    live_hist = live_m - live_sig
 
     def candle_dir(r):
         o = float(r[1])
@@ -535,28 +609,46 @@ def trading_signal(tf):
     current_dir = candle_dir(current_row)
     dirs = [previous_dir, current_dir]
 
-    macd_dir = (
+    closed_macd_dir = (
         "UP"
         if m > sig and m > 0
         else "DOWN"
         if m < sig and m < 0
         else None
     )
-
-    # A direcao de entrada nasce sempre do candle ATUAL ainda aberto.
-    direction = (
-        current_dir
-        if current_dir is not None and current_dir == macd_dir
+    live_macd_dir = (
+        "UP"
+        if live_m > live_sig and live_m > 0
+        else "DOWN"
+        if live_m < live_sig and live_m < 0
         else None
     )
 
-    # Em recuperacao, o candle anterior fechado precisa confirmar o atual.
+    strengthening = False
+    if current_dir == "UP" and closed_macd_dir == "UP" and live_macd_dir == "UP":
+        strengthening = live_m > m and live_hist > closed_hist
+    elif current_dir == "DOWN" and closed_macd_dir == "DOWN" and live_macd_dir == "DOWN":
+        strengthening = live_m < m and live_hist < closed_hist
+
+    direction = current_dir if strengthening else None
+
     recovery_confirmed = (
         direction is not None
         and previous_dir == direction
         and current_dir == direction
     )
-    return direction, recovery_confirmed, m, sig, dirs
+
+    return (
+        direction,
+        recovery_confirmed,
+        m,
+        sig,
+        dirs,
+        live_m,
+        live_sig,
+        closed_hist,
+        live_hist,
+    )
 
 
 def bounds(now, mins):
@@ -3030,22 +3122,27 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | JANELA T-%ss ATINGIDA | proxima rodada=%s | avaliando candle ATUAL aberto + MACD",
+            "%s | JANELA T-%ss ATINGIDA | proxima rodada=%s | avaliando candle ATUAL aberto + MACD FECHADO + MACD AO VIVO",
             st["name"],
             ENTRY_SECONDS,
             next_start.isoformat(),
         )
 
-        direction, two_same, macd, sig, dirs = trading_signal(st["tf"])
+        direction, two_same, macd, sig, dirs, live_macd, live_sig, closed_hist, live_hist = trading_signal(st["tf"])
 
         if not direction:
             log.info(
-                "%s | SEM ENTRADA: candle ATUAL aberto e MACD nao alinhados | "
-                "dirs=%s | macd=%s sig=%s",
+                "%s | SEM ENTRADA V34: candle/MACD fechado/MACD ao vivo sem fortalecimento na mesma direcao | "
+                "dirs=%s | macd_fechado=%s sig_fechado=%s hist_fechado=%s | "
+                "macd_live=%s sig_live=%s hist_live=%s",
                 st["name"],
                 dirs,
                 macd,
                 sig,
+                closed_hist,
+                live_macd,
+                live_sig,
+                live_hist,
             )
             return
 
@@ -3059,22 +3156,28 @@ class Bot:
             return
 
         log.info(
-            "%s | SINAL APROVADO | direction=%s | dirs=%s | macd=%s | signal=%s | loss_streak=%s | recovery_deficit=%s",
+            "%s | SINAL APROVADO V34 | direction=%s | dirs=%s | "
+            "macd_fechado=%s signal_fechado=%s hist_fechado=%s | "
+            "macd_live=%s signal_live=%s hist_live=%s | loss_streak=%s | recovery_deficit=%s",
             st["name"],
             direction,
             dirs,
             macd,
             sig,
+            closed_hist,
+            live_macd,
+            live_sig,
+            live_hist,
             st["loss_streak"],
             st.get("recovery_deficit", "0"),
         )
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=32 | RESET_UNICO=V32 | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=DEFICIT_ACUMULADO+BASE | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=34 | RESET_TOTAL_UNICO=V34 | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=DEFICIT_ACUMULADO+BASE | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V32 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V34 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=TARGET>=USD1 | FALLBACK_1PONTA=PAR>CAIXA | PARTIAL_PAR=PROPORCIONAL | "
