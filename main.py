@@ -7,25 +7,27 @@ import signal as signal_module
 import logging
 import subprocess
 import importlib
+import re
+import html as html_lib
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait
-from threading import Barrier
+from threading import Barrier, Thread
 from zoneinfo import ZoneInfo
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V28 FINAL - MINIMO USD 1 POR PONTA + DIFERENCIAL DIRECIONAL + RECOVERY DEFICIT + AUTO-REDEEM
+# POLYMARKET BTC V30 FINAL - V29 + FILTRO SEMANA + CALENDARIO EUA ALTO IMPACTO
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
 #
 # SINAL
 #   - entrada T-30s para a PROXIMA rodada
-#   - ultimo candle FECHADO + MACD 7/21/9 na mesma direcao
-#   - depois de LOSS: exige 2 candles FECHADOS consecutivos
+#   - candle ATUAL ainda ABERTO no T-30 + MACD 7/21/9 na mesma direcao
+#   - depois de LOSS: exige candle ANTERIOR FECHADO + candle ATUAL ABERTO
 #     na mesma direcao + MACD alinhado
 #
 # EXECUCAO
@@ -39,7 +41,7 @@ from urllib.parse import urlencode
 #   - no inicio da rodada, todo saldo ainda aberto e cancelado
 #   - se nao houve fill ate o inicio, a rodada e descartada
 #
-# SIZING V28
+# SIZING V29
 #   - caixa inicial independente: US$12
 #   - modo PAR: lado oposto = minimo nominal de US$1,00
 #   - modo DIRECIONAL-ONLY: apenas a perna do sinal, minimo nominal de US$1,00
@@ -51,6 +53,15 @@ from urllib.parse import urlencode
 #   - maximo de US$1000 de gasto teorico por perna
 #   - objetivo: US$200,000 por robo
 #
+#
+# FILTRO DE SESSAO / NOTICIAS V30
+#   - robos *_day: somente segunda a sexta, 10:00 <= inicio da rodada < 16:00 Brasilia
+#   - robos 24h continuam 7 dias por semana
+#   - os 6 robos consultam eventos EUA de ALTO IMPACTO (3 estrelas/tourinhos)
+#   - 5m/15m: nenhuma nova rodada com inicio entre T-15min e T+15min da noticia
+#   - 1h: nenhuma nova rodada com inicio entre T-60min e T+60min da noticia
+#   - calendario e atualizado em thread separada para nao atrasar o gatilho T-30
+#   - se o calendario ficar indisponivel/velho, novas entradas sao bloqueadas por seguranca
 # RECONCILIACAO DE SAQUES
 #   - consulta a atividade WITHDRAWAL da propria carteira Polymarket
 #   - aplica somente saques posteriores ao primeiro startup da V14
@@ -138,7 +149,16 @@ BALANCE_SYNC_SECONDS = float(os.getenv("BALANCE_SYNC_SECONDS", "30"))
 ENTRY_SECONDS = 30  # FIXO: trava o sinal 30s antes da proxima rodada
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "0.5"))
 MAX_BUY_PRICE = Decimal(os.getenv("MAX_BUY_PRICE", "0.55"))
-MIN_LEG_USD = Decimal(os.getenv("MIN_LEG_USD", "1.00"))  # V28: minimo nominal por ponta
+MIN_LEG_USD = Decimal(os.getenv("MIN_LEG_USD", "1.00"))  # minimo nominal por ponta
+
+# V30 - calendario economico dos EUA, alto impacto (equivalente a 3 estrelas/tourinhos).
+NEWS_FILTER_ENABLED = os.getenv("NEWS_FILTER_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+NEWS_REFRESH_SECONDS = float(os.getenv("NEWS_REFRESH_SECONDS", "300"))
+NEWS_MAX_STALE_SECONDS = float(os.getenv("NEWS_MAX_STALE_SECONDS", "1800"))
+NEWS_FAIL_CLOSED = os.getenv("NEWS_FAIL_CLOSED", "1").lower() in ("1", "true", "yes", "on")
+NEWS_WINDOW_SHORT_MIN = int(os.getenv("NEWS_WINDOW_SHORT_MIN", "15"))
+NEWS_WINDOW_1H_MIN = int(os.getenv("NEWS_WINDOW_1H_MIN", "60"))
+INVESTING_CALENDAR_URL = "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData"
 
 TFS = {"5m": 5, "15m": 15, "1h": 60}
 
@@ -153,7 +173,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v28")
+log = logging.getLogger("btc-polymarket-v30")
 STOP = False
 
 
@@ -214,7 +234,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 28,
+        "version": 29,
         "strategies": {},
         "capital_reconciliation": {
             "initialized": False,
@@ -341,7 +361,7 @@ def load():
                     elif pnl > 0:
                         rebuilt[name] = max(D("0"), rebuilt[name] - pnl)
             except Exception:
-                log.exception("MIGRACAO V28 | falha ao reconstruir recovery_deficit pelo audit")
+                log.exception("MIGRACAO V30 | falha ao reconstruir recovery_deficit pelo audit")
 
         for name in needs_rebuild:
             st = new["strategies"][name]
@@ -359,7 +379,7 @@ def load():
             st["recovery_deficit"] = str(max(D("0"), deficit))
             st["martingale_base_edge"] = None
 
-        new["version"] = 28
+        new["version"] = 29
         save(new)
         return new
     except Exception:
@@ -386,14 +406,18 @@ def ema(values, n):
 
 def trading_signal(tf):
     """
-    Usa apenas candles FECHADOS.
+    V29 - direcao pelo candle ATUAL ainda aberto no T-30.
 
     Entrada normal:
-      ultimo candle fechado == direcao MACD.
+      candle atual aberto == direcao MACD.
 
     Apos loss:
-      os 2 ultimos candles fechados precisam estar na mesma direcao
-      e essa direcao precisa estar alinhada ao MACD.
+      candle anterior fechado + candle atual aberto precisam estar
+      na mesma direcao, e essa direcao precisa estar alinhada ao MACD.
+
+    O MACD mantem a regra anterior e e calculado somente com candles
+    totalmente fechados, evitando contaminar o indicador com um candle
+    ainda em formacao.
     """
     rows = get(
         BINANCE + "/api/v3/klines",
@@ -401,9 +425,14 @@ def trading_signal(tf):
     )
     now_ms = int(time.time() * 1000)
     closed = [r for r in rows if int(r[6]) < now_ms]
-    if len(closed) < 30:
+    current = [r for r in rows if int(r[0]) <= now_ms <= int(r[6])]
+    if len(closed) < 30 or not current:
         return None, False, None, None, []
 
+    current_row = current[-1]
+    previous_closed = closed[-1]
+
+    # MACD permanece como antes: apenas candles integralmente fechados.
     closes = [float(r[4]) for r in closed]
     fast = ema(closes, 7)
     slow = ema(closes, 21)
@@ -420,8 +449,9 @@ def trading_signal(tf):
             return "DOWN"
         return None
 
-    dirs = [candle_dir(r) for r in closed[-2:]]
-    last = dirs[-1]
+    previous_dir = candle_dir(previous_closed)
+    current_dir = candle_dir(current_row)
+    dirs = [previous_dir, current_dir]
 
     macd_dir = (
         "UP"
@@ -431,14 +461,20 @@ def trading_signal(tf):
         else None
     )
 
-    direction = last if last is not None and last == macd_dir else None
-    two_same = (
-        direction is not None
-        and len(dirs) == 2
-        and dirs[0] == direction
-        and dirs[1] == direction
+    # A direcao de entrada nasce sempre do candle ATUAL ainda aberto.
+    direction = (
+        current_dir
+        if current_dir is not None and current_dir == macd_dir
+        else None
     )
-    return direction, two_same, m, sig, dirs
+
+    # Em recuperacao, o candle anterior fechado precisa confirmar o atual.
+    recovery_confirmed = (
+        direction is not None
+        and previous_dir == direction
+        and current_dir == direction
+    )
+    return direction, recovery_confirmed, m, sig, dirs
 
 
 def bounds(now, mins):
@@ -554,20 +590,107 @@ def winner(sl):
 
 
 def session_allows_round(st, round_start):
+    """V30: sessao day opera somente seg-sex, 10:00-16:00 Brasilia."""
     if st["session"] == "24h":
         return True
-    h = round_start.astimezone(TZ).hour
-    return 10 <= h < 16
+    local = round_start.astimezone(TZ)
+    if local.weekday() >= 5:  # 5=sabado, 6=domingo
+        return False
+    return 10 <= local.hour < 16
+
+
+def _strip_html(value):
+    value = re.sub(r"<[^>]+>", " ", str(value or ""))
+    value = html_lib.unescape(value)
+    return " ".join(value.split())
+
+
+def fetch_us_high_impact_calendar():
+    """Busca o calendario Investing.com filtrado para EUA + importancia alta.
+
+    O request força timezone GMT/UTC (timeZone=56, usado historicamente pelo
+    calendario do Investing.com). Assim o data-event-datetime pode ser tratado
+    como UTC sem depender do DST de Brasilia ou Nova York.
+    """
+    now = datetime.now(UTC)
+    date_from = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    date_to = (now + timedelta(days=3)).strftime("%Y-%m-%d")
+    payload = urlencode([
+        ("country[]", "5"),          # United States
+        ("importance[]", "3"),       # high impact / 3 estrelas
+        ("dateFrom", date_from),
+        ("dateTo", date_to),
+        ("timeZone", "56"),          # GMT/UTC
+        ("timeFilter", "timeOnly"),
+        ("currentTab", "custom"),
+        ("submitFilters", "1"),
+        ("limit_from", "0"),
+    ]).encode("utf-8")
+    req = Request(
+        INVESTING_CALENDAR_URL,
+        data=payload,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json,text/plain,*/*",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Referer": "https://www.investing.com/economic-calendar/",
+        },
+        method="POST",
+    )
+    with urlopen(req, timeout=12) as r:
+        raw = r.read().decode("utf-8", errors="replace")
+    obj = json.loads(raw)
+    calendar_html = str(obj.get("data") or "") if isinstance(obj, dict) else ""
+    if not calendar_html:
+        raise RuntimeError("Investing calendar respondeu sem campo data")
+
+    rows = re.findall(
+        r"<tr\b(?=[^>]*\bjs-event-item\b)[^>]*>.*?</tr>",
+        calendar_html,
+        flags=re.I | re.S,
+    )
+    events = []
+    for row in rows:
+        mdt = re.search(r'data-event-datetime=["\']([^"\']+)["\']', row, flags=re.I)
+        if not mdt:
+            continue
+        dt_text = mdt.group(1).strip()
+        dt = None
+        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+            try:
+                dt = datetime.strptime(dt_text, fmt).replace(tzinfo=UTC)
+                break
+            except ValueError:
+                pass
+        if dt is None:
+            continue
+
+        mev = re.search(
+            r'<td[^>]*class=["\'][^"\']*\bevent\b[^"\']*["\'][^>]*>(.*?)</td>',
+            row,
+            flags=re.I | re.S,
+        )
+        name = _strip_html(mev.group(1) if mev else "US high-impact event")
+        if not name:
+            name = "US high-impact event"
+        events.append({"time_utc": dt, "name": name, "source": "Investing.com"})
+
+    # Resposta valida pode realmente nao ter eventos. Se existem linhas de evento
+    # mas nenhuma data foi parseada, tratamos como mudanca de HTML/erro e falhamos fechado.
+    if rows and not events:
+        raise RuntimeError("Investing calendar mudou o formato: linhas encontradas sem datetime parseavel")
+    return events
 
 
 def base_edge(st):
-    """V28: diferencial/lucro-base fixo por timeframe."""
+    """V29: diferencial/lucro-base fixo por timeframe."""
     return BASE_EDGE_BY_TF.get(st.get("tf"), EDGE_5M)
 
 
 def recovery_target(st):
     """
-    Meta liquida V28.
+    Meta liquida V29.
 
     Sem deficit: lucro-base do timeframe.
     Com deficit: TODO o prejuizo ainda nao recuperado + lucro-base.
@@ -583,7 +706,7 @@ def recovery_target(st):
 
 def sizing(st, min_shares, directional_limit_price, opposite_limit_price):
     """
-    V28: PAR com minimo nominal de US$1,00 na perna oposta.
+    V29: PAR com minimo nominal de US$1,00 na perna oposta.
 
     A perna oposta usa o menor notional configurado (MIN_LEG_USD).
     A perna direcional e calculada para que, se a direcao vencer, o lucro
@@ -595,13 +718,13 @@ def sizing(st, min_shares, directional_limit_price, opposite_limit_price):
     Como qo*po ~= MIN_LEG_USD, isso mantem o capital inicial proximo do
     minimo possivel sem abandonar a recuperacao financeira real.
     O orderMinSize informado pela Gamma e mantido apenas para diagnostico;
-    V28 nao o usa como piso local porque ordens nominais de US$1 foram
+    V29 nao o usa como piso local porque ordens nominais de US$1 foram
     validadas manualmente pelo operador nos tres timeframes.
     """
     pd = D(directional_limit_price)
     po = D(opposite_limit_price)
     if pd <= 0 or pd >= 1 or po <= 0 or po >= 1:
-        raise ValueError("precos invalidos para sizing V28")
+        raise ValueError("precos invalidos para sizing V29")
 
     base, deficit, target = recovery_target(st)
 
@@ -643,7 +766,7 @@ def sizing(st, min_shares, directional_limit_price, opposite_limit_price):
 
 def sizing_directional_only(st, min_shares, directional_limit_price):
     """
-    V28: UMA UNICA PONTA direcional.
+    V29: UMA UNICA PONTA direcional.
 
     A ordem nunca fica abaixo de US$1 nominal. Para atingir a meta liquida:
         q >= target / (1-p)
@@ -652,7 +775,7 @@ def sizing_directional_only(st, min_shares, directional_limit_price):
     """
     pd = D(directional_limit_price)
     if pd <= 0 or pd >= 1:
-        raise ValueError("preco invalido para sizing directional-only V28")
+        raise ValueError("preco invalido para sizing directional-only V29")
 
     base, deficit, target = recovery_target(st)
     shares_for_profit = ceil_6(target / (D("1") - pd))
@@ -798,8 +921,74 @@ class Bot:
         self.last_balance_snapshot = None
         self.initialize_withdrawal_tracker()
 
+        # V30: calendario em background, para nunca bloquear o loop de entrada T-30.
+        self.news_events = []
+        self.news_last_success = 0.0
+        self.news_last_attempt = 0.0
+        self.news_last_error = "ainda nao carregado"
+        self.news_thread = None
+        if NEWS_FILTER_ENABLED:
+            self.news_thread = Thread(target=self._news_calendar_loop, name="news-calendar", daemon=True)
+            self.news_thread.start()
+
         if LIVE:
             self.sync_balance(force=True)
+
+    # -------------------- V30 ECONOMIC NEWS FILTER --------------------
+
+    def _news_calendar_loop(self):
+        while not STOP:
+            self.news_last_attempt = time.time()
+            try:
+                events = fetch_us_high_impact_calendar()
+                self.news_events = events
+                self.news_last_success = time.time()
+                self.news_last_error = ""
+                upcoming = [e for e in events if e["time_utc"] >= datetime.now(UTC) - timedelta(hours=2)]
+                preview = "; ".join(
+                    f'{e["time_utc"].astimezone(TZ).strftime("%d/%m %H:%M BRT")} {e["name"]}'
+                    for e in upcoming[:8]
+                ) or "nenhum evento alto impacto no intervalo carregado"
+                log.info(
+                    "NEWS V30 | Investing.com EUA HIGH carregado | eventos=%s | proximos=%s",
+                    len(events), preview,
+                )
+            except Exception as exc:
+                self.news_last_error = repr(exc)
+                log.warning("NEWS V30 | falha ao atualizar calendario EUA HIGH | erro=%r", exc)
+
+            deadline = time.time() + max(30.0, NEWS_REFRESH_SECONDS)
+            while not STOP and time.time() < deadline:
+                time.sleep(1.0)
+
+    def news_allows_round(self, st, round_start):
+        """Retorna (allowed, event, reason) para a proxima rodada.
+
+        5m/15m: bloqueio [noticia-15m, noticia+15m).
+        1h: bloqueio [noticia-60m, noticia+60m).
+        """
+        if not NEWS_FILTER_ENABLED:
+            return True, None, "NEWS_FILTER_DISABLED"
+
+        age = time.time() - self.news_last_success if self.news_last_success else float("inf")
+        if age > NEWS_MAX_STALE_SECONDS:
+            if NEWS_FAIL_CLOSED:
+                return False, None, f"CALENDARIO_INDISPONIVEL age={age:.0f}s erro={self.news_last_error}"
+            return True, None, f"CALENDARIO_INDISPONIVEL_FAIL_OPEN age={age:.0f}s"
+
+        minutes = NEWS_WINDOW_1H_MIN if st.get("tf") == "1h" else NEWS_WINDOW_SHORT_MIN
+        before = timedelta(minutes=minutes)
+        after = timedelta(minutes=minutes)
+        rs = round_start.astimezone(UTC)
+
+        for ev in self.news_events:
+            et = ev.get("time_utc")
+            if not isinstance(et, datetime):
+                continue
+            # Exatamente no fim da janela volta a permitir entrada.
+            if et - before <= rs < et + after:
+                return False, ev, f"NEWS_BLACKOUT_{minutes}MIN"
+        return True, None, "OK"
 
     # -------------------- AUTOMATIC POSITION REDEMPTION --------------------
 
@@ -974,7 +1163,7 @@ class Bot:
 
     def process_redemptions(self, force=False):
         """
-        V28/V22: nao envia redeem_positions() manualmente para Deposit Wallet.
+        V29/V22: nao envia redeem_positions() manualmente para Deposit Wallet.
         O operator oficial faz o auto-redeem; esta fila apenas reconcilia a
         posicao ate ela desaparecer. Isso evita o POST /submit que ja se mostrou
         sujeito a revert no relayer.
@@ -1635,7 +1824,7 @@ class Bot:
     def place_rebalanced_leg(self, p, leg, shares):
         """
         Cria uma nova GTC para a quantidade proporcional restante.
-        V28 usa piso nominal local de US$1,00 para ordens de reposicao.
+        V29 usa piso nominal local de US$1,00 para ordens de reposicao.
         """
         shares = floor_6(D(shares))
         price = D(p.get(f"{leg}_limit_price") or p["limit_price"])
@@ -1854,7 +2043,7 @@ class Bot:
         if max_limit_price <= 0:
             return
 
-        # V28: o modo de execucao e decidido com o preco real da perna direcional.
+        # V29: o modo de execucao e decidido com o preco real da perna direcional.
         # Se a meta atingir o valor minimo negociavel dessa perna, passa a uma
         # unica ponta direcional. Abaixo disso, conserva o par minimo.
         base_profit, recovery_deficit, target_net_profit = recovery_target(st)
@@ -1907,7 +2096,7 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | SINAL TRAVADO %s | V28 aguardando estrutura valida <= %s ate %s | %s",
+            "%s | SINAL TRAVADO %s | V30 aguardando estrutura valida <= %s ate %s | %s",
             st["name"],
             direction,
             max_limit_price,
@@ -1920,7 +2109,7 @@ class Bot:
 
     def wait_for_both_prices(self, st, now):
         """
-        V28 - seleciona automaticamente entre PAR e DIRECIONAL-ONLY.
+        V29 - seleciona automaticamente entre PAR e DIRECIONAL-ONLY.
 
         Regra principal solicitada:
           target = recovery_deficit + lucro-base
@@ -1944,12 +2133,12 @@ class Bot:
                 "type": "no_entry_price_condition",
                 "strategy": st["name"],
                 "slug": p["slug"],
-                "reason": "nenhuma estrutura V28 valida antes do inicio",
+                "reason": "nenhuma estrutura V30 valida antes do inicio",
                 "limit_price": p["limit_price"],
                 "ts": now.isoformat(),
             })
             log.info(
-                "%s | RODADA DESCARTADA | nenhuma estrutura V28 valida antes do inicio",
+                "%s | RODADA DESCARTADA | nenhuma estrutura V30 valida antes do inicio",
                 st["name"],
             )
             st["pending"] = None
@@ -1969,7 +2158,7 @@ class Bot:
         if dp is None or D(dp) > max_limit_price:
             if time.time() - float(p.get("last_wait_log", 0)) >= 3:
                 log.info(
-                    "%s | AGUARDANDO PRECO V28 | DIR=%s OPP=%s | DIR precisa <= %s",
+                    "%s | AGUARDANDO PRECO V30 | DIR=%s OPP=%s | DIR precisa <= %s",
                     st["name"], dp, op, max_limit_price,
                 )
                 p["last_wait_log"] = time.time()
@@ -2000,7 +2189,7 @@ class Bot:
             if not both_ok:
                 if time.time() - float(p.get("last_wait_log", 0)) >= 3:
                     log.info(
-                        "%s | AGUARDANDO PRECO V28 | modo=PAR | DIR=%s OPP=%s | precisa OPP<=%s | TARGET=%s < MIN_USD_PONTA=%s",
+                        "%s | AGUARDANDO PRECO V30 | modo=PAR | DIR=%s OPP=%s | precisa OPP<=%s | TARGET=%s < MIN_USD_PONTA=%s",
                         st["name"], dp, op, max_limit_price, target_net_profit, dir_min_notional,
                     )
                     p["last_wait_log"] = time.time()
@@ -2030,7 +2219,7 @@ class Bot:
             total_spend = sz["directional_max_spend"]
             if sz.get("blocked"):
                 log.warning(
-                    "%s | BLOQUEADO V28 DIRECIONAL-ONLY | motivo=%s | DIR_LIMIT=%s | base=%s | deficit=%s | target=%s",
+                    "%s | BLOQUEADO V30 DIRECIONAL-ONLY | motivo=%s | DIR_LIMIT=%s | base=%s | deficit=%s | target=%s",
                     st["name"], sz.get("reason"), dir_limit, sz["base_profit"],
                     sz["recovery_deficit"], sz["target_net_profit"],
                 )
@@ -2039,7 +2228,7 @@ class Bot:
                 return
             if total_spend > D(st["bankroll"]):
                 log.warning(
-                    "%s | BLOQUEADO V28 DIRECIONAL-ONLY | gasto=%s > bankroll=%s | target=%s",
+                    "%s | BLOQUEADO V30 DIRECIONAL-ONLY | gasto=%s > bankroll=%s | target=%s",
                     st["name"], total_spend, st["bankroll"], sz["target_net_profit"],
                 )
                 st["pending"] = None
@@ -2057,7 +2246,7 @@ class Bot:
             save(self.s)
 
             log.info(
-                "%s | SIZING V28 DIRECIONAL-ONLY | MOTIVO=%s | MIN_SHARES_REPORTADO=%s | MIN_USD_PONTA=%s | DIR_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=0 | GASTO_MAX=%s | LUCRO_MIN=%s",
+                "%s | SIZING V30 DIRECIONAL-ONLY | MOTIVO=%s | MIN_SHARES_REPORTADO=%s | MIN_USD_PONTA=%s | DIR_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=0 | GASTO_MAX=%s | LUCRO_MIN=%s",
                 st["name"], single_reason, p["minimum_order_shares"], dir_min_notional,
                 dir_limit, sz["base_profit"], sz["recovery_deficit"], sz["target_net_profit"],
                 sz["directional_shares"], total_spend, sz["guaranteed_net_at_limit"],
@@ -2121,7 +2310,7 @@ class Bot:
         total_spend = pair_total
         if sz.get("blocked"):
             log.warning(
-                "%s | BLOQUEADO V28 PAR | motivo=%s | DIR_LIMIT=%s | OPP_LIMIT=%s | base=%s | deficit=%s | target=%s",
+                "%s | BLOQUEADO V30 PAR | motivo=%s | DIR_LIMIT=%s | OPP_LIMIT=%s | base=%s | deficit=%s | target=%s",
                 st["name"], sz.get("reason"), dir_limit, opp_limit, sz["base_profit"],
                 sz["recovery_deficit"], sz["target_net_profit"],
             )
@@ -2130,7 +2319,7 @@ class Bot:
             return
         if total_spend > D(st["bankroll"]):
             log.warning(
-                "%s | BLOQUEADO V28 PAR | gasto=%s > bankroll=%s | fallback direcional tambem nao coube | target=%s",
+                "%s | BLOQUEADO V30 PAR | gasto=%s > bankroll=%s | fallback direcional tambem nao coube | target=%s",
                 st["name"], total_spend, st["bankroll"], sz["target_net_profit"],
             )
             st["pending"] = None
@@ -2148,7 +2337,7 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | SIZING V28 PAR-USD1 | MIN_SHARES_REPORTADO=%s | MIN_USD_PONTA=%s | DIR_PX=%s | OPP_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=%s | GASTO_MAX=%s | LUCRO_MIN=%s",
+            "%s | SIZING V30 PAR-USD1 | MIN_SHARES_REPORTADO=%s | MIN_USD_PONTA=%s | DIR_PX=%s | OPP_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=%s | GASTO_MAX=%s | LUCRO_MIN=%s",
             st["name"], p["minimum_order_shares"], dir_min_notional, dir_limit, opp_limit,
             sz["base_profit"], sz["recovery_deficit"], sz["target_net_profit"],
             sz["directional_shares"], sz["opposite_shares"], total_spend,
@@ -2198,7 +2387,7 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | RESULTADO ENVIO PAR V28 | DIR order_id=%s | OPP order_id=%s | DIR_ERR=%s | OPP_ERR=%s",
+            "%s | RESULTADO ENVIO PAR V30 | DIR order_id=%s | OPP order_id=%s | DIR_ERR=%s | OPP_ERR=%s",
             st["name"], p["directional_order_id"], p["opposite_order_id"],
             p["directional_error"], p["opposite_error"],
         )
@@ -2234,7 +2423,7 @@ class Bot:
         for leg in ("directional", "opposite"):
             if p.get(f"{leg}_order_id"):
                 continue
-            # V28 directional-only nunca deve recriar uma perna oposta inexistente.
+            # V29 directional-only nunca deve recriar uma perna oposta inexistente.
             if D(p.get(f"{leg}_shares_requested", "0") or "0") <= 0:
                 continue
 
@@ -2299,7 +2488,7 @@ class Bot:
         dsh = D(p.get("directional_shares_filled", "0"))
         osh = D(p.get("opposite_shares_filled", "0"))
 
-        # V28: modo de UMA ponta. Nao existe rebalanceamento nem recuperacao
+        # V29: modo de UMA ponta. Nao existe rebalanceamento nem recuperacao
         # da perna oposta. A ordem direcional deve executar antes do inicio;
         # se executar, acompanha a posicao ate a resolucao.
         if p.get("execution_mode") == "directional_only":
@@ -2629,6 +2818,27 @@ class Bot:
             return
 
         if not session_allows_round(st, next_start):
+            # *_day: V30 bloqueia fim de semana e fora de 10:00-16:00 BRT.
+            return
+
+        news_ok, news_event, news_reason = self.news_allows_round(st, next_start)
+        if not news_ok:
+            key = next_start.astimezone(UTC).isoformat()
+            if st.get("last_news_block_log") != key:
+                st["last_news_block_log"] = key
+                save(self.s)
+                if news_event:
+                    log.warning(
+                        "%s | ENTRADA BLOQUEADA NEWS V30 | rodada=%s | motivo=%s | evento=%s | evento_BRT=%s",
+                        st["name"], next_start.isoformat(), news_reason,
+                        news_event.get("name"),
+                        news_event["time_utc"].astimezone(TZ).isoformat(),
+                    )
+                else:
+                    log.warning(
+                        "%s | ENTRADA BLOQUEADA NEWS V30 | rodada=%s | motivo=%s",
+                        st["name"], next_start.isoformat(), news_reason,
+                    )
             return
 
         key = next_start.astimezone(UTC).isoformat()
@@ -2639,7 +2849,7 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | JANELA T-%ss ATINGIDA | proxima rodada=%s | avaliando candle+MACD",
+            "%s | JANELA T-%ss ATINGIDA | proxima rodada=%s | avaliando candle ATUAL aberto + MACD",
             st["name"],
             ENTRY_SECONDS,
             next_start.isoformat(),
@@ -2649,7 +2859,7 @@ class Bot:
 
         if not direction:
             log.info(
-                "%s | SEM ENTRADA: candle fechado e MACD nao alinhados | "
+                "%s | SEM ENTRADA: candle ATUAL aberto e MACD nao alinhados | "
                 "dirs=%s | macd=%s sig=%s",
                 st["name"],
                 dirs,
@@ -2660,7 +2870,7 @@ class Bot:
 
         if st["loss_streak"] > 0 and not two_same:
             log.info(
-                "%s | MARTINGALE AGUARDA 2 CANDLES %s + MACD | dirs=%s",
+                "%s | MARTINGALE AGUARDA candle ANTERIOR fechado + ATUAL aberto %s + MACD | dirs=[anterior_fechado, atual_aberto]=%s",
                 st["name"],
                 direction,
                 dirs,
@@ -2680,13 +2890,14 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=28 | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=DEFICIT_ACUMULADO+BASE", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H)
+        log.info("STARTUP OK | codigo carregado | versao=30 | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=DEFICIT_ACUMULADO+BASE | DAY=SEG-SEX_10-16_BRT | NEWS_US_HIGH=ON | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V28 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V30 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=TARGET>=USD1 | FALLBACK_1PONTA=PAR>CAIXA | PARTIAL_PAR=PROPORCIONAL | "
+            "DAY=SEG-SEX_10-16_BRT | NEWS=US_HIGH_3ESTRELAS | NEWS_5M15M=+-15M | NEWS_1H=+-60M | "
             "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO | MARTINGALE=DEFICIT_ACUMULADO+BASE | SIZING=USD1_POR_PONTA+AUTO_DIRECIONAL_ONLY | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
             LIVE,
             gasless_mode,
