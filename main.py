@@ -25,7 +25,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V37 FINAL - MINIMO CLOB DINAMICO + RD/STOP LOSS EXPLICITO + SWITCH PELO DEFICIT + MACD AO VIVO + RESET V34 PRESERVADO
+# POLYMARKET BTC V39 FINAL - ENTRADAS SOBREPOSTAS + MINIMO CLOB DINAMICO + RD/STOP LOSS + MACD AO VIVO + RESET V34 PRESERVADO
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -193,7 +193,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v34")
+log = logging.getLogger("btc-polymarket-v38")
 STOP = False
 
 
@@ -254,7 +254,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 37,
+        "version": 39,
         "strategies": {},
         "maintenance": {
             "applied_resets": [],
@@ -294,6 +294,7 @@ def fresh():
                 "last_result": "NONE",
                 "last_trigger": "",
                 "pending": None,
+                "open_positions": [],
             }
     return s
 
@@ -330,6 +331,7 @@ def load():
                 "last_result",
                 "last_trigger",
                 "pending",
+                "open_positions",
             ):
                 if field in v:
                     dst[field] = v[field]
@@ -342,6 +344,14 @@ def load():
                 p.setdefault("opposite_spent", p.get("opposite_amount", "0"))
                 p.setdefault("directional_shares", "0")
                 p.setdefault("opposite_shares", "0")
+
+            # V38: posicoes ja iniciadas e aguardando resolucao ficam separadas
+            # do unico slot operacional usado para preparar/enviar a proxima rodada.
+            ops = dst.get("open_positions")
+            if not isinstance(ops, list):
+                dst["open_positions"] = []
+            else:
+                dst["open_positions"] = [x for x in ops if isinstance(x, dict)]
 
         tracker = old.get("capital_reconciliation")
         if isinstance(tracker, dict):
@@ -416,7 +426,7 @@ def load():
             st["recovery_deficit"] = str(max(D("0"), deficit))
             st["martingale_base_edge"] = None
 
-        new["version"] = 37
+        new["version"] = 39
         save(new)
         return new
     except Exception:
@@ -459,11 +469,11 @@ def apply_one_time_all_robots_reset(s):
 
     active_pending = [
         name for name, st in s.get("strategies", {}).items()
-        if isinstance(st.get("pending"), dict)
+        if isinstance(st.get("pending"), dict) or bool(st.get("open_positions"))
     ]
     if active_pending:
         log.warning(
-            "RESET V34 TOTAL ADIADO | existem pending ativos=%s | reset sera aplicado quando todos encerrarem",
+            "RESET V34 TOTAL ADIADO | existem pending/posicoes abertas=%s | reset sera aplicado quando todos encerrarem",
             ",".join(sorted(active_pending)),
         )
         return False
@@ -493,6 +503,7 @@ def apply_one_time_all_robots_reset(s):
         st["last_result"] = "NONE"
         st["last_trigger"] = ""
         st["pending"] = None
+        st["open_positions"] = []
 
     ts = datetime.now(UTC).isoformat()
     applied.append(ONE_TIME_RESET_ID)
@@ -504,7 +515,7 @@ def apply_one_time_all_robots_reset(s):
         "reset_scope": "TOTAL_LOGICAL_STRATEGY_STATE",
         "before": before,
     }
-    s["version"] = 37
+    s["version"] = 39
     save(s)
 
     audit({
@@ -2422,6 +2433,8 @@ class Bot:
             "edge_at_limit": str(target_net_profit),
             "base_profit_target": str(base_profit),
             "recovery_deficit_before": str(recovery_deficit),
+            "recovery_active_at_entry": bool(recovery_deficit > 0),
+            "open_positions_at_entry": len(st.get("open_positions") or []),
             "target_net_profit": str(target_net_profit),
             "guaranteed_net_at_limit": None,
             "directional_min_notional": None,
@@ -3058,14 +3071,18 @@ class Bot:
 
     # ------------------------- RESOLUTION -------------------------
 
-    def resolve(self, st):
-        p = st.get("pending")
+    def resolve(self, st, p=None):
+        # V39: aceita tanto o pending legado quanto uma posicao da fila
+        # open_positions. Retorna True somente quando a resolucao foi concluida.
+        from_open_positions = p is not None
+        if p is None:
+            p = st.get("pending")
         if not p or p.get("phase") != "await_resolution":
-            return
+            return False
 
         w = winner(p["slug"])
         if not w:
-            return
+            return False
 
         direction = p["direction"]
         opposite_direction = "DOWN" if direction == "UP" else "UP"
@@ -3113,7 +3130,12 @@ class Bot:
             financial_result = "WIN"
             deficit_after = max(D("0"), deficit_before - pnl)
             st["wins"] += 1
-            st["loss_streak"] = 0
+            # V39: enquanto ainda existir RD, o ciclo de recuperacao continua ativo.
+            # Uma vitoria parcial reduz o deficit, mas NAO encerra o martingale.
+            # O ciclo so volta ao zero quando o RD financeiro chega exatamente a 0.
+            if deficit_after <= 0:
+                deficit_after = D("0")
+                st["loss_streak"] = 0
         else:
             financial_result = "FLAT"
             deficit_after = deficit_before
@@ -3148,11 +3170,24 @@ class Bot:
             "ts": datetime.now(UTC).isoformat(),
         })
 
-        st["pending"] = None
+        if from_open_positions:
+            ops = st.setdefault("open_positions", [])
+            try:
+                ops.remove(p)
+            except ValueError:
+                # Fallback por identidade logica para estados reserializados.
+                slug = str(p.get("slug") or "")
+                rs = str(p.get("round_start") or "")
+                st["open_positions"] = [
+                    x for x in ops
+                    if not (str(x.get("slug") or "") == slug and str(x.get("round_start") or "") == rs)
+                ]
+        else:
+            st["pending"] = None
         save(self.s)
 
         log.info(
-            "%s | RESOLUCAO V36 | WINNER=%s | SINAL=%s | RESULTADO_FINANCEIRO=%s | PNL=%s | STOP_LOSS=%s | BANKROLL=%s | loss_streak=%s | RD_ANTES=%s | RD_DEPOIS=%s | PROX_TARGET=%s",
+            "%s | RESOLUCAO V39 CASCATA | WINNER=%s | SINAL=%s | RESULTADO_FINANCEIRO=%s | PNL=%s | STOP_LOSS=%s | BANKROLL=%s | loss_streak=%s | RD_ANTES=%s | RD_DEPOIS=%s | PROX_TARGET=%s | RECOVERY_ACTIVE=%s",
             st["name"],
             w,
             direction,
@@ -3164,13 +3199,85 @@ class Bot:
             deficit_before,
             deficit_after,
             deficit_after + D(base_edge(st)),
+            deficit_after > 0,
         )
+        return True
+
+    def archive_awaiting_resolution(self, st):
+        """V39: libera o slot pending assim que a ordem passa a aguardar resultado."""
+        p = st.get("pending")
+        if not isinstance(p, dict) or p.get("phase") != "await_resolution":
+            return False
+
+        ops = st.setdefault("open_positions", [])
+        slug = str(p.get("slug") or "")
+        rs = str(p.get("round_start") or "")
+        duplicate = any(
+            str(x.get("slug") or "") == slug and str(x.get("round_start") or "") == rs
+            for x in ops if isinstance(x, dict)
+        )
+        if not duplicate:
+            ops.append(p)
+            log.info(
+                "%s | V39 POSICAO EM ANDAMENTO DESACOPLADA | slug=%s | open_positions=%s | proxima rodada pode ser avaliada sem esperar resolucao",
+                st["name"], slug, len(ops),
+            )
+        st["pending"] = None
+        save(self.s)
+        return True
+
+    def resolve_open_positions(self, st):
+        """
+        V39: resolve a fila em ordem cronologica estrita (FIFO por round_end).
+
+        Isso e essencial para o martingale em cascata com rodadas sobrepostas:
+        A -> B -> C -> D. Se A ainda nao tiver resultado, B/C/D podem continuar
+        abertos e novas rodadas podem ser capturadas, mas um resultado posterior
+        nao e contabilizado antes de A. Assim, quando A finalmente resolve, o RD
+        e atualizado primeiro; depois B, depois C, sempre na ordem real das rodadas.
+        """
+        ops = st.setdefault("open_positions", [])
+        if not ops:
+            return
+
+        def pos_key(x):
+            return (str(x.get("round_end") or ""), str(x.get("round_start") or ""), str(x.get("slug") or ""))
+
+        ops.sort(key=pos_key)
+
+        # Processa todas as posicoes consecutivas ja resolviveis. Ao encontrar
+        # a primeira mais antiga ainda sem winner, para ali para preservar FIFO.
+        while ops:
+            oldest = ops[0]
+            try:
+                resolved = self.resolve(st, oldest)
+            except Exception:
+                log.exception(
+                    "%s | erro resolvendo posicao V39 FIFO | slug=%s",
+                    st["name"], oldest.get("slug"),
+                )
+                break
+
+            if not resolved:
+                break
+
+            ops = st.setdefault("open_positions", [])
+            ops.sort(key=pos_key)
 
     # ------------------------- LOOP -------------------------
 
     def tick(self, st, now):
-        p = st.get("pending")
+        # V39: uma rodada ja iniciada nao bloqueia a captura T-30 da rodada seguinte.
+        # Assim que uma operacao entra em await_resolution ela e movida para
+        # open_positions; o slot pending fica livre para preparar a proxima rodada.
+        if isinstance(st.get("pending"), dict) and st["pending"].get("phase") == "await_resolution":
+            self.archive_awaiting_resolution(st)
 
+        # Resolucao das rodadas anteriores ocorre em paralelo logico com a busca
+        # por uma nova entrada. Se ainda nao houver winner, a posicao permanece na fila.
+        self.resolve_open_positions(st)
+
+        p = st.get("pending")
         if p:
             phase = p.get("phase")
 
@@ -3178,8 +3285,11 @@ class Bot:
                 self.wait_for_both_prices(st, now)
             elif phase in ("orders_active", "single_leg_recovery", "proportional_rebalance"):
                 self.process_active_orders(st, now)
-            elif phase == "await_resolution":
-                self.resolve(st)
+
+            # A rotina acima pode ter acabado de transformar o pending em
+            # await_resolution; desacopla imediatamente para nao bloquear a proxima.
+            if isinstance(st.get("pending"), dict) and st["pending"].get("phase") == "await_resolution":
+                self.archive_awaiting_resolution(st)
             return
 
         if D(st["bankroll"]) >= TARGET:
@@ -3248,11 +3358,14 @@ class Bot:
             )
             return
 
-        if st["loss_streak"] > 0 and not two_same:
+        recovery_active = max(D("0"), D(st.get("recovery_deficit", "0") or "0")) > 0
+        if recovery_active and not two_same:
             log.info(
-                "%s | MARTINGALE AGUARDA candle ANTERIOR fechado + ATUAL aberto %s + MACD | dirs=[anterior_fechado, atual_aberto]=%s",
+                "%s | MARTINGALE V39 EM CASCATA AGUARDA candle ANTERIOR fechado + ATUAL aberto %s + MACD | RD=%s | OPEN=%s | dirs=[anterior_fechado, atual_aberto]=%s",
                 st["name"],
                 direction,
+                st.get("recovery_deficit", "0"),
+                len(st.get("open_positions") or []),
                 dirs,
             )
             return
@@ -3260,7 +3373,7 @@ class Bot:
         log.info(
             "%s | SINAL APROVADO V34 | direction=%s | dirs=%s | "
             "macd_fechado=%s signal_fechado=%s hist_fechado=%s | "
-            "macd_live=%s signal_live=%s hist_live=%s | loss_streak=%s | recovery_deficit=%s",
+            "macd_live=%s signal_live=%s hist_live=%s | loss_streak=%s | recovery_deficit=%s | recovery_active=%s | open_positions=%s",
             st["name"],
             direction,
             dirs,
@@ -3272,14 +3385,16 @@ class Bot:
             live_hist,
             st["loss_streak"],
             st.get("recovery_deficit", "0"),
+            recovery_active,
+            len(st.get("open_positions") or []),
         )
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=37 | MIN_ORDER=CLOB_DINAMICO+USD1 | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=39 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_RD_ATUAL | MIN_ORDER=CLOB_DINAMICO+USD1 | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V37 FINAL | MIN_ORDER=CLOB_DINAMICO+USD1 | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V39 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_RD_ATUAL | MIN_ORDER=CLOB_DINAMICO+USD1 | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
@@ -3328,6 +3443,7 @@ class Bot:
                     f'PNL={st.get("last_pnl", "0")},'
                     f'SL={st.get("last_stop_loss", "0")},'
                     f'R={st.get("last_result", "NONE")},'
+                    f'OPEN={len(st.get("open_positions") or [])},'
                     f'phase={(st.get("pending") or {}).get("phase","-")}'
                     for st in self.s["strategies"].values()
                 )
