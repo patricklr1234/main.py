@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# V36 - RD/STOP LOSS FINANCEIRO EXPLICITO + PAR ATE DEFICIT >= USD1 + MACD LIVE
+# V37 - MINIMO CLOB DINAMICO + RD/STOP LOSS EXPLICITO + PAR ATE DEFICIT >= USD1 + MACD LIVE
 # - inicia os 6 robos em bankroll 12, loss_streak 0 e recovery_deficit 0
 # - zera estatisticas logicas antigas (wins/losses/trades/realized_pnl/last_trigger)
 # - reset e aplicado uma unica vez e somente sem pending ativo
@@ -25,7 +25,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V36 FINAL - RD/STOP LOSS FINANCEIRO EXPLICITO + SWITCH PELO DEFICIT + MACD AO VIVO + RESET V34 PRESERVADO
+# POLYMARKET BTC V37 FINAL - MINIMO CLOB DINAMICO + RD/STOP LOSS EXPLICITO + SWITCH PELO DEFICIT + MACD AO VIVO + RESET V34 PRESERVADO
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -131,6 +131,7 @@ ET = ZoneInfo("America/New_York")
 UTC = timezone.utc
 
 GAMMA = "https://gamma-api.polymarket.com"
+CLOB = "https://clob.polymarket.com"
 BINANCE = "https://api.binance.com"
 
 PK = (os.getenv("POLYMARKET_PRIVATE_KEY") or os.getenv("PRIVATE_KEY") or "").strip()
@@ -253,7 +254,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 36,
+        "version": 37,
         "strategies": {},
         "maintenance": {
             "applied_resets": [],
@@ -415,7 +416,7 @@ def load():
             st["recovery_deficit"] = str(max(D("0"), deficit))
             st["martingale_base_edge"] = None
 
-        new["version"] = 36
+        new["version"] = 37
         save(new)
         return new
     except Exception:
@@ -503,7 +504,7 @@ def apply_one_time_all_robots_reset(s):
         "reset_scope": "TOTAL_LOGICAL_STRATEGY_STATE",
         "before": before,
     }
-    s["version"] = 36
+    s["version"] = 37
     save(s)
 
     audit({
@@ -747,6 +748,53 @@ def market(ev):
     return None
 
 
+def clob_constraints(condition_id, gamma_min_shares=Decimal("0"), gamma_tick=Decimal("0.01")):
+    """
+    V37: consulta o CLOB oficial imediatamente antes do sizing/envio.
+
+    O endpoint /clob-markets/{condition_id} devolve:
+      mos = minimum order size EM SHARES
+      mts = minimum tick size
+
+    Usa o maior minimo entre CLOB e Gamma. Se a consulta CLOB falhar,
+    conserva o valor Gamma. Isso evita enviar uma ordem abaixo do minimo
+    reportado pelo proprio CLOB, como `Size (1.96) lower than the minimum: 5`.
+    """
+    gamma_min_shares = max(D("0"), D(gamma_min_shares or 0))
+    gamma_tick = D(gamma_tick or "0.01")
+    if gamma_tick <= 0:
+        gamma_tick = D("0.01")
+
+    result = {
+        "minimum_order_shares": gamma_min_shares,
+        "tick_size": gamma_tick,
+        "source": "GAMMA",
+        "clob_min_shares": D("0"),
+        "gamma_min_shares": gamma_min_shares,
+    }
+
+    if not condition_id:
+        return result
+
+    try:
+        info = get(CLOB + "/clob-markets/" + str(condition_id))
+        clob_min = D(info.get("mos") or 0)
+        clob_tick = D(info.get("mts") or gamma_tick)
+        if clob_tick <= 0:
+            clob_tick = gamma_tick
+        result["clob_min_shares"] = clob_min
+        result["minimum_order_shares"] = max(gamma_min_shares, clob_min)
+        result["tick_size"] = clob_tick
+        result["source"] = "CLOB+GAMMA"
+    except Exception as exc:
+        log.warning(
+            "CLOB CONSTRAINTS V37 | falha condition_id=%s | usando Gamma min_shares=%s tick=%s | err=%r",
+            condition_id, gamma_min_shares, gamma_tick, exc,
+        )
+
+    return result
+
+
 def winner(sl):
     m = market(event(sl))
     if not m or not m["closed"] or len(m["outcomes"]) != len(m["prices"]):
@@ -980,40 +1028,43 @@ def recovery_target(st):
 
 def sizing(st, min_shares, directional_limit_price, opposite_limit_price):
     """
-    V29: PAR com minimo nominal de US$1,00 na perna oposta.
+    V37: PAR respeitando DOIS pisos em cada ponta:
+      1) valor nominal minimo configurado (MIN_LEG_USD, normalmente US$1);
+      2) minimum order size do mercado/CLOB EM SHARES.
 
-    A perna oposta usa o menor notional configurado (MIN_LEG_USD).
-    A perna direcional e calculada para que, se a direcao vencer, o lucro
-    liquido do par seja pelo menos recovery_deficit + base do timeframe.
+    A perna oposta usa:
+      qo = max(ceil(MIN_LEG_USD / po), minimum_order_shares)
 
-      qo = MIN_LEG_USD / po
-      qd >= (target_liquido + qo*po) / (1-pd)
+    A perna direcional usa o maior entre:
+      - shares necessarias para garantir target liquido;
+      - shares para o minimo nominal de US$1;
+      - minimum_order_shares do CLOB.
 
-    Como qo*po ~= MIN_LEG_USD, isso mantem o capital inicial proximo do
-    minimo possivel sem abandonar a recuperacao financeira real.
-    O orderMinSize informado pela Gamma e mantido apenas para diagnostico;
-    V29 nao o usa como piso local porque ordens nominais de US$1 foram
-    validadas manualmente pelo operador nos tres timeframes.
+    Assim nenhuma das duas pernas e enviada abaixo do `mos` oficial.
     """
     pd = D(directional_limit_price)
     po = D(opposite_limit_price)
+    market_min = max(D("0"), D(min_shares or 0))
     if pd <= 0 or pd >= 1 or po <= 0 or po >= 1:
-        raise ValueError("precos invalidos para sizing V29")
+        raise ValueError("precos invalidos para sizing V37")
 
     base, deficit, target = recovery_target(st)
 
-    opposite_shares = ceil_6(MIN_LEG_USD / po)
+    opposite_nominal_min = ceil_6(MIN_LEG_USD / po)
+    opposite_shares = max(opposite_nominal_min, market_min)
     opposite_max_spend = opposite_shares * po
 
-    directional_shares = ceil_6((target + opposite_max_spend) / (D("1") - pd))
-    directional_min_shares = ceil_6(MIN_LEG_USD / pd)
-    directional_shares = max(directional_shares, directional_min_shares)
+    shares_for_target = ceil_6((target + opposite_max_spend) / (D("1") - pd))
+    directional_nominal_min = ceil_6(MIN_LEG_USD / pd)
+    directional_shares = max(shares_for_target, directional_nominal_min, market_min)
 
     directional_max_spend = directional_shares * pd
     guaranteed_net_at_limit = directional_shares - directional_max_spend - opposite_max_spend
 
     blocked = None
-    if opposite_max_spend > MAX_ENTRY or directional_max_spend > MAX_ENTRY:
+    if market_min <= 0:
+        blocked = "MIN_ORDER_SHARES_UNAVAILABLE"
+    elif opposite_max_spend > MAX_ENTRY or directional_max_spend > MAX_ENTRY:
         blocked = "MAX_ENTRY"
     elif guaranteed_net_at_limit < target:
         blocked = "TARGET_NOT_GUARANTEED"
@@ -1034,32 +1085,35 @@ def sizing(st, min_shares, directional_limit_price, opposite_limit_price):
         "directional_limit_price": pd,
         "opposite_limit_price": po,
         "minimum_leg_usd": MIN_LEG_USD,
-        "reported_market_min_shares": D(min_shares),
+        "reported_market_min_shares": market_min,
+        "opposite_nominal_min_shares": opposite_nominal_min,
+        "directional_nominal_min_shares": directional_nominal_min,
     }
 
 
 def sizing_directional_only(st, min_shares, directional_limit_price):
     """
-    V29: UMA UNICA PONTA direcional.
-
-    A ordem nunca fica abaixo de US$1 nominal. Para atingir a meta liquida:
-        q >= target / (1-p)
-    e tambem:
-        q >= MIN_LEG_USD / p
+    V37: DIRECIONAL-ONLY respeitando simultaneamente:
+      - target financeiro;
+      - minimo nominal de US$1;
+      - minimum order size oficial do mercado/CLOB em shares.
     """
     pd = D(directional_limit_price)
+    market_min = max(D("0"), D(min_shares or 0))
     if pd <= 0 or pd >= 1:
-        raise ValueError("preco invalido para sizing directional-only V29")
+        raise ValueError("preco invalido para sizing directional-only V37")
 
     base, deficit, target = recovery_target(st)
     shares_for_profit = ceil_6(target / (D("1") - pd))
     shares_for_min_usd = ceil_6(MIN_LEG_USD / pd)
-    directional_shares = max(shares_for_profit, shares_for_min_usd)
+    directional_shares = max(shares_for_profit, shares_for_min_usd, market_min)
     directional_max_spend = directional_shares * pd
     guaranteed_net_at_limit = directional_shares - directional_max_spend
 
     blocked = None
-    if directional_max_spend > MAX_ENTRY:
+    if market_min <= 0:
+        blocked = "MIN_ORDER_SHARES_UNAVAILABLE"
+    elif directional_max_spend > MAX_ENTRY:
         blocked = "MAX_ENTRY"
     elif guaranteed_net_at_limit < target:
         blocked = "TARGET_NOT_GUARANTEED"
@@ -1080,7 +1134,8 @@ def sizing_directional_only(st, min_shares, directional_limit_price):
         "directional_limit_price": pd,
         "opposite_limit_price": None,
         "minimum_leg_usd": MIN_LEG_USD,
-        "reported_market_min_shares": D(min_shares),
+        "reported_market_min_shares": market_min,
+        "shares_for_min_usd": shares_for_min_usd,
     }
 
 
@@ -2450,8 +2505,31 @@ class Bot:
                 save(self.s)
             return
 
-        tick = D(p.get("tick_size") or "0.01")
-        min_shares = D(p["minimum_order_shares"])
+        # V37: revalida os limites do mercado no CLOB oficial imediatamente
+        # antes do sizing/envio. Nao confia apenas no valor salvo em T-30.
+        constraints = clob_constraints(
+            m.get("condition_id") or p.get("condition_id"),
+            m.get("min_order_shares", p.get("minimum_order_shares", "0")),
+            m.get("tick_size", p.get("tick_size", "0.01")),
+        )
+        tick = D(constraints["tick_size"])
+        min_shares = D(constraints["minimum_order_shares"])
+        p["minimum_order_shares"] = str(min_shares)
+        p["minimum_order_shares_gamma"] = str(constraints["gamma_min_shares"])
+        p["minimum_order_shares_clob"] = str(constraints["clob_min_shares"])
+        p["minimum_order_source"] = constraints["source"]
+        p["tick_size"] = str(tick)
+        save(self.s)
+
+        if min_shares <= 0:
+            log.warning(
+                "%s | BLOQUEADO V37 | minimum_order_shares indisponivel | condition_id=%s | fonte=%s",
+                st["name"], m.get("condition_id") or p.get("condition_id"), constraints["source"],
+            )
+            st["pending"] = None
+            save(self.s)
+            return
+
         dir_limit = ceil_to_step(D(dp), tick)
         if dir_limit > max_limit_price:
             return
@@ -2475,7 +2553,7 @@ class Bot:
             if not both_ok:
                 if time.time() - float(p.get("last_wait_log", 0)) >= 3:
                     log.info(
-                        "%s | AGUARDANDO PRECO V36 | modo=PAR | DIR=%s OPP=%s | precisa OPP<=%s | TARGET=%s | DEFICIT=%s < SWITCH_USD=%s",
+                        "%s | AGUARDANDO PRECO V37 | modo=PAR | DIR=%s OPP=%s | precisa OPP<=%s | TARGET=%s | DEFICIT=%s < SWITCH_USD=%s",
                         st["name"], dp, op, max_limit_price, target_net_profit, recovery_deficit, dir_min_notional,
                     )
                     p["last_wait_log"] = time.time()
@@ -2499,7 +2577,7 @@ class Bot:
             total_spend = sz["directional_max_spend"]
             if sz.get("blocked"):
                 log.warning(
-                    "%s | BLOQUEADO V36 DIRECIONAL-ONLY | motivo=%s | DIR_LIMIT=%s | base=%s | deficit=%s | target=%s",
+                    "%s | BLOQUEADO V37 DIRECIONAL-ONLY | motivo=%s | DIR_LIMIT=%s | base=%s | deficit=%s | target=%s",
                     st["name"], sz.get("reason"), dir_limit, sz["base_profit"],
                     sz["recovery_deficit"], sz["target_net_profit"],
                 )
@@ -2508,7 +2586,7 @@ class Bot:
                 return
             if total_spend > D(st["bankroll"]):
                 log.warning(
-                    "%s | BLOQUEADO V36 DIRECIONAL-ONLY | gasto=%s > bankroll=%s | target=%s",
+                    "%s | BLOQUEADO V37 DIRECIONAL-ONLY | gasto=%s > bankroll=%s | target=%s",
                     st["name"], total_spend, st["bankroll"], sz["target_net_profit"],
                 )
                 st["pending"] = None
@@ -2526,8 +2604,8 @@ class Bot:
             save(self.s)
 
             log.info(
-                "%s | SIZING V36 DIRECIONAL-ONLY | MOTIVO=%s | MIN_SHARES_REPORTADO=%s | SWITCH_DEFICIT_USD=%s | DIR_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=0 | GASTO_MAX=%s | LUCRO_MIN=%s",
-                st["name"], single_reason, p["minimum_order_shares"], dir_min_notional,
+                "%s | SIZING V37 DIRECIONAL-ONLY | MOTIVO=%s | MIN_SHARES_EFETIVO=%s | MIN_GAMMA=%s | MIN_CLOB=%s | FONTE_MIN=%s | SWITCH_DEFICIT_USD=%s | DIR_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=0 | GASTO_MAX=%s | LUCRO_MIN=%s",
+                st["name"], single_reason, p["minimum_order_shares"], p.get("minimum_order_shares_gamma"), p.get("minimum_order_shares_clob"), p.get("minimum_order_source"), dir_min_notional,
                 dir_limit, sz["base_profit"], sz["recovery_deficit"], sz["target_net_profit"],
                 sz["directional_shares"], total_spend, sz["guaranteed_net_at_limit"],
             )
@@ -2590,7 +2668,7 @@ class Bot:
         total_spend = pair_total
         if sz.get("blocked"):
             log.warning(
-                "%s | BLOQUEADO V36 PAR | motivo=%s | DIR_LIMIT=%s | OPP_LIMIT=%s | base=%s | deficit=%s | target=%s",
+                "%s | BLOQUEADO V37 PAR | motivo=%s | DIR_LIMIT=%s | OPP_LIMIT=%s | base=%s | deficit=%s | target=%s",
                 st["name"], sz.get("reason"), dir_limit, opp_limit, sz["base_profit"],
                 sz["recovery_deficit"], sz["target_net_profit"],
             )
@@ -2599,7 +2677,7 @@ class Bot:
             return
         if total_spend > D(st["bankroll"]):
             log.warning(
-                "%s | BLOQUEADO V36 PAR | gasto=%s > bankroll=%s | SEM_FALLBACK_DIRECIONAL | deficit=%s | target=%s",
+                "%s | BLOQUEADO V37 PAR | gasto=%s > bankroll=%s | SEM_FALLBACK_DIRECIONAL | deficit=%s | target=%s",
                 st["name"], total_spend, st["bankroll"], sz["recovery_deficit"], sz["target_net_profit"],
             )
             st["pending"] = None
@@ -2617,8 +2695,8 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | SIZING V36 PAR-USD1 | MIN_SHARES_REPORTADO=%s | MIN_USD_PONTA=%s | DIR_PX=%s | OPP_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=%s | GASTO_MAX=%s | LUCRO_MIN=%s",
-            st["name"], p["minimum_order_shares"], dir_min_notional, dir_limit, opp_limit,
+            "%s | SIZING V37 PAR-MIN-CLOB | MIN_SHARES_EFETIVO=%s | MIN_GAMMA=%s | MIN_CLOB=%s | FONTE_MIN=%s | MIN_USD_PONTA=%s | DIR_PX=%s | OPP_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=%s | GASTO_MAX=%s | LUCRO_MIN=%s",
+            st["name"], p["minimum_order_shares"], p.get("minimum_order_shares_gamma"), p.get("minimum_order_shares_clob"), p.get("minimum_order_source"), dir_min_notional, dir_limit, opp_limit,
             sz["base_profit"], sz["recovery_deficit"], sz["target_net_profit"],
             sz["directional_shares"], sz["opposite_shares"], total_spend,
             sz["guaranteed_net_at_limit"],
@@ -2636,7 +2714,7 @@ class Bot:
             start_barrier.wait()
             return self.place_gtc_limit(token, D(price), D(shares))
 
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-v28") as ex:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-v37") as ex:
             f_dir = ex.submit(
                 send_leg, p["directional_token"],
                 p["directional_shares_requested"], p["directional_limit_price"],
@@ -3198,10 +3276,10 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=36 | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=37 | MIN_ORDER=CLOB_DINAMICO+USD1 | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V36 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V37 FINAL | MIN_ORDER=CLOB_DINAMICO+USD1 | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
