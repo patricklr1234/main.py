@@ -25,7 +25,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V39 FINAL - ENTRADAS SOBREPOSTAS + MINIMO CLOB DINAMICO + RD/STOP LOSS + MACD AO VIVO + RESET V34 PRESERVADO
+# POLYMARKET BTC V40 FINAL - ENTRADAS SOBREPOSTAS + MINIMO CLOB DINAMICO + RD/STOP LOSS + MACD AO VIVO + RESET V34 PRESERVADO
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -829,6 +829,66 @@ def winner(sl):
         return "UP"
     if o in ("DOWN", "NO"):
         return "DOWN"
+    return None
+
+
+def winner_for_position(p):
+    """
+    V40: detecta o vencedor por múltiplas fontes e persiste o resultado na posição.
+    A detecção pode ocorrer fora de ordem; a contabilização financeira continua FIFO.
+    """
+    cached = str((p or {}).get("resolved_winner") or "").upper()
+    if cached in ("UP", "DOWN"):
+        return cached
+
+    slug = str((p or {}).get("slug") or "")
+    if slug:
+        try:
+            w = winner(slug)
+            if w in ("UP", "DOWN"):
+                p["resolved_winner"] = w
+                p["resolved_winner_source"] = "GAMMA"
+                p["resolved_winner_at"] = datetime.now(UTC).isoformat()
+                return w
+        except Exception:
+            pass
+
+    condition_id = str((p or {}).get("condition_id") or "").strip()
+    if not condition_id:
+        return None
+
+    # Parsing defensivo de respostas CLOB que exponham tokens/outcomes vencedores.
+    for path in (f"/clob-markets/{condition_id}", f"/markets/{condition_id}"):
+        try:
+            info = get(CLOB + path)
+        except Exception:
+            continue
+
+        candidates = []
+        if isinstance(info, dict):
+            for key in ("tokens", "outcomes"):
+                val = info.get(key)
+                if isinstance(val, list):
+                    candidates.extend(val)
+
+        for tok in candidates:
+            if not isinstance(tok, dict):
+                continue
+            flag = tok.get("winner")
+            if flag is not True and str(flag).lower() not in ("true", "1"):
+                continue
+            out = str(tok.get("outcome") or tok.get("name") or "").upper()
+            if out in ("UP", "YES"):
+                w = "UP"
+            elif out in ("DOWN", "NO"):
+                w = "DOWN"
+            else:
+                continue
+            p["resolved_winner"] = w
+            p["resolved_winner_source"] = "CLOB"
+            p["resolved_winner_at"] = datetime.now(UTC).isoformat()
+            return w
+
     return None
 
 
@@ -3072,7 +3132,7 @@ class Bot:
     # ------------------------- RESOLUTION -------------------------
 
     def resolve(self, st, p=None):
-        # V39: aceita tanto o pending legado quanto uma posicao da fila
+        # V40: aceita tanto o pending legado quanto uma posicao da fila
         # open_positions. Retorna True somente quando a resolucao foi concluida.
         from_open_positions = p is not None
         if p is None:
@@ -3080,7 +3140,7 @@ class Bot:
         if not p or p.get("phase") != "await_resolution":
             return False
 
-        w = winner(p["slug"])
+        w = winner_for_position(p)
         if not w:
             return False
 
@@ -3130,7 +3190,7 @@ class Bot:
             financial_result = "WIN"
             deficit_after = max(D("0"), deficit_before - pnl)
             st["wins"] += 1
-            # V39: enquanto ainda existir RD, o ciclo de recuperacao continua ativo.
+            # V40: enquanto ainda existir RD, o ciclo de recuperacao continua ativo.
             # Uma vitoria parcial reduz o deficit, mas NAO encerra o martingale.
             # O ciclo so volta ao zero quando o RD financeiro chega exatamente a 0.
             if deficit_after <= 0:
@@ -3187,7 +3247,7 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | RESOLUCAO V39 CASCATA | WINNER=%s | SINAL=%s | RESULTADO_FINANCEIRO=%s | PNL=%s | STOP_LOSS=%s | BANKROLL=%s | loss_streak=%s | RD_ANTES=%s | RD_DEPOIS=%s | PROX_TARGET=%s | RECOVERY_ACTIVE=%s",
+            "%s | RESOLUCAO V40 CASCATA | WINNER=%s | SINAL=%s | RESULTADO_FINANCEIRO=%s | PNL=%s | STOP_LOSS=%s | BANKROLL=%s | loss_streak=%s | RD_ANTES=%s | RD_DEPOIS=%s | PROX_TARGET=%s | RECOVERY_ACTIVE=%s",
             st["name"],
             w,
             direction,
@@ -3204,7 +3264,7 @@ class Bot:
         return True
 
     def archive_awaiting_resolution(self, st):
-        """V39: libera o slot pending assim que a ordem passa a aguardar resultado."""
+        """V40: libera o slot pending assim que a ordem passa a aguardar resultado."""
         p = st.get("pending")
         if not isinstance(p, dict) or p.get("phase") != "await_resolution":
             return False
@@ -3219,7 +3279,7 @@ class Bot:
         if not duplicate:
             ops.append(p)
             log.info(
-                "%s | V39 POSICAO EM ANDAMENTO DESACOPLADA | slug=%s | open_positions=%s | proxima rodada pode ser avaliada sem esperar resolucao",
+                "%s | V40 POSICAO EM ANDAMENTO DESACOPLADA | slug=%s | open_positions=%s | proxima rodada pode ser avaliada sem esperar resolucao",
                 st["name"], slug, len(ops),
             )
         st["pending"] = None
@@ -3228,46 +3288,89 @@ class Bot:
 
     def resolve_open_positions(self, st):
         """
-        V39: resolve a fila em ordem cronologica estrita (FIFO por round_end).
+        V40: detecção fora de ordem + aplicação financeira FIFO.
 
-        Isso e essencial para o martingale em cascata com rodadas sobrepostas:
-        A -> B -> C -> D. Se A ainda nao tiver resultado, B/C/D podem continuar
-        abertos e novas rodadas podem ser capturadas, mas um resultado posterior
-        nao e contabilizado antes de A. Assim, quando A finalmente resolve, o RD
-        e atualizado primeiro; depois B, depois C, sempre na ordem real das rodadas.
+        Varre TODAS as posições abertas. B/C podem ter o winner detectado e salvo
+        mesmo enquanto A ainda está atrasada. Depois, bankroll/PNL/RD são aplicados
+        somente na ordem cronológica A -> B -> C.
         """
         ops = st.setdefault("open_positions", [])
         if not ops:
             return
 
         def pos_key(x):
-            return (str(x.get("round_end") or ""), str(x.get("round_start") or ""), str(x.get("slug") or ""))
+            return (
+                str(x.get("round_end") or ""),
+                str(x.get("round_start") or ""),
+                str(x.get("slug") or ""),
+            )
 
         ops.sort(key=pos_key)
 
-        # Processa todas as posicoes consecutivas ja resolviveis. Ao encontrar
-        # a primeira mais antiga ainda sem winner, para ali para preservar FIFO.
-        while ops:
-            oldest = ops[0]
+        # Detecta e cacheia resultados de TODAS as posições, sem bloquear em A.
+        cache_changed = False
+        for idx, pos in enumerate(list(ops)):
+            if not isinstance(pos, dict):
+                continue
+            before = str(pos.get("resolved_winner") or "")
             try:
-                resolved = self.resolve(st, oldest)
+                w = winner_for_position(pos)
             except Exception:
                 log.exception(
-                    "%s | erro resolvendo posicao V39 FIFO | slug=%s",
+                    "%s | erro detectando winner V40 | slug=%s",
+                    st["name"], pos.get("slug"),
+                )
+                continue
+
+            after = str(pos.get("resolved_winner") or "")
+            if after and after != before:
+                cache_changed = True
+                log.info(
+                    "%s | V40 RESULTADO CACHEADO | slug=%s | winner=%s | fonte=%s | posicao_fifo=%s",
+                    st["name"],
+                    pos.get("slug"),
+                    w,
+                    pos.get("resolved_winner_source"),
+                    idx + 1,
+                )
+
+        if cache_changed:
+            save(self.s)
+
+        # Aplica resultados somente em FIFO, consumindo toda sequência já resolvida.
+        while True:
+            ops = st.setdefault("open_positions", [])
+            if not ops:
+                return
+            ops.sort(key=pos_key)
+            oldest = ops[0]
+
+            if str(oldest.get("resolved_winner") or "").upper() not in ("UP", "DOWN"):
+                try:
+                    if not winner_for_position(oldest):
+                        return
+                    save(self.s)
+                except Exception:
+                    log.exception(
+                        "%s | erro resolvendo posicao V40 FIFO | slug=%s",
+                        st["name"], oldest.get("slug"),
+                    )
+                    return
+
+            try:
+                if not self.resolve(st, oldest):
+                    return
+            except Exception:
+                log.exception(
+                    "%s | erro aplicando resolucao V40 FIFO | slug=%s",
                     st["name"], oldest.get("slug"),
                 )
-                break
-
-            if not resolved:
-                break
-
-            ops = st.setdefault("open_positions", [])
-            ops.sort(key=pos_key)
+                return
 
     # ------------------------- LOOP -------------------------
 
     def tick(self, st, now):
-        # V39: uma rodada ja iniciada nao bloqueia a captura T-30 da rodada seguinte.
+        # V40: uma rodada ja iniciada nao bloqueia a captura T-30 da rodada seguinte.
         # Assim que uma operacao entra em await_resolution ela e movida para
         # open_positions; o slot pending fica livre para preparar a proxima rodada.
         if isinstance(st.get("pending"), dict) and st["pending"].get("phase") == "await_resolution":
@@ -3361,7 +3464,7 @@ class Bot:
         recovery_active = max(D("0"), D(st.get("recovery_deficit", "0") or "0")) > 0
         if recovery_active and not two_same:
             log.info(
-                "%s | MARTINGALE V39 EM CASCATA AGUARDA candle ANTERIOR fechado + ATUAL aberto %s + MACD | RD=%s | OPEN=%s | dirs=[anterior_fechado, atual_aberto]=%s",
+                "%s | MARTINGALE V40 EM CASCATA AGUARDA candle ANTERIOR fechado + ATUAL aberto %s + MACD | RD=%s | OPEN=%s | dirs=[anterior_fechado, atual_aberto]=%s",
                 st["name"],
                 direction,
                 st.get("recovery_deficit", "0"),
@@ -3391,10 +3494,10 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=39 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_RD_ATUAL | MIN_ORDER=CLOB_DINAMICO+USD1 | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=40 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE_RESOLUCAO | RESOLUCAO=MULTIFONTE_GAMMA+CLOB | MIN_ORDER=CLOB_DINAMICO+USD1 | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V39 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_RD_ATUAL | MIN_ORDER=CLOB_DINAMICO+USD1 | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V40 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE_RESOLUCAO | RESOLUCAO=MULTIFONTE_GAMMA+CLOB | MIN_ORDER=CLOB_DINAMICO+USD1 | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
