@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V30 FINAL - V29 + FILTRO SEMANA + CALENDARIO EUA ALTO IMPACTO
+# POLYMARKET BTC V31 FINAL - CALENDARIO RESILIENTE COM CACHE PERSISTENTE
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -54,14 +54,17 @@ from urllib.parse import urlencode
 #   - objetivo: US$200,000 por robo
 #
 #
-# FILTRO DE SESSAO / NOTICIAS V30
+# FILTRO DE SESSAO / NOTICIAS V31
 #   - robos *_day: somente segunda a sexta, 10:00 <= inicio da rodada < 16:00 Brasilia
 #   - robos 24h continuam 7 dias por semana
-#   - os 6 robos consultam eventos EUA de ALTO IMPACTO (3 estrelas/tourinhos)
-#   - 5m/15m: nenhuma nova rodada com inicio entre T-15min e T+15min da noticia
-#   - 1h: nenhuma nova rodada com inicio entre T-60min e T+60min da noticia
-#   - calendario e atualizado em thread separada para nao atrasar o gatilho T-30
-#   - se o calendario ficar indisponivel/velho, novas entradas sao bloqueadas por seguranca
+#   - Trading Economics = fonte primaria quando TRADING_ECONOMICS_API_KEY estiver configurada
+#   - Investing.com = fallback automatico
+#   - ultimo calendario valido salvo persistentemente em /data/news_calendar_cache.json
+#   - busca 7 dias adiante e atualiza em thread separada, nunca no gatilho T-30
+#   - 5m/15m: bloqueio T-15min ate T+15min da noticia
+#   - 1h: bloqueio T-60min ate T+60min da noticia
+#   - falha temporaria das fontes NAO trava entrada: usa o cache valido
+#   - cache muito antigo gera alerta; por padrao continua operando (fail-open)
 # RECONCILIACAO DE SAQUES
 #   - consulta a atividade WITHDRAWAL da propria carteira Polymarket
 #   - aplica somente saques posteriores ao primeiro startup da V14
@@ -151,13 +154,16 @@ POLL_SECONDS = float(os.getenv("POLL_SECONDS", "0.5"))
 MAX_BUY_PRICE = Decimal(os.getenv("MAX_BUY_PRICE", "0.55"))
 MIN_LEG_USD = Decimal(os.getenv("MIN_LEG_USD", "1.00"))  # minimo nominal por ponta
 
-# V30 - calendario economico dos EUA, alto impacto (equivalente a 3 estrelas/tourinhos).
+# V31 - calendario economico resiliente.
 NEWS_FILTER_ENABLED = os.getenv("NEWS_FILTER_ENABLED", "1").lower() in ("1", "true", "yes", "on")
-NEWS_REFRESH_SECONDS = float(os.getenv("NEWS_REFRESH_SECONDS", "300"))
-NEWS_MAX_STALE_SECONDS = float(os.getenv("NEWS_MAX_STALE_SECONDS", "1800"))
-NEWS_FAIL_CLOSED = os.getenv("NEWS_FAIL_CLOSED", "1").lower() in ("1", "true", "yes", "on")
+NEWS_REFRESH_SECONDS = float(os.getenv("NEWS_REFRESH_SECONDS", "10800"))  # 3 horas
+NEWS_LOOKAHEAD_DAYS = int(os.getenv("NEWS_LOOKAHEAD_DAYS", "7"))
+NEWS_MAX_STALE_SECONDS = float(os.getenv("NEWS_MAX_STALE_SECONDS", "172800"))  # 48 horas
+NEWS_FAIL_CLOSED = os.getenv("NEWS_FAIL_CLOSED", "0").lower() in ("1", "true", "yes", "on")
 NEWS_WINDOW_SHORT_MIN = int(os.getenv("NEWS_WINDOW_SHORT_MIN", "15"))
 NEWS_WINDOW_1H_MIN = int(os.getenv("NEWS_WINDOW_1H_MIN", "60"))
+TRADING_ECONOMICS_API_KEY = os.getenv("TRADING_ECONOMICS_API_KEY", "").strip()
+TRADING_ECONOMICS_BASE = "https://api.tradingeconomics.com"
 INVESTING_CALENDAR_URL = "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData"
 
 TFS = {"5m": 5, "15m": 15, "1h": 60}
@@ -167,13 +173,14 @@ ROOT = Path(os.getenv("BOT_DIR", str(DEFAULT_ROOT))).resolve()
 ROOT.mkdir(parents=True, exist_ok=True)
 STATE = ROOT / "state.json"
 TRADES = ROOT / "trades.jsonl"
+NEWS_CACHE = ROOT / "news_calendar_cache.json"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v30")
+log = logging.getLogger("btc-polymarket-v31")
 STOP = False
 
 
@@ -590,7 +597,7 @@ def winner(sl):
 
 
 def session_allows_round(st, round_start):
-    """V30: sessao day opera somente seg-sex, 10:00-16:00 Brasilia."""
+    """V31: sessao day opera somente seg-sex, 10:00-16:00 Brasilia."""
     if st["session"] == "24h":
         return True
     local = round_start.astimezone(TZ)
@@ -605,82 +612,172 @@ def _strip_html(value):
     return " ".join(value.split())
 
 
-def fetch_us_high_impact_calendar():
-    """Busca o calendario Investing.com filtrado para EUA + importancia alta.
+def _parse_calendar_datetime(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+    except Exception:
+        pass
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=UTC)
+        except ValueError:
+            pass
+    return None
 
-    O request força timezone GMT/UTC (timeZone=56, usado historicamente pelo
-    calendario do Investing.com). Assim o data-event-datetime pode ser tratado
-    como UTC sem depender do DST de Brasilia ou Nova York.
-    """
+
+def _dedupe_news_events(events):
+    unique = {}
+    for ev in events:
+        dt = ev.get("time_utc")
+        if not isinstance(dt, datetime):
+            continue
+        dt = dt.astimezone(UTC).replace(microsecond=0)
+        name = " ".join(str(ev.get("name") or "US high-impact event").split())
+        unique[(dt.isoformat(), name.lower())] = {
+            "time_utc": dt,
+            "name": name,
+            "source": str(ev.get("source") or "unknown"),
+        }
+    return sorted(unique.values(), key=lambda e: e["time_utc"])
+
+
+def fetch_tradingeconomics_us_high_impact_calendar():
+    """Fonte primaria: EUA + Importance=3."""
+    if not TRADING_ECONOMICS_API_KEY:
+        raise RuntimeError("TRADING_ECONOMICS_API_KEY nao configurada")
     now = datetime.now(UTC)
     date_from = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    date_to = (now + timedelta(days=3)).strftime("%Y-%m-%d")
+    date_to = (now + timedelta(days=max(1, NEWS_LOOKAHEAD_DAYS))).strftime("%Y-%m-%d")
+    query = urlencode({"c": TRADING_ECONOMICS_API_KEY, "importance": "3", "f": "json"})
+    url = f"{TRADING_ECONOMICS_BASE}/calendar/country/united%20states/{date_from}/{date_to}?{query}"
+    req = Request(url, headers={"User-Agent": "btc-polymarket-v31/1.0", "Accept": "application/json"})
+    with urlopen(req, timeout=15) as r:
+        obj = json.loads(r.read().decode("utf-8", errors="replace"))
+    if not isinstance(obj, list):
+        raise RuntimeError("Trading Economics respondeu formato inesperado")
+    events = []
+    for item in obj:
+        if not isinstance(item, dict):
+            continue
+        try:
+            importance = int(item.get("Importance") or 0)
+        except Exception:
+            importance = 0
+        country = str(item.get("Country") or item.get("OCountry") or "").lower().strip()
+        if importance != 3 or country not in ("united states", "estados unidos"):
+            continue
+        dt = _parse_calendar_datetime(item.get("Date"))
+        if dt is None:
+            continue
+        name = str(item.get("Event") or item.get("Category") or "US high-impact event").strip()
+        events.append({"time_utc": dt, "name": name, "source": "TradingEconomics"})
+    return _dedupe_news_events(events)
+
+
+def fetch_investing_us_high_impact_calendar():
+    """Fallback: Investing.com EUA + importancia 3."""
+    now = datetime.now(UTC)
+    date_from = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    date_to = (now + timedelta(days=max(1, NEWS_LOOKAHEAD_DAYS))).strftime("%Y-%m-%d")
     payload = urlencode([
-        ("country[]", "5"),          # United States
-        ("importance[]", "3"),       # high impact / 3 estrelas
-        ("dateFrom", date_from),
-        ("dateTo", date_to),
-        ("timeZone", "56"),          # GMT/UTC
-        ("timeFilter", "timeOnly"),
-        ("currentTab", "custom"),
-        ("submitFilters", "1"),
-        ("limit_from", "0"),
+        ("country[]", "5"), ("importance[]", "3"),
+        ("dateFrom", date_from), ("dateTo", date_to),
+        ("timeZone", "56"), ("timeFilter", "timeOnly"),
+        ("currentTab", "custom"), ("submitFilters", "1"), ("limit_from", "0"),
     ]).encode("utf-8")
     req = Request(
-        INVESTING_CALENDAR_URL,
-        data=payload,
+        INVESTING_CALENDAR_URL, data=payload,
         headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
             "X-Requested-With": "XMLHttpRequest",
             "Accept": "application/json,text/plain,*/*",
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "Referer": "https://www.investing.com/economic-calendar/",
-        },
-        method="POST",
+        }, method="POST",
     )
-    with urlopen(req, timeout=12) as r:
-        raw = r.read().decode("utf-8", errors="replace")
-    obj = json.loads(raw)
+    with urlopen(req, timeout=15) as r:
+        obj = json.loads(r.read().decode("utf-8", errors="replace"))
     calendar_html = str(obj.get("data") or "") if isinstance(obj, dict) else ""
     if not calendar_html:
         raise RuntimeError("Investing calendar respondeu sem campo data")
-
-    rows = re.findall(
-        r"<tr\b(?=[^>]*\bjs-event-item\b)[^>]*>.*?</tr>",
-        calendar_html,
-        flags=re.I | re.S,
-    )
+    rows = re.findall(r"<tr\b(?=[^>]*\bjs-event-item\b)[^>]*>.*?</tr>", calendar_html, flags=re.I | re.S)
     events = []
     for row in rows:
         mdt = re.search(r'data-event-datetime=["\']([^"\']+)["\']', row, flags=re.I)
         if not mdt:
             continue
-        dt_text = mdt.group(1).strip()
-        dt = None
-        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M"):
-            try:
-                dt = datetime.strptime(dt_text, fmt).replace(tzinfo=UTC)
-                break
-            except ValueError:
-                pass
+        dt = _parse_calendar_datetime(mdt.group(1))
         if dt is None:
             continue
-
-        mev = re.search(
-            r'<td[^>]*class=["\'][^"\']*\bevent\b[^"\']*["\'][^>]*>(.*?)</td>',
-            row,
-            flags=re.I | re.S,
-        )
-        name = _strip_html(mev.group(1) if mev else "US high-impact event")
-        if not name:
-            name = "US high-impact event"
+        mev = re.search(r'<td[^>]*class=["\'][^"\']*\bevent\b[^"\']*["\'][^>]*>(.*?)</td>',
+                        row, flags=re.I | re.S)
+        name = _strip_html(mev.group(1) if mev else "US high-impact event") or "US high-impact event"
         events.append({"time_utc": dt, "name": name, "source": "Investing.com"})
-
-    # Resposta valida pode realmente nao ter eventos. Se existem linhas de evento
-    # mas nenhuma data foi parseada, tratamos como mudanca de HTML/erro e falhamos fechado.
     if rows and not events:
-        raise RuntimeError("Investing calendar mudou o formato: linhas encontradas sem datetime parseavel")
-    return events
+        raise RuntimeError("Investing calendar mudou o formato")
+    return _dedupe_news_events(events)
+
+
+def save_news_cache(events, source):
+    payload = {
+        "version": 31,
+        "saved_at_utc": datetime.now(UTC).isoformat(),
+        "source": source,
+        "events": [{
+            "time_utc": e["time_utc"].astimezone(UTC).isoformat(),
+            "name": e.get("name", "US high-impact event"),
+            "source": e.get("source", source),
+        } for e in events if isinstance(e.get("time_utc"), datetime)],
+    }
+    tmp = NEWS_CACHE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(NEWS_CACHE)
+
+
+def load_news_cache():
+    if not NEWS_CACHE.exists():
+        return [], 0.0, "", "cache inexistente"
+    try:
+        obj = json.loads(NEWS_CACHE.read_text(encoding="utf-8"))
+        saved = datetime.fromisoformat(str(obj.get("saved_at_utc", "")).replace("Z", "+00:00"))
+        if saved.tzinfo is None:
+            saved = saved.replace(tzinfo=UTC)
+        events = []
+        for item in obj.get("events", []):
+            if not isinstance(item, dict):
+                continue
+            dt = _parse_calendar_datetime(item.get("time_utc"))
+            if dt:
+                events.append({
+                    "time_utc": dt,
+                    "name": str(item.get("name") or "US high-impact event"),
+                    "source": str(item.get("source") or obj.get("source") or "cache"),
+                })
+        return _dedupe_news_events(events), saved.timestamp(), str(obj.get("source") or "cache"), ""
+    except Exception as exc:
+        return [], 0.0, "", repr(exc)
+
+
+def fetch_us_high_impact_calendar_resilient():
+    errors = []
+    if TRADING_ECONOMICS_API_KEY:
+        try:
+            return fetch_tradingeconomics_us_high_impact_calendar(), "TradingEconomics", errors
+        except Exception as exc:
+            errors.append(f"TradingEconomics={exc!r}")
+    else:
+        errors.append("TradingEconomics=SEM_API_KEY")
+    try:
+        return fetch_investing_us_high_impact_calendar(), "Investing.com", errors
+    except Exception as exc:
+        errors.append(f"Investing.com={exc!r}")
+    raise RuntimeError(" | ".join(errors))
 
 
 def base_edge(st):
@@ -921,74 +1018,82 @@ class Bot:
         self.last_balance_snapshot = None
         self.initialize_withdrawal_tracker()
 
-        # V30: calendario em background, para nunca bloquear o loop de entrada T-30.
-        self.news_events = []
-        self.news_last_success = 0.0
+        # V31: cache persistente carregado antes da thread; rede nunca e consultada no T-30.
+        cached_events, cached_ts, cached_source, cached_error = load_news_cache()
+        self.news_events = cached_events
+        self.news_last_success = cached_ts
         self.news_last_attempt = 0.0
-        self.news_last_error = "ainda nao carregado"
+        self.news_source = cached_source or "nenhuma"
+        self.news_last_error = cached_error or ""
         self.news_thread = None
+        if cached_events:
+            age = max(0.0, time.time() - cached_ts)
+            log.info("NEWS V31 | CACHE CARREGADO | fonte=%s | eventos=%s | idade=%.1fh | arquivo=%s",
+                     self.news_source, len(cached_events), age / 3600.0, NEWS_CACHE)
+        elif cached_error:
+            log.warning("NEWS V31 | cache nao disponivel | detalhe=%s", cached_error)
         if NEWS_FILTER_ENABLED:
-            self.news_thread = Thread(target=self._news_calendar_loop, name="news-calendar", daemon=True)
+            self.news_thread = Thread(target=self._news_calendar_loop, name="news-calendar-v31", daemon=True)
             self.news_thread.start()
 
         if LIVE:
             self.sync_balance(force=True)
 
-    # -------------------- V30 ECONOMIC NEWS FILTER --------------------
+    # -------------------- V31 ECONOMIC NEWS FILTER --------------------
 
     def _news_calendar_loop(self):
         while not STOP:
             self.news_last_attempt = time.time()
             try:
-                events = fetch_us_high_impact_calendar()
+                events, source, prior_errors = fetch_us_high_impact_calendar_resilient()
                 self.news_events = events
                 self.news_last_success = time.time()
-                self.news_last_error = ""
-                upcoming = [e for e in events if e["time_utc"] >= datetime.now(UTC) - timedelta(hours=2)]
+                self.news_source = source
+                self.news_last_error = " | ".join(prior_errors)
+                save_news_cache(events, source)
+                now_utc = datetime.now(UTC)
+                upcoming = [e for e in events if e["time_utc"] >= now_utc - timedelta(hours=2)]
                 preview = "; ".join(
                     f'{e["time_utc"].astimezone(TZ).strftime("%d/%m %H:%M BRT")} {e["name"]}'
                     for e in upcoming[:8]
-                ) or "nenhum evento alto impacto no intervalo carregado"
-                log.info(
-                    "NEWS V30 | Investing.com EUA HIGH carregado | eventos=%s | proximos=%s",
-                    len(events), preview,
-                )
+                ) or "nenhum evento alto impacto no horizonte"
+                log.info("NEWS V31 | ATUALIZADO | fonte=%s | eventos=%s | horizonte=%sd | proximos=%s%s",
+                         source, len(events), NEWS_LOOKAHEAD_DAYS, preview,
+                         (" | fallback_info=" + self.news_last_error) if self.news_last_error else "")
             except Exception as exc:
                 self.news_last_error = repr(exc)
-                log.warning("NEWS V30 | falha ao atualizar calendario EUA HIGH | erro=%r", exc)
-
-            deadline = time.time() + max(30.0, NEWS_REFRESH_SECONDS)
+                age = time.time() - self.news_last_success if self.news_last_success else float("inf")
+                log.warning("NEWS V31 | FONTES INDISPONIVEIS | mantendo cache | fonte_cache=%s | "
+                            "eventos_cache=%s | idade_cache=%s | erro=%r",
+                            self.news_source, len(self.news_events),
+                            (f"{age/3600.0:.1f}h" if age != float("inf") else "SEM_CACHE"), exc)
+            deadline = time.time() + max(60.0, NEWS_REFRESH_SECONDS)
             while not STOP and time.time() < deadline:
                 time.sleep(1.0)
 
     def news_allows_round(self, st, round_start):
-        """Retorna (allowed, event, reason) para a proxima rodada.
-
-        5m/15m: bloqueio [noticia-15m, noticia+15m).
-        1h: bloqueio [noticia-60m, noticia+60m).
-        """
+        """Somente consulta memoria/cache; nunca acessa internet no T-30."""
         if not NEWS_FILTER_ENABLED:
             return True, None, "NEWS_FILTER_DISABLED"
-
         age = time.time() - self.news_last_success if self.news_last_success else float("inf")
-        if age > NEWS_MAX_STALE_SECONDS:
+        if not self.news_last_success:
             if NEWS_FAIL_CLOSED:
-                return False, None, f"CALENDARIO_INDISPONIVEL age={age:.0f}s erro={self.news_last_error}"
-            return True, None, f"CALENDARIO_INDISPONIVEL_FAIL_OPEN age={age:.0f}s"
+                return False, None, f"SEM_CALENDARIO erro={self.news_last_error}"
+            return True, None, f"SEM_CALENDARIO_FAIL_OPEN erro={self.news_last_error}"
+        if age > NEWS_MAX_STALE_SECONDS and NEWS_FAIL_CLOSED:
+            return False, None, f"CALENDARIO_MUITO_ANTIGO age={age:.0f}s fonte={self.news_source}"
 
         minutes = NEWS_WINDOW_1H_MIN if st.get("tf") == "1h" else NEWS_WINDOW_SHORT_MIN
         before = timedelta(minutes=minutes)
         after = timedelta(minutes=minutes)
         rs = round_start.astimezone(UTC)
-
         for ev in self.news_events:
             et = ev.get("time_utc")
-            if not isinstance(et, datetime):
-                continue
-            # Exatamente no fim da janela volta a permitir entrada.
-            if et - before <= rs < et + after:
+            if isinstance(et, datetime) and et - before <= rs < et + after:
                 return False, ev, f"NEWS_BLACKOUT_{minutes}MIN"
-        return True, None, "OK"
+        if age > NEWS_MAX_STALE_SECONDS:
+            return True, None, f"OK_CACHE_STALE_FAIL_OPEN age={age:.0f}s fonte={self.news_source}"
+        return True, None, f"OK fonte={self.news_source}"
 
     # -------------------- AUTOMATIC POSITION REDEMPTION --------------------
 
@@ -2818,7 +2923,7 @@ class Bot:
             return
 
         if not session_allows_round(st, next_start):
-            # *_day: V30 bloqueia fim de semana e fora de 10:00-16:00 BRT.
+            # *_day: V31 bloqueia fim de semana e fora de 10:00-16:00 BRT.
             return
 
         news_ok, news_event, news_reason = self.news_allows_round(st, next_start)
@@ -2829,14 +2934,14 @@ class Bot:
                 save(self.s)
                 if news_event:
                     log.warning(
-                        "%s | ENTRADA BLOQUEADA NEWS V30 | rodada=%s | motivo=%s | evento=%s | evento_BRT=%s",
+                        "%s | ENTRADA BLOQUEADA NEWS V31 | rodada=%s | motivo=%s | evento=%s | evento_BRT=%s",
                         st["name"], next_start.isoformat(), news_reason,
                         news_event.get("name"),
                         news_event["time_utc"].astimezone(TZ).isoformat(),
                     )
                 else:
                     log.warning(
-                        "%s | ENTRADA BLOQUEADA NEWS V30 | rodada=%s | motivo=%s",
+                        "%s | ENTRADA BLOQUEADA NEWS V31 | rodada=%s | motivo=%s",
                         st["name"], next_start.isoformat(), news_reason,
                     )
             return
@@ -2890,14 +2995,14 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=30 | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=DEFICIT_ACUMULADO+BASE | DAY=SEG-SEX_10-16_BRT | NEWS_US_HIGH=ON | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H)
+        log.info("STARTUP OK | codigo carregado | versao=31 | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=DEFICIT_ACUMULADO+BASE | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
             "POLYMARKET BTC V30 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=TARGET>=USD1 | FALLBACK_1PONTA=PAR>CAIXA | PARTIAL_PAR=PROPORCIONAL | "
-            "DAY=SEG-SEX_10-16_BRT | NEWS=US_HIGH_3ESTRELAS | NEWS_5M15M=+-15M | NEWS_1H=+-60M | "
+            "DAY=SEG-SEX_10-16_BRT | NEWS=US_HIGH_3ESTRELAS_RESILIENTE | NEWS_5M15M=+-15M | NEWS_1H=+-60M | "
             "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO | MARTINGALE=DEFICIT_ACUMULADO+BASE | SIZING=USD1_POR_PONTA+AUTO_DIRECIONAL_ONLY | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
             LIVE,
             gasless_mode,
