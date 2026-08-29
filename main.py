@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V31 FINAL - CALENDARIO RESILIENTE COM CACHE PERSISTENTE
+# POLYMARKET BTC V32 FINAL - RESET UNICO DOS 6 ROBOS + CALENDARIO RESILIENTE
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -53,6 +53,12 @@ from urllib.parse import urlencode
 #   - maximo de US$1000 de gasto teorico por perna
 #   - objetivo: US$200,000 por robo
 #
+#
+# RESET UNICO V32
+#   - no primeiro startup desta versao, redefine os 6 robos para US$12
+#   - zera loss_streak e recovery_deficit de cada robo
+#   - preserva historico, pending, reconciliacao de saques e resgates
+#   - grava marcador persistente; reinicios/redeploys seguintes NAO resetam novamente
 #
 # FILTRO DE SESSAO / NOTICIAS V31
 #   - robos *_day: somente segunda a sexta, 10:00 <= inicio da rodada < 16:00 Brasilia
@@ -180,7 +186,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("btc-polymarket-v31")
+log = logging.getLogger("btc-polymarket-v32")
 STOP = False
 
 
@@ -241,8 +247,12 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 29,
+        "version": 32,
         "strategies": {},
+        "maintenance": {
+            "applied_resets": [],
+            "last_reset": None,
+        },
         "capital_reconciliation": {
             "initialized": False,
             "baseline_epoch": 0,
@@ -341,6 +351,13 @@ def load():
                 if field in redemption:
                     dst_redemption[field] = redemption[field]
 
+        maintenance = old.get("maintenance")
+        if isinstance(maintenance, dict):
+            dst_maintenance = new["maintenance"]
+            for field in ("applied_resets", "last_reset"):
+                if field in maintenance:
+                    dst_maintenance[field] = maintenance[field]
+
         # Migracao V25: cria um deficit financeiro persistente para cada robo.
         # Se o estado antigo ainda nao tinha esse campo, tenta reconstruir o
         # drawdown nao recuperado a partir das resolucoes auditadas em trades.jsonl.
@@ -386,7 +403,7 @@ def load():
             st["recovery_deficit"] = str(max(D("0"), deficit))
             st["martingale_base_edge"] = None
 
-        new["version"] = 29
+        new["version"] = 32
         save(new)
         return new
     except Exception:
@@ -394,6 +411,64 @@ def load():
         s = fresh()
         save(s)
         return s
+
+
+ONE_TIME_RESET_ID = "v32_reset_all_robots_to_initial_12"
+
+
+def apply_one_time_all_robots_reset(s):
+    """
+    V32: reset financeiro unico dos seis robos.
+
+    O marcador fica dentro do state.json persistente. Assim, o primeiro startup
+    que carregar a V32 aplica o reset e grava o ID; qualquer restart/redeploy
+    posterior detecta o marcador e NAO repete o reset.
+
+    Preservado de proposito: pending, wins/losses/trades, realized_pnl,
+    last_trigger, reconciliacao de saques e reconciliacao de resgates.
+    """
+    maintenance = s.setdefault("maintenance", {"applied_resets": [], "last_reset": None})
+    applied = maintenance.setdefault("applied_resets", [])
+    if ONE_TIME_RESET_ID in applied:
+        return False
+
+    before = {}
+    for name, st in s.get("strategies", {}).items():
+        before[name] = {
+            "bankroll": str(st.get("bankroll", "0")),
+            "loss_streak": int(st.get("loss_streak", 0) or 0),
+            "recovery_deficit": str(st.get("recovery_deficit", "0") or "0"),
+        }
+        st["bankroll"] = str(INITIAL)
+        st["loss_streak"] = 0
+        st["recovery_deficit"] = "0"
+        st["martingale_base_edge"] = None
+
+    ts = datetime.now(UTC).isoformat()
+    applied.append(ONE_TIME_RESET_ID)
+    maintenance["last_reset"] = {
+        "id": ONE_TIME_RESET_ID,
+        "timestamp": ts,
+        "bankroll_each": str(INITIAL),
+        "robots": sorted(s.get("strategies", {}).keys()),
+        "before": before,
+    }
+    s["version"] = 32
+    save(s)
+
+    audit({
+        "type": "maintenance_reset",
+        "id": ONE_TIME_RESET_ID,
+        "timestamp": ts,
+        "bankroll_each": str(INITIAL),
+        "robots": sorted(s.get("strategies", {}).keys()),
+        "before": before,
+    })
+    log.warning(
+        "RESET V32 APLICADO UMA UNICA VEZ | robos=%s | bankroll_cada=%s | loss_streak=0 | recovery_deficit=0 | marcador=%s",
+        len(s.get("strategies", {})), INITIAL, ONE_TIME_RESET_ID,
+    )
+    return True
 
 
 def audit(payload):
@@ -987,6 +1062,7 @@ def build_gasless_api_key():
 class Bot:
     def __init__(self):
         self.s = load()
+        apply_one_time_all_robots_reset(self.s)
         self.c = None
 
         if LIVE:
@@ -2995,10 +3071,10 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=31 | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=DEFICIT_ACUMULADO+BASE | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=32 | RESET_UNICO=V32 | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=DEFICIT_ACUMULADO+BASE | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V30 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V32 FINAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=TARGET>=USD1 | FALLBACK_1PONTA=PAR>CAIXA | PARTIAL_PAR=PROPORCIONAL | "
