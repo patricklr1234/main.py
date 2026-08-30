@@ -28,7 +28,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC+ETH+HYPE V50 FINAL - CHAINLINK WS FAST-SETTLEMENT + CAIXA LIVRE + CAPITAL COMPROMETIDO + TOKEN-BOOK USD1 + RD/STOP LOSS
+# POLYMARKET BTC+ETH+HYPE V51 FINAL - CHAINLINK WS FAST-SETTLEMENT + CAIXA LIVRE + CAPITAL COMPROMETIDO + TOKEN-BOOK USD1 + RD/STOP LOSS
 # - resultado operacional das rodadas BTC pelo feed Chainlink live da Polymarket em segundos apos o boundary
 # - Gamma/CLOB e saldo de auto-redeem permanecem como redundancia/fallback
 #
@@ -357,7 +357,7 @@ def strategy_name(asset, tf, session):
 
 def fresh():
     s = {
-        "version": 50,
+        "version": 51,
         "strategies": {},
         "maintenance": {
             "applied_resets": [],
@@ -546,7 +546,7 @@ def load():
             st["recovery_deficit"] = str(max(D("0"), deficit))
             st["martingale_base_edge"] = None
 
-        new["version"] = 50
+        new["version"] = 51
         save(new)
         return new
     except Exception:
@@ -635,7 +635,7 @@ def apply_one_time_all_robots_reset(s):
         "reset_scope": "TOTAL_LOGICAL_STRATEGY_STATE",
         "before": before,
     }
-    s["version"] = 50
+    s["version"] = 51
     save(s)
 
     audit({
@@ -3316,34 +3316,45 @@ class Bot:
         dir_min_notional = MIN_LEG_USD
         p["directional_min_notional"] = str(dir_min_notional)
 
-        # V35: o switch depende SOMENTE do deficit financeiro acumulado.
-        # O lucro-base do timeframe nao antecipa mais a troca para uma ponta.
-        # Assim, todo ciclo novo (deficit=0) obrigatoriamente comeca em PAR.
-        # V44: ciclo NOVO (RD=0) e sempre PAR. DIRECIONAL-ONLY so existe
-        # quando ha deficit de recuperacao REAL >= US$1.
-        use_single = recovery_deficit > 0 and recovery_deficit >= dir_min_notional
-        single_reason = "RECOVERY_DEFICIT_REAL_ATINGIU_USD1" if use_single else None
-
+        # V51: o switch para DIRECIONAL-ONLY NAO usa mais o piso fixo de US$1.
+        # Em mercados cujo /book exige, por exemplo, 5 shares por token, uma
+        # unica perna minima pode custar ~US$2,50. Trocar para uma ponta com RD
+        # pequeno cria uma exposicao unilateral desproporcional.
+        #
+        # Regra V51: primeiro calcula o CAPITAL MINIMO REAL do PAR no book atual
+        # (min_shares_dir*preco_dir + min_shares_opp*preco_opp). Enquanto o RD
+        # acumulado for MENOR que esse piso, o robo permanece obrigatoriamente
+        # em PAR. Somente quando o prejuizo acumulado atingir esse capital minimo
+        # real o DIRECIONAL-ONLY pode ser usado. Isso vale igualmente para BTC,
+        # ETH e HYPE e para 5m/15m/1h.
         pair_sz = None
         pair_total = None
         opp_limit = None
 
+        both_ok = op is not None and D(op) <= max_limit_price
+        if not both_ok:
+            if time.time() - float(p.get("last_wait_log", 0)) >= 3:
+                log.info(
+                    "%s | AGUARDANDO PRECO V51 | precisa DUAS PERNAS para calcular switch dinamico | DIR=%s OPP=%s | OPP<=%s | TARGET=%s | DEFICIT=%s",
+                    st["name"], dp, op, max_limit_price, target_net_profit, recovery_deficit,
+                )
+                p["last_wait_log"] = time.time()
+                save(self.s)
+            return
+
+        opp_limit = ceil_to_step(D(op), tick)
+        if opp_limit > max_limit_price:
+            return
+
+        min_pair_capital = (dir_min_shares * dir_limit) + (opp_min_shares * opp_limit)
+        single_switch_threshold = max(MIN_LEG_USD, min_pair_capital)
+        p["single_leg_switch_threshold"] = str(single_switch_threshold)
+        p["minimum_pair_capital_at_switch"] = str(min_pair_capital)
+        use_single = recovery_deficit > 0 and recovery_deficit >= single_switch_threshold
+        single_reason = "RECOVERY_DEFICIT_ATINGIU_CAPITAL_MINIMO_REAL_DO_PAR" if use_single else None
+        save(self.s)
+
         if not use_single:
-            both_ok = op is not None and D(op) <= max_limit_price
-            if not both_ok:
-                if time.time() - float(p.get("last_wait_log", 0)) >= 3:
-                    log.info(
-                        "%s | AGUARDANDO PRECO V37 | modo=PAR | DIR=%s OPP=%s | precisa OPP<=%s | TARGET=%s | DEFICIT=%s < SWITCH_USD=%s",
-                        st["name"], dp, op, max_limit_price, target_net_profit, recovery_deficit, dir_min_notional,
-                    )
-                    p["last_wait_log"] = time.time()
-                    save(self.s)
-                return
-
-            opp_limit = ceil_to_step(D(op), tick)
-            if opp_limit > max_limit_price:
-                return
-
             pair_sz = sizing(st, dir_min_shares, opp_min_shares, dir_limit, opp_limit, recovery_deficit)
             pair_total = pair_sz["directional_max_spend"] + pair_sz["opposite_max_spend"]
 
@@ -3385,8 +3396,8 @@ class Bot:
             save(self.s)
 
             log.info(
-                "%s | SIZING V44 DIRECIONAL-ONLY | MOTIVO=%s | DIR_MIN_BOOK_EFETIVO=%s | MIN_GAMMA_FALLBACK=%s | MIN_CLOB_FALLBACK=%s | FONTE_MIN=%s | SWITCH_DEFICIT_USD=%s | DIR_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=0 | GASTO_MAX=%s | LUCRO_MIN=%s",
-                st["name"], single_reason, p["minimum_order_shares"], p.get("minimum_order_shares_gamma"), p.get("minimum_order_shares_clob"), p.get("minimum_order_source"), dir_min_notional,
+                "%s | SIZING V44 DIRECIONAL-ONLY | MOTIVO=%s | DIR_MIN_BOOK_EFETIVO=%s | MIN_GAMMA_FALLBACK=%s | MIN_CLOB_FALLBACK=%s | FONTE_MIN=%s | SWITCH_DEFICIT_DINAMICO=%s | CAPITAL_MIN_PAR=%s | DIR_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=0 | GASTO_MAX=%s | LUCRO_MIN=%s",
+                st["name"], single_reason, p["minimum_order_shares"], p.get("minimum_order_shares_gamma"), p.get("minimum_order_shares_clob"), p.get("minimum_order_source"), single_switch_threshold, min_pair_capital,
                 dir_limit, sz["base_profit"], sz["recovery_deficit"], sz["target_net_profit"],
                 sz["directional_shares"], total_spend, sz["guaranteed_net_at_limit"],
             )
@@ -3435,6 +3446,8 @@ class Bot:
                 "directional_snapshot_price": str(dp),
                 "directional_limit_price": str(dir_limit),
                 "directional_min_notional": str(dir_min_notional),
+                "single_leg_switch_threshold": str(single_switch_threshold),
+                "minimum_pair_capital_at_switch": str(min_pair_capital),
                 "target_net_profit": str(sz["target_net_profit"]),
                 "directional_shares": str(sz["directional_shares"]),
                 "max_spend": str(total_spend),
@@ -4476,13 +4489,13 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction, recovery_preview)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=50 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=51 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC+ETH+HYPE V50 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
+            "POLYMARKET BTC+ETH+HYPE V51 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
             "ATIVOS=BTC+ETH+HYPE | 18_ROBOS | BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
-            "SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
+            "SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
             "DAY=SEG-SEX_10-16_BRT | NEWS=US_HIGH_3ESTRELAS_RESILIENTE | NEWS_5M15M=+-15M | NEWS_1H=+-60M | "
             "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO+FASTPATH_REDEEM_UNICO | CHAINLINK_RESULT=BTC_ETH_HYPE_TWAP_5M15M<=4MIN+BINANCE_HOURLY<=4MIN | MARTINGALE=DEFICIT_ACUMULADO+BASE | SIZING=USD1_POR_PONTA+AUTO_DIRECIONAL_ONLY | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
             LIVE,
