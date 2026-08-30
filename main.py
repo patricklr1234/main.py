@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# V37 - MINIMO CLOB DINAMICO + RD/STOP LOSS EXPLICITO + PAR ATE DEFICIT >= USD1 + MACD LIVE
+# V53 - RESGATE DIRETO DOS DOIS OUTCOMES + RECUPERACAO DE PERNA UNICA
 # - inicia os 6 robos em bankroll 12, loss_streak 0 e recovery_deficit 0
 # - zera estatisticas logicas antigas (wins/losses/trades/realized_pnl/last_trigger)
 # - reset e aplicado uma unica vez e somente sem pending ativo
@@ -28,7 +28,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC+ETH+HYPE V51 FINAL - CHAINLINK WS FAST-SETTLEMENT + CAIXA LIVRE + CAPITAL COMPROMETIDO + TOKEN-BOOK USD1 + RD/STOP LOSS
+# POLYMARKET BTC+ETH+HYPE V53 FINAL - FOK RESCUE + DIRECT REDEEM + PATRIMONIO OPERACIONAL
 # - resultado operacional das rodadas BTC pelo feed Chainlink live da Polymarket em segundos apos o boundary
 # - Gamma/CLOB e saldo de auto-redeem permanecem como redundancia/fallback
 #
@@ -198,6 +198,11 @@ ENTRY_SECONDS = 30  # FIXO: trava o sinal 30s antes da proxima rodada
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "0.5"))
 MAX_BUY_PRICE = Decimal(os.getenv("MAX_BUY_PRICE", "0.55"))
 MIN_LEG_USD = Decimal(os.getenv("MIN_LEG_USD", "1.00"))  # minimo nominal por ponta
+SINGLE_LEG_RESCUE_ENABLED = os.getenv("SINGLE_LEG_RESCUE_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+SINGLE_LEG_RESCUE_MAX_PRICE = Decimal(os.getenv("SINGLE_LEG_RESCUE_MAX_PRICE", "0.65"))
+SINGLE_LEG_RESCUE_AFTER_SECONDS = float(os.getenv("SINGLE_LEG_RESCUE_AFTER_SECONDS", "2"))
+SINGLE_LEG_MAX_COMBINED_PRICE = Decimal(os.getenv("SINGLE_LEG_MAX_COMBINED_PRICE", "1.03"))
+DIRECT_REDEEM_ENABLED = os.getenv("DIRECT_REDEEM_ENABLED", "1").lower() in ("1", "true", "yes", "on")
 
 # V42 - previa probabilistica da rodada anterior no T-30 da proxima.
 # O forecast NUNCA altera o RD contabil oficial; ele apenas cria um RD projetado
@@ -324,6 +329,51 @@ def logical_cash_snapshot(st):
     }
 
 
+def aggregate_operational_snapshot(state, wallet_balance_units=None):
+    """
+    V52: separa caixa USDC livre de capital convertido em tokens.
+
+    `wallet_cost_basis` nao e mark-to-market: soma o saldo collateral disponivel
+    ao custo efetivamente pago pelas posicoes ainda abertas. Assim, uma compra
+    deixa de parecer perda imediata apenas porque USDC virou token binario.
+    O lucro definitivo continua sendo reconhecido somente na resolucao/resgate.
+    """
+    strategies = list((state or {}).get("strategies", {}).values())
+    actual_committed = D("0")
+    for st in strategies:
+        actual_committed += sum(
+            (position_committed_cash(x) for x in (st.get("open_positions") or []) if isinstance(x, dict)),
+            D("0"),
+        )
+        if isinstance(st.get("pending"), dict):
+            actual_committed += position_committed_cash(st["pending"])
+
+    logical_equity = sum((D(st.get("bankroll", "0") or "0") for st in strategies), D("0"))
+    realized_pnl = sum((D(st.get("realized_pnl", "0") or "0") for st in strategies), D("0"))
+    wins = sum(int(st.get("wins", 0) or 0) for st in strategies)
+    losses = sum(int(st.get("losses", 0) or 0) for st in strategies)
+
+    wallet_cash = None
+    wallet_cost_basis = None
+    if wallet_balance_units not in (None, "", "?"):
+        try:
+            wallet_cash = D(wallet_balance_units) / D("1000000")
+            wallet_cost_basis = wallet_cash + actual_committed
+        except Exception:
+            wallet_cash = None
+            wallet_cost_basis = None
+
+    return {
+        "wallet_cash_usd": wallet_cash,
+        "actual_committed_usd": actual_committed,
+        "wallet_cost_basis_usd": wallet_cost_basis,
+        "logical_equity": logical_equity,
+        "realized_pnl": realized_pnl,
+        "wins": wins,
+        "losses": losses,
+    }
+
+
 def get(url, params=None):
     if params:
         url += "?" + urlencode(params)
@@ -357,7 +407,7 @@ def strategy_name(asset, tf, session):
 
 def fresh():
     s = {
-        "version": 51,
+        "version": 53,
         "strategies": {},
         "maintenance": {
             "applied_resets": [],
@@ -546,7 +596,7 @@ def load():
             st["recovery_deficit"] = str(max(D("0"), deficit))
             st["martingale_base_edge"] = None
 
-        new["version"] = 51
+        new["version"] = 53
         save(new)
         return new
     except Exception:
@@ -635,7 +685,7 @@ def apply_one_time_all_robots_reset(s):
         "reset_scope": "TOTAL_LOGICAL_STRATEGY_STATE",
         "before": before,
     }
-    s["version"] = 51
+    s["version"] = 53
     save(s)
 
     audit({
@@ -1780,6 +1830,7 @@ class Bot:
 
         self.last_withdrawal_sync = 0.0
         self.last_redemption_sync = 0.0
+        self.last_redeem_discovery = 0.0
         self.last_balance_sync = 0.0
         self.last_balance_resolution_sync = 0.0
         self.last_balance_snapshot = None
@@ -1884,13 +1935,13 @@ class Bot:
             log.warning("AUTO-REDEEM OPERATOR | falha ao confirmar aprovacoes; trading continua | erro=%r", exc)
 
     def enqueue_redemption(self, pending, winning_shares):
-        """Persist a resolved winning condition for gasless redemption.
+        """Persiste a condicao resolvida para resgatar os DOIS outcomes.
 
         Logical PnL accounting is independent from the on-chain redemption.  The
         queue prevents a temporary relayer/market-finalization error from losing
         the redemption request when the strategy moves on to its next round.
         """
-        if not LIVE or D(winning_shares) <= 0:
+        if not LIVE:
             return
 
         rec = self.s.setdefault("redemption_reconciliation", {
@@ -1923,6 +1974,7 @@ class Bot:
             "condition_id": condition_id,
             "slug": slug,
             "winning_shares": str(winning_shares),
+            "redeem_both_outcomes": True,
             "attempts": 0,
             "next_try_epoch": 0,
             "queued_at": datetime.now(UTC).isoformat(),
@@ -2037,12 +2089,57 @@ class Bot:
             "ts": datetime.now(UTC).isoformat(),
         })
 
+    def discover_redeemable_conditions(self, rec, processed, queue, force=False):
+        """Descobre inclusive tokens antigos/perdedores que nao entraram na fila."""
+        now_mono = time.monotonic()
+        if not force and now_mono - self.last_redeem_discovery < 60.0:
+            return False
+        self.last_redeem_discovery = now_mono
+        try:
+            positions = list(self.c.list_positions(user=WALLET, page_size=100).iter_items())
+        except Exception as exc:
+            log.warning("RESGATE V53 | descoberta de posicoes falhou | erro=%r", exc)
+            return False
+
+        queued_ids = {str(x.get("condition_id") or "").lower() for x in queue if isinstance(x, dict)}
+        discovered = {}
+        for pos in positions:
+            if not bool(self._obj_field(pos, "redeemable", default=False)):
+                continue
+            try:
+                size = D(self._obj_field(pos, "size", default="0") or "0")
+            except Exception:
+                size = D("0")
+            if size <= 0:
+                continue
+            cid = str(self._obj_field(pos, "condition_id", "conditionId", default="") or "").strip()
+            if cid:
+                discovered[cid] = discovered.get(cid, D("0")) + size
+
+        changed = False
+        for cid, total_size in discovered.items():
+            if cid.lower() in queued_ids:
+                continue
+            processed.discard(cid)
+            queue.append({
+                "condition_id": cid,
+                "slug": "",
+                "winning_shares": "0",
+                "redeem_both_outcomes": True,
+                "discovered_from_wallet": True,
+                "discovered_size": str(total_size),
+                "attempts": 0,
+                "next_try_epoch": 0,
+                "queued_at": datetime.now(UTC).isoformat(),
+            })
+            changed = True
+            log.warning("RESGATE V53 | TOKEN RESOLVIDO DESCOBERTO NA CARTEIRA | condition_id=%s | size=%s", cid, total_size)
+        return changed
+
     def process_redemptions(self, force=False):
         """
-        V29/V22: nao envia redeem_positions() manualmente para Deposit Wallet.
-        O operator oficial faz o auto-redeem; esta fila apenas reconcilia a
-        posicao ate ela desaparecer. Isso evita o POST /submit que ja se mostrou
-        sujeito a revert no relayer.
+        V53: descobre posicoes resolvidas e usa redeem_positions oficial para
+        queimar os dois outcomes e receber o payout vencedor.
         """
         if not LIVE or not self.c:
             return
@@ -2057,6 +2154,10 @@ class Bot:
         })
         processed = {str(x) for x in rec.get("processed_condition_ids", [])}
         queue = rec.setdefault("queue", [])
+        discovered = self.discover_redeemable_conditions(rec, processed, queue, force=force)
+        if discovered:
+            rec["processed_condition_ids"] = list(processed)[-5000:]
+            save(self.s)
         if not queue:
             return
 
@@ -2137,7 +2238,49 @@ class Bot:
                 log.info("RESGATE | AINDA NAO RESGATAVEL | condition_id=%s | size=%s | retry=60s", condition_id, inspection.get("total_size"))
                 continue
 
-            # REDEEMABLE: deixa o operator oficial liquidar; zero POST /submit.
+            # V53 REDEEMABLE: o SDK oficial resgata os dois outcomes em uma
+            # unica transacao. O vencedor vira pUSD e o perdedor e queimado a
+            # zero, removendo os tokens encerrados da carteira.
+            if DIRECT_REDEEM_ENABLED:
+                if item.get("direct_redeem_submitted_at"):
+                    item["next_try_epoch"] = now_epoch + 30
+                    kept.append(item)
+                    changed = True
+                    log.info(
+                        "RESGATE DIRETO V53 | transacao ja enviada; aguardando posicao desaparecer | condition_id=%s",
+                        condition_id,
+                    )
+                    continue
+                try:
+                    fn = getattr(self.c, "redeem_positions", None)
+                    if not callable(fn):
+                        raise RuntimeError("SDK sem metodo redeem_positions")
+                    handle = fn(condition_id=condition_id)
+                    outcome = handle.wait() if hasattr(handle, "wait") else handle
+                    item["direct_redeem_submitted_at"] = datetime.now(UTC).isoformat()
+                    item["direct_redeem_outcome"] = str(outcome)
+                    item["next_try_epoch"] = now_epoch + 20
+                    item["absent_confirmations"] = 0
+                    kept.append(item)
+                    changed = True
+                    log.warning(
+                        "RESGATE DIRETO V53 ENVIADO | condition_id=%s | ambos outcomes: vencedor->pUSD, perdedor->0 | confirmacao em 20s",
+                        condition_id,
+                    )
+                    continue
+                except Exception as exc:
+                    item["attempts"] = int(item.get("attempts") or 0) + 1
+                    item["last_error"] = repr(exc)
+                    item["next_try_epoch"] = now_epoch + min(600, 30 * (2 ** min(item["attempts"], 4)))
+                    kept.append(item)
+                    changed = True
+                    log.warning(
+                        "RESGATE DIRETO V53 FALHOU | condition_id=%s | tentativa=%s | retry_at=%s | erro=%r",
+                        condition_id, item["attempts"], item["next_try_epoch"], exc,
+                    )
+                    continue
+
+            # Fallback opcional: deixa o operator oficial liquidar.
             queued_at = item.get("queued_at")
             age = 0
             try:
@@ -2786,6 +2929,94 @@ class Bot:
             except Exception:
                 pass
             raise
+
+    def place_market_fok_buy(self, token, usd_amount, max_price):
+        """Compra imediata FOK: executa o notional inteiro ou executa zero."""
+        usd_amount = floor_6(max(D("0"), D(usd_amount)))
+        max_price = D(max_price)
+        if usd_amount <= 0 or max_price <= 0 or max_price >= 1:
+            return None
+        if not LIVE:
+            return {
+                "simulation": True,
+                "ok": True,
+                "order_id": f"SIM-FOK-{str(token)[-8:]}-{time.time_ns()}",
+            }
+        try:
+            return self.c.place_market_order(
+                token_id=str(token), side="BUY", amount=str(usd_amount),
+                max_price=str(max_price), max_spend=str(usd_amount), order_type="FOK",
+            )
+        except TypeError:
+            # Compatibilidade com builds do SDK anteriores ao argumento max_spend.
+            return self.c.place_market_order(
+                token_id=str(token), side="BUY", amount=str(usd_amount),
+                max_price=str(max_price), order_type="FOK",
+            )
+
+    def rescue_missing_leg_fok(self, st, p, filled_leg, missing_leg, now):
+        """Tenta completar uma perna faltante sem deixar nova ordem resting."""
+        if not SINGLE_LEG_RESCUE_ENABLED or p.get("single_leg_rescue_done"):
+            return False
+
+        first = p.get("single_leg_detected_at")
+        if not first:
+            p["single_leg_detected_at"] = now.isoformat()
+            return False
+        try:
+            first_dt = datetime.fromisoformat(str(first))
+        except Exception:
+            first_dt = now
+        if (now - first_dt).total_seconds() < SINGLE_LEG_RESCUE_AFTER_SECONDS:
+            return False
+
+        filled_shares = D(p.get(f"{filled_leg}_shares_filled", "0") or "0")
+        filled_spent = D(p.get(f"{filled_leg}_spent", "0") or "0")
+        missing_requested = D(p.get(f"{missing_leg}_shares_requested", "0") or "0")
+        missing_filled = D(p.get(f"{missing_leg}_shares_filled", "0") or "0")
+        remaining = max(D("0"), missing_requested - missing_filled)
+        if filled_shares <= 0 or remaining <= 0:
+            return False
+
+        filled_avg = filled_spent / filled_shares if filled_spent > 0 else D(
+            p.get(f"{filled_leg}_limit_price") or p.get("limit_price") or MAX_BUY_PRICE
+        )
+        economic_cap = max(D("0.01"), SINGLE_LEG_MAX_COMBINED_PRICE - filled_avg)
+        rescue_cap = floor_to_step(
+            min(SINGLE_LEG_RESCUE_MAX_PRICE, economic_cap),
+            D(p.get("tick_size") or "0.01"),
+        )
+        original_cap = D(p.get(f"{missing_leg}_limit_price") or p.get("limit_price") or MAX_BUY_PRICE)
+        if rescue_cap <= original_cap:
+            p["single_leg_rescue_done"] = True
+            p["single_leg_rescue_result"] = "SEM_ESPACO_ECONOMICO_PARA_SUBIR_PRECO"
+            save(self.s)
+            return False
+
+        self.cancel_leg(p, missing_leg)
+        usd_amount = floor_6(remaining * rescue_cap)
+        try:
+            resp = self.place_market_fok_buy(p[f"{missing_leg}_token"], usd_amount, rescue_cap)
+            oid = resp.get("order_id") if isinstance(resp, dict) else order_id_of(resp)
+            if oid:
+                p[f"{missing_leg}_order_id"] = str(oid)
+                p.setdefault(f"{missing_leg}_order_ids", []).append(str(oid))
+            p["single_leg_rescue_done"] = True
+            p["single_leg_rescue_cap"] = str(rescue_cap)
+            p["single_leg_rescue_amount"] = str(usd_amount)
+            p["single_leg_rescue_result"] = "FOK_ENVIADA" if oid else rejected_reason(resp)
+            save(self.s)
+            log.warning(
+                "%s | RESGATE DA SEGUNDA PERNA FOK | perna=%s | cap=%s | amount=%s | order=%s | combinado_max=%s",
+                st["name"], missing_leg, rescue_cap, usd_amount, oid, SINGLE_LEG_MAX_COMBINED_PRICE,
+            )
+            return bool(oid)
+        except Exception as exc:
+            p["single_leg_rescue_done"] = True
+            p["single_leg_rescue_result"] = repr(exc)
+            save(self.s)
+            log.exception("%s | FALHA RESGATE DA SEGUNDA PERNA FOK", st["name"])
+            return False
 
     def cancel_ids(self, ids):
         ids = [str(x) for x in ids if x]
@@ -3783,25 +4014,39 @@ class Bot:
                 missing_leg = "opposite" if dsh > 0 else "directional"
 
                 # Cancela qualquer quantidade restante do lado que ja executou,
-                # para nao aumentar a exposicao daquele lado.
-                self.cancel_ids([p.get(f"{filled_leg}_order_id")])
+                # para nao aumentar a exposicao daquele lado. V52 faz isso uma
+                # unica vez; repetir DELETE em todo poll gerava centenas de chamadas
+                # sem melhorar o fill da perna faltante.
+                cancel_flag = f"{filled_leg}_remainder_cancelled"
+                if not p.get(cancel_flag):
+                    self.cancel_ids([p.get(f"{filled_leg}_order_id")])
+                    p[cancel_flag] = True
+                    p[f"{filled_leg}_remainder_cancelled_at"] = now.isoformat()
 
                 # Se a ordem do lado faltante nao existe por erro, recria.
                 if not p.get(f"{missing_leg}_order_id"):
                     self.retry_missing_order(p)
 
+                # V53: depois de uma curta janela no limite original, cancela a
+                # ordem resting e tenta a quantidade faltante como FOK em um
+                # limite adaptativo. FOK impede uma segunda execução parcial.
+                self.rescue_missing_leg_fok(st, p, filled_leg, missing_leg, now)
+
                 p["phase"] = "single_leg_recovery"
                 p["recovery_leg"] = missing_leg
                 save(self.s)
 
-                log.warning(
-                    "%s | APENAS UM LADO EXECUTOU | %s preenchido; "
-                    "%s fica GTC @ %s ATE O FINAL DA RODADA",
-                    st["name"],
-                    filled_leg,
-                    missing_leg,
-                    p.get(f"{missing_leg}_limit_price") or p["limit_price"],
-                )
+                if not p.get("single_leg_warning_logged"):
+                    p["single_leg_warning_logged"] = True
+                    save(self.s)
+                    log.warning(
+                        "%s | APENAS UM LADO EXECUTOU | %s preenchido; "
+                        "%s fica GTC @ %s ATE O FINAL DA RODADA",
+                        st["name"],
+                        filled_leg,
+                        missing_leg,
+                        p.get(f"{missing_leg}_limit_price") or p["limit_price"],
+                    )
                 return
 
             save(self.s)
@@ -4489,10 +4734,10 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction, recovery_preview)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=51 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=52 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC+ETH+HYPE V51 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
+            "POLYMARKET BTC+ETH+HYPE V53 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE=RD_FINANCEIRO_EXATO | SEGUNDA_PERNA=FOK_ADAPTATIVO | RESGATE=DIRETO_AMBOS_OUTCOMES | RESOLUCAO=CHAINLINK+SALDO+GAMMA+CLOB | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
             "ATIVOS=BTC+ETH+HYPE | 18_ROBOS | BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
@@ -4552,10 +4797,18 @@ class Bot:
                 summary = " | ".join(summary_parts)
                 recon = self.s.get("capital_reconciliation", {})
                 bal = self.last_balance_snapshot or {}
+                portfolio = aggregate_operational_snapshot(self.s, bal.get("balance"))
                 log.info(
-                    "HEARTBEAT | LIVE=%s | wallet_balance=%s | withdrawn_applied=%s | %s",
+                    "HEARTBEAT V53 | LIVE=%s | wallet_cash_usd=%s | capital_em_tokens_custo=%s | "
+                    "capital_operacional_custo=%s | pnl_realizado_logico=%s | wins=%s | losses=%s | "
+                    "withdrawn_applied=%s | %s",
                     LIVE,
-                    bal.get("balance", "?"),
+                    portfolio.get("wallet_cash_usd"),
+                    portfolio.get("actual_committed_usd"),
+                    portfolio.get("wallet_cost_basis_usd"),
+                    portfolio.get("realized_pnl"),
+                    portfolio.get("wins"),
+                    portfolio.get("losses"),
                     recon.get("total_withdrawn_applied", "0"),
                     summary,
                 )
