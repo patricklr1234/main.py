@@ -27,7 +27,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V41 FINAL - ENTRADAS SOBREPOSTAS + MINIMO CLOB DINAMICO + RD/STOP LOSS + MACD AO VIVO + RESET V34 PRESERVADO
+# POLYMARKET BTC V42 FINAL - ENTRADAS SOBREPOSTAS + MINIMO CLOB DINAMICO + RD/STOP LOSS + MACD AO VIVO + RESET V34 PRESERVADO
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -169,7 +169,7 @@ POLL_SECONDS = float(os.getenv("POLL_SECONDS", "0.5"))
 MAX_BUY_PRICE = Decimal(os.getenv("MAX_BUY_PRICE", "0.55"))
 MIN_LEG_USD = Decimal(os.getenv("MIN_LEG_USD", "1.00"))  # minimo nominal por ponta
 
-# V41 - previa probabilistica da rodada anterior no T-30 da proxima.
+# V42 - previa probabilistica da rodada anterior no T-30 da proxima.
 # O forecast NUNCA altera o RD contabil oficial; ele apenas cria um RD projetado
 # para o sizing da nova entrada. A resolucao oficial continua sendo soberana.
 PROB_PREVIEW_ENABLED = os.getenv("PROB_PREVIEW_ENABLED", "1").lower() in ("1", "true", "yes", "on")
@@ -1094,7 +1094,7 @@ def base_edge(st):
 
 def recovery_target(st, deficit_override=None):
     """
-    Meta liquida V41.
+    Meta liquida V42.
 
     Sem override, usa o recovery_deficit OFICIAL persistido.
     Com deficit_override, usa apenas para o sizing provisório da entrada atual;
@@ -1123,7 +1123,7 @@ def projected_position_pnl(pos, predicted_winner):
 
 def binance_round_resolution_probability(tf, round_start, round_end):
     """
-    V41: estima P(UP) da rodada usando distancia do BTC ao preco de abertura
+    V42: estima P(UP) da rodada usando distancia do BTC ao preco de abertura
     e volatilidade realizada de retornos de 1 minuto. Modelo sem drift:
       log(P_final/P_atual) ~ N(0, sigma_1m^2 * segundos_restantes/60).
 
@@ -3294,6 +3294,11 @@ class Bot:
         st["last_stop_loss"] = str(stop_loss)
         st["last_result"] = financial_result
 
+        # V42: se B/C usou uma previa probabilistica desta posicao e o winner
+        # oficial contradisse a previsao, congela novas entradas ate a cadeia
+        # aberta terminar. O RD acima ja foi atualizado com o resultado oficial.
+        self.detect_preview_mismatch_and_freeze(st, p, w)
+
         audit({
             "type": "resolution",
             "strategy": st["name"],
@@ -3335,7 +3340,7 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | RESOLUCAO V41 CASCATA | WINNER=%s | SINAL=%s | RESULTADO_FINANCEIRO=%s | PNL=%s | STOP_LOSS=%s | BANKROLL=%s | loss_streak=%s | RD_ANTES=%s | RD_DEPOIS=%s | PROX_TARGET=%s | RECOVERY_ACTIVE=%s",
+            "%s | RESOLUCAO V42 CASCATA | WINNER=%s | SINAL=%s | RESULTADO_FINANCEIRO=%s | PNL=%s | STOP_LOSS=%s | BANKROLL=%s | loss_streak=%s | RD_ANTES=%s | RD_DEPOIS=%s | PROX_TARGET=%s | RECOVERY_ACTIVE=%s",
             st["name"],
             w,
             direction,
@@ -3367,12 +3372,120 @@ class Bot:
         if not duplicate:
             ops.append(p)
             log.info(
-                "%s | V41 POSICAO EM ANDAMENTO DESACOPLADA | slug=%s | open_positions=%s | proxima rodada pode ser avaliada sem esperar resolucao",
+                "%s | V42 POSICAO EM ANDAMENTO DESACOPLADA | slug=%s | open_positions=%s | proxima rodada pode ser avaliada sem esperar resolucao",
                 st["name"], slug, len(ops),
             )
         st["pending"] = None
         save(self.s)
         return True
+
+    def detect_preview_mismatch_and_freeze(self, st, resolved_pos, official_winner):
+        """
+        V42: se uma entrada posterior B usou uma previa probabilistica de A e
+        o resultado oficial de A contradiz a previsao, congela NOVAS entradas
+        desse robo ate todas as posicoes/pending atuais terminarem e o RD ficar
+        totalmente consolidado.
+
+        A resolucao oficial continua soberana. O congelamento nao cancela nem
+        altera B ja executada; apenas impede que C/D... nascam sobre um estado
+        financeiro ainda provisoriamente influenciado pela previsao errada.
+        """
+        slug_a = str(resolved_pos.get("slug") or "")
+        if not slug_a:
+            return False
+
+        related = []
+        candidates = []
+        pending = st.get("pending")
+        if isinstance(pending, dict):
+            candidates.append(pending)
+        candidates.extend(x for x in (st.get("open_positions") or []) if isinstance(x, dict))
+
+        for pos in candidates:
+            if pos is resolved_pos:
+                continue
+            preview = pos.get("probability_preview") or {}
+            if not isinstance(preview, dict) or not pos.get("probability_preview_applied"):
+                continue
+            if str(preview.get("slug_a") or "") != slug_a:
+                continue
+            predicted = str(preview.get("predicted_winner") or "").upper()
+            if predicted not in ("UP", "DOWN"):
+                continue
+            if predicted == str(official_winner or "").upper():
+                continue
+            related.append({
+                "slug": str(pos.get("slug") or ""),
+                "round_start": str(pos.get("round_start") or ""),
+                "predicted_winner_a": predicted,
+            })
+
+        if not related:
+            return False
+
+        freeze = st.get("probability_preview_mismatch_freeze")
+        if not isinstance(freeze, dict):
+            freeze = {}
+        freeze.update({
+            "active": True,
+            "trigger_slug_a": slug_a,
+            "predicted_winner_a": related[0]["predicted_winner_a"],
+            "official_winner_a": str(official_winner or "").upper(),
+            "dependent_positions": related,
+            "activated_at": datetime.now(UTC).isoformat(),
+            "reason": "PREVISAO_A_DIVERGIU_DO_RESULTADO_OFICIAL",
+        })
+        st["probability_preview_mismatch_freeze"] = freeze
+        save(self.s)
+        log.warning(
+            "%s | CONGELAMENTO V42 ATIVADO | previa de A errou | A=%s | previsto=%s | oficial=%s | dependentes=%s | NOVAS_ENTRADAS=BLOQUEADAS ate pending/open_positions zerarem e RD consolidar",
+            st["name"], slug_a, freeze["predicted_winner_a"], freeze["official_winner_a"],
+            [x.get("slug") for x in related],
+        )
+        audit({
+            "type": "probability_preview_mismatch_freeze_v42",
+            "strategy": st["name"],
+            "slug_a": slug_a,
+            "predicted_winner_a": freeze["predicted_winner_a"],
+            "official_winner_a": freeze["official_winner_a"],
+            "dependent_positions": related,
+            "recovery_deficit_at_freeze": str(st.get("recovery_deficit", "0")),
+            "ts": datetime.now(UTC).isoformat(),
+        })
+        return True
+
+    def preview_mismatch_freeze_blocks_new_entry(self, st):
+        """
+        V42: enquanto um erro de previa estiver congelando a cadeia, continua
+        processando/resolvendo as posicoes existentes, mas nao permite nova
+        entrada. Libera automaticamente somente quando pending e open_positions
+        estiverem vazios; nesse ponto o RD oficial ja incorporou toda a cadeia.
+        """
+        freeze = st.get("probability_preview_mismatch_freeze")
+        if not isinstance(freeze, dict) or not freeze.get("active"):
+            return False
+
+        pending = st.get("pending")
+        ops = [x for x in (st.get("open_positions") or []) if isinstance(x, dict)]
+        if isinstance(pending, dict) or ops:
+            return True
+
+        freeze["active"] = False
+        freeze["released_at"] = datetime.now(UTC).isoformat()
+        freeze["recovery_deficit_consolidated"] = str(st.get("recovery_deficit", "0"))
+        st["probability_preview_mismatch_freeze"] = freeze
+        save(self.s)
+        log.warning(
+            "%s | CONGELAMENTO V42 LIBERADO | todas as posicoes da cadeia encerradas | RD_CONSOLIDADO=%s | proxima entrada volta a usar somente estado oficial",
+            st["name"], st.get("recovery_deficit", "0"),
+        )
+        audit({
+            "type": "probability_preview_mismatch_freeze_released_v42",
+            "strategy": st["name"],
+            "recovery_deficit_consolidated": str(st.get("recovery_deficit", "0")),
+            "ts": datetime.now(UTC).isoformat(),
+        })
+        return False
 
     def resolve_open_positions(self, st):
         """
@@ -3405,7 +3518,7 @@ class Bot:
                 w = winner_for_position(pos)
             except Exception:
                 log.exception(
-                    "%s | erro detectando winner V41 | slug=%s",
+                    "%s | erro detectando winner V42 | slug=%s",
                     st["name"], pos.get("slug"),
                 )
                 continue
@@ -3414,7 +3527,7 @@ class Bot:
             if after and after != before:
                 cache_changed = True
                 log.info(
-                    "%s | V41 RESULTADO CACHEADO | slug=%s | winner=%s | fonte=%s | posicao_fifo=%s",
+                    "%s | V42 RESULTADO CACHEADO | slug=%s | winner=%s | fonte=%s | posicao_fifo=%s",
                     st["name"],
                     pos.get("slug"),
                     w,
@@ -3440,7 +3553,7 @@ class Bot:
                     save(self.s)
                 except Exception:
                     log.exception(
-                        "%s | erro resolvendo posicao V41 FIFO | slug=%s",
+                        "%s | erro resolvendo posicao V42 FIFO | slug=%s",
                         st["name"], oldest.get("slug"),
                     )
                     return
@@ -3450,7 +3563,7 @@ class Bot:
                     return
             except Exception:
                 log.exception(
-                    "%s | erro aplicando resolucao V41 FIFO | slug=%s",
+                    "%s | erro aplicando resolucao V42 FIFO | slug=%s",
                     st["name"], oldest.get("slug"),
                 )
                 return
@@ -3459,7 +3572,7 @@ class Bot:
 
     def probability_preview_for_next_entry(self, st, next_start):
         """
-        V41: antes de dimensionar B, estima o desfecho de A se A termina no
+        V42: antes de dimensionar B, estima o desfecho de A se A termina no
         instante em que B comeca. O RD oficial permanece intocado.
 
         Se a confianca ficar abaixo do limiar, usa o RD oficial (conservador).
@@ -3519,7 +3632,7 @@ class Bot:
         try:
             forecast = binance_round_resolution_probability(st["tf"], rstart, rend)
         except Exception as exc:
-            log.warning("%s | PREVIA V41 indisponivel | erro=%r", st["name"], exc)
+            log.warning("%s | PREVIA V42 indisponivel | erro=%r", st["name"], exc)
             result["reason"] = "ERRO_FORECAST"
             return result
         if not forecast:
@@ -3541,7 +3654,7 @@ class Bot:
         if float(forecast["confidence"]) < PROB_PREVIEW_MIN_CONFIDENCE:
             result["reason"] = "CONFIANCA_ABAIXO_LIMIAR"
             log.info(
-                "%s | PREVIA V41 NAO APLICADA | A=%s | P_UP=%.2f%% | P_DOWN=%.2f%% | confianca=%.2f%% < limiar=%.2f%% | RD_OFICIAL=%s",
+                "%s | PREVIA V42 NAO APLICADA | A=%s | P_UP=%.2f%% | P_DOWN=%.2f%% | confianca=%.2f%% < limiar=%.2f%% | RD_OFICIAL=%s",
                 st["name"], pos.get("slug"), forecast["p_up"]*100, forecast["p_down"]*100,
                 forecast["confidence"]*100, PROB_PREVIEW_MIN_CONFIDENCE*100, rd_official,
             )
@@ -3549,11 +3662,13 @@ class Bot:
 
         predicted = forecast["predicted_winner"]
         projected_pnl = projected_position_pnl(pos, predicted)
-        # V41 e assimetrico de proposito:
+        # V42 e assimetrico de proposito:
         # - se A provavelmente RECUPERA dinheiro, B pode reduzir/zerar o RD provisoriamente;
         # - se A provavelmente PERDE, B apenas continua com o RD oficial ja conhecido.
-        #   Nao soma uma perda ainda nao oficial. Se A realmente perder, a resolucao
-        #   oficial acrescenta a perda ao RD e C absorve a diferenca.
+        #   Nao soma uma perda ainda nao oficial. Se a previsao de A estiver errada,
+        #   a resolucao oficial ativa o CONGELAMENTO V42: nenhuma C e aberta enquanto
+        #   B (e qualquer outra posicao ja existente da cadeia) nao terminar. Depois,
+        #   a proxima entrada usa o RD oficial completamente consolidado.
         if projected_pnl > 0:
             projected_rd = max(D("0"), rd_official - projected_pnl)
         else:
@@ -3566,7 +3681,7 @@ class Bot:
             "projected_recovery_deficit": str(projected_rd),
         })
         log.info(
-            "%s | PREVIA V41 A->B APLICADA | A=%s | winner_previsto=%s | P_UP=%.2f%% | P_DOWN=%.2f%% | confianca=%.2f%% | preco_abertura=%.2f | preco_atual=%.2f | faltam=%.1fs | PNL_A_PROJETADO=%s | RD_OFICIAL=%s | RD_PROJETADO_B=%s | TARGET_B=%s",
+            "%s | PREVIA V42 A->B APLICADA | A=%s | winner_previsto=%s | P_UP=%.2f%% | P_DOWN=%.2f%% | confianca=%.2f%% | preco_abertura=%.2f | preco_atual=%.2f | faltam=%.1fs | PNL_A_PROJETADO=%s | RD_OFICIAL=%s | RD_PROJETADO_B=%s | TARGET_B=%s",
             st["name"], pos.get("slug"), predicted, forecast["p_up"]*100, forecast["p_down"]*100,
             forecast["confidence"]*100, forecast["open_price"], forecast["current_price"], forecast["seconds_left"],
             projected_pnl, rd_official, projected_rd, projected_rd + D(base_edge(st)),
@@ -3601,6 +3716,12 @@ class Bot:
             # await_resolution; desacopla imediatamente para nao bloquear a proxima.
             if isinstance(st.get("pending"), dict) and st["pending"].get("phase") == "await_resolution":
                 self.archive_awaiting_resolution(st)
+            return
+
+        # V42: se uma previa usada numa entrada anterior foi desmentida pelo
+        # resultado oficial, nao abre C/D... enquanto ainda houver qualquer
+        # posicao da cadeia em aberto. A resolucao acima continua rodando normalmente.
+        if self.preview_mismatch_freeze_blocks_new_entry(st):
             return
 
         if D(st["bankroll"]) >= TARGET:
@@ -3703,10 +3824,10 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction, recovery_preview)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=41 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE_RESOLUCAO+PREVIA_PROBABILISTICA | RESOLUCAO=MULTIFONTE_GAMMA+CLOB | MIN_ORDER=CLOB_DINAMICO+USD1 | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=42 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=MULTIFONTE_GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=CLOB_DINAMICO+USD1 | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V41 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE_RESOLUCAO+PREVIA_PROBABILISTICA | RESOLUCAO=MULTIFONTE_GAMMA+CLOB | MIN_ORDER=CLOB_DINAMICO+USD1 | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V42 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=MULTIFONTE_GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=CLOB_DINAMICO+USD1 | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
