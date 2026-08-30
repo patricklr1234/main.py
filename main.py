@@ -15,6 +15,8 @@ import subprocess
 import importlib
 import re
 import html as html_lib
+import math
+import statistics
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,7 +27,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V40 FINAL - ENTRADAS SOBREPOSTAS + MINIMO CLOB DINAMICO + RD/STOP LOSS + MACD AO VIVO + RESET V34 PRESERVADO
+# POLYMARKET BTC V41 FINAL - ENTRADAS SOBREPOSTAS + MINIMO CLOB DINAMICO + RD/STOP LOSS + MACD AO VIVO + RESET V34 PRESERVADO
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -166,6 +168,15 @@ ENTRY_SECONDS = 30  # FIXO: trava o sinal 30s antes da proxima rodada
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "0.5"))
 MAX_BUY_PRICE = Decimal(os.getenv("MAX_BUY_PRICE", "0.55"))
 MIN_LEG_USD = Decimal(os.getenv("MIN_LEG_USD", "1.00"))  # minimo nominal por ponta
+
+# V41 - previa probabilistica da rodada anterior no T-30 da proxima.
+# O forecast NUNCA altera o RD contabil oficial; ele apenas cria um RD projetado
+# para o sizing da nova entrada. A resolucao oficial continua sendo soberana.
+PROB_PREVIEW_ENABLED = os.getenv("PROB_PREVIEW_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+PROB_PREVIEW_MIN_CONFIDENCE = float(os.getenv("PROB_PREVIEW_MIN_CONFIDENCE", "0.85"))
+PROB_PREVIEW_MAX_SECONDS_TO_END = float(os.getenv("PROB_PREVIEW_MAX_SECONDS_TO_END", "45"))
+PROB_PREVIEW_VOL_LOOKBACK_MIN = int(os.getenv("PROB_PREVIEW_VOL_LOOKBACK_MIN", "60"))
+PROB_PREVIEW_MIN_SIGMA_1M = float(os.getenv("PROB_PREVIEW_MIN_SIGMA_1M", "0.00005"))
 
 # V31 - calendario economico resiliente.
 NEWS_FILTER_ENABLED = os.getenv("NEWS_FILTER_ENABLED", "1").lower() in ("1", "true", "yes", "on")
@@ -1081,23 +1092,92 @@ def base_edge(st):
     return BASE_EDGE_BY_TF.get(st.get("tf"), EDGE_5M)
 
 
-def recovery_target(st):
+def recovery_target(st, deficit_override=None):
     """
-    Meta liquida V29.
+    Meta liquida V41.
 
-    Sem deficit: lucro-base do timeframe.
-    Com deficit: TODO o prejuizo ainda nao recuperado + lucro-base.
-
-    Exemplo 5m:
-      deficit=0.27 -> target=0.27+0.25=0.52
-      nova perda=0.60 -> deficit=0.87 -> target=1.12
+    Sem override, usa o recovery_deficit OFICIAL persistido.
+    Com deficit_override, usa apenas para o sizing provisório da entrada atual;
+    isso NAO modifica o RD real e NAO antecipa contabilizacao de resultado.
     """
     base = D(base_edge(st))
-    deficit = max(D("0"), D(st.get("recovery_deficit", "0") or "0"))
+    if deficit_override is None:
+        deficit = max(D("0"), D(st.get("recovery_deficit", "0") or "0"))
+    else:
+        deficit = max(D("0"), D(deficit_override or "0"))
     return base, deficit, deficit + base
 
 
-def sizing(st, min_shares, directional_limit_price, opposite_limit_price):
+def projected_position_pnl(pos, predicted_winner):
+    """PNL que a posicao teria se o winner previsto fosse o winner oficial."""
+    direction = str(pos.get("direction") or "").upper()
+    opposite = "DOWN" if direction == "UP" else "UP"
+    w = str(predicted_winner or "").upper()
+    dsh = D(pos.get("directional_shares_filled", "0") or "0")
+    osh = D(pos.get("opposite_shares_filled", "0") or "0")
+    dsp = D(pos.get("directional_spent", "0") or "0")
+    osp = D(pos.get("opposite_spent", "0") or "0")
+    winning = dsh if w == direction else osh if w == opposite else D("0")
+    return winning - dsp - osp
+
+
+def binance_round_resolution_probability(tf, round_start, round_end):
+    """
+    V41: estima P(UP) da rodada usando distancia do BTC ao preco de abertura
+    e volatilidade realizada de retornos de 1 minuto. Modelo sem drift:
+      log(P_final/P_atual) ~ N(0, sigma_1m^2 * segundos_restantes/60).
+
+    E uma estimativa probabilistica, nao uma resolucao oficial.
+    """
+    now = datetime.now(UTC)
+    seconds_left = max(0.0, (round_end - now).total_seconds())
+    if seconds_left <= 0 or seconds_left > PROB_PREVIEW_MAX_SECONDS_TO_END:
+        return None
+
+    start_ms = int(round_start.timestamp() * 1000)
+    row = get(BINANCE + "/api/v3/klines", {
+        "symbol": "BTCUSDT", "interval": tf, "startTime": start_ms, "limit": 1
+    })
+    if not row:
+        return None
+    open_price = float(row[0][1])
+
+    ticker = get(BINANCE + "/api/v3/ticker/price", {"symbol": "BTCUSDT"})
+    current_price = float(ticker["price"])
+    if open_price <= 0 or current_price <= 0:
+        return None
+
+    rows = get(BINANCE + "/api/v3/klines", {
+        "symbol": "BTCUSDT", "interval": "1m",
+        "limit": max(20, min(1000, PROB_PREVIEW_VOL_LOOKBACK_MIN + 2)),
+    })
+    now_ms = int(time.time() * 1000)
+    closed = [r for r in rows if int(r[6]) < now_ms]
+    closes = [float(r[4]) for r in closed[-(PROB_PREVIEW_VOL_LOOKBACK_MIN + 1):]]
+    if len(closes) < 15:
+        return None
+    rets = [math.log(b / a) for a, b in zip(closes[:-1], closes[1:]) if a > 0 and b > 0]
+    if len(rets) < 10:
+        return None
+    sigma_1m = max(float(statistics.pstdev(rets)), PROB_PREVIEW_MIN_SIGMA_1M)
+    sigma_h = sigma_1m * math.sqrt(max(seconds_left, 0.001) / 60.0)
+    z = math.log(current_price / open_price) / sigma_h
+    p_up = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+    p_up = min(0.9999, max(0.0001, p_up))
+    return {
+        "p_up": p_up,
+        "p_down": 1.0 - p_up,
+        "predicted_winner": "UP" if p_up >= 0.5 else "DOWN",
+        "confidence": max(p_up, 1.0 - p_up),
+        "open_price": open_price,
+        "current_price": current_price,
+        "seconds_left": seconds_left,
+        "sigma_1m": sigma_1m,
+        "model": "BINANCE_DISTANCE+REALIZED_VOL_NORMAL",
+    }
+
+
+def sizing(st, min_shares, directional_limit_price, opposite_limit_price, recovery_deficit_override=None):
     """
     V37: PAR respeitando DOIS pisos em cada ponta:
       1) valor nominal minimo configurado (MIN_LEG_USD, normalmente US$1);
@@ -1119,7 +1199,7 @@ def sizing(st, min_shares, directional_limit_price, opposite_limit_price):
     if pd <= 0 or pd >= 1 or po <= 0 or po >= 1:
         raise ValueError("precos invalidos para sizing V37")
 
-    base, deficit, target = recovery_target(st)
+    base, deficit, target = recovery_target(st, recovery_deficit_override)
 
     opposite_nominal_min = ceil_6(MIN_LEG_USD / po)
     opposite_shares = max(opposite_nominal_min, market_min)
@@ -1162,7 +1242,7 @@ def sizing(st, min_shares, directional_limit_price, opposite_limit_price):
     }
 
 
-def sizing_directional_only(st, min_shares, directional_limit_price):
+def sizing_directional_only(st, min_shares, directional_limit_price, recovery_deficit_override=None):
     """
     V37: DIRECIONAL-ONLY respeitando simultaneamente:
       - target financeiro;
@@ -1174,7 +1254,7 @@ def sizing_directional_only(st, min_shares, directional_limit_price):
     if pd <= 0 or pd >= 1:
         raise ValueError("preco invalido para sizing directional-only V37")
 
-    base, deficit, target = recovery_target(st)
+    base, deficit, target = recovery_target(st, recovery_deficit_override)
     shares_for_profit = ceil_6(target / (D("1") - pd))
     shares_for_min_usd = ceil_6(MIN_LEG_USD / pd)
     directional_shares = max(shares_for_profit, shares_for_min_usd, market_min)
@@ -2408,7 +2488,7 @@ class Bot:
 
     # ------------------------- PRE-START WINDOW -------------------------
 
-    def prepare_entry_window(self, st, round_start, direction):
+    def prepare_entry_window(self, st, round_start, direction, recovery_preview=None):
         """
         Em T-30 o sinal fica TRAVADO.
         Nenhuma ordem e enviada ainda.
@@ -2455,7 +2535,10 @@ class Bot:
         # V29: o modo de execucao e decidido com o preco real da perna direcional.
         # Se a meta atingir o valor minimo negociavel dessa perna, passa a uma
         # unica ponta direcional. Abaixo disso, conserva o par minimo.
-        base_profit, recovery_deficit, target_net_profit = recovery_target(st)
+        recovery_preview = recovery_preview or {}
+        rd_official = max(D("0"), D(st.get("recovery_deficit", "0") or "0"))
+        rd_for_entry = D(recovery_preview.get("projected_recovery_deficit", rd_official))
+        base_profit, recovery_deficit, target_net_profit = recovery_target(st, rd_for_entry)
         st["martingale_base_edge"] = None
 
         directional_token = m["up"] if direction == "UP" else m["down"]
@@ -2493,6 +2576,10 @@ class Bot:
             "edge_at_limit": str(target_net_profit),
             "base_profit_target": str(base_profit),
             "recovery_deficit_before": str(recovery_deficit),
+            "recovery_deficit_official_at_signal": str(rd_official),
+            "recovery_deficit_for_entry": str(recovery_deficit),
+            "probability_preview_applied": bool(recovery_preview.get("applied")),
+            "probability_preview": recovery_preview,
             "recovery_active_at_entry": bool(recovery_deficit > 0),
             "open_positions_at_entry": len(st.get("open_positions") or []),
             "target_net_profit": str(target_net_profit),
@@ -2607,7 +2694,8 @@ class Bot:
         if dir_limit > max_limit_price:
             return
 
-        base_profit, recovery_deficit, target_net_profit = recovery_target(st)
+        rd_for_entry = D(p.get("recovery_deficit_for_entry", st.get("recovery_deficit", "0")) or "0")
+        base_profit, recovery_deficit, target_net_profit = recovery_target(st, rd_for_entry)
         dir_min_notional = MIN_LEG_USD
         p["directional_min_notional"] = str(dir_min_notional)
 
@@ -2637,7 +2725,7 @@ class Bot:
             if opp_limit > max_limit_price:
                 return
 
-            pair_sz = sizing(st, min_shares, dir_limit, opp_limit)
+            pair_sz = sizing(st, min_shares, dir_limit, opp_limit, recovery_deficit)
             pair_total = pair_sz["directional_max_spend"] + pair_sz["opposite_max_spend"]
 
             # V35: SEM fallback para uma ponta por falta de caixa.
@@ -2646,7 +2734,7 @@ class Bot:
             # mais abaixo em vez de transformar a entrada em direcional-only.
 
         if use_single:
-            sz = sizing_directional_only(st, min_shares, dir_limit)
+            sz = sizing_directional_only(st, min_shares, dir_limit, recovery_deficit)
             total_spend = sz["directional_max_spend"]
             if sz.get("blocked"):
                 log.warning(
@@ -3247,7 +3335,7 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | RESOLUCAO V40 CASCATA | WINNER=%s | SINAL=%s | RESULTADO_FINANCEIRO=%s | PNL=%s | STOP_LOSS=%s | BANKROLL=%s | loss_streak=%s | RD_ANTES=%s | RD_DEPOIS=%s | PROX_TARGET=%s | RECOVERY_ACTIVE=%s",
+            "%s | RESOLUCAO V41 CASCATA | WINNER=%s | SINAL=%s | RESULTADO_FINANCEIRO=%s | PNL=%s | STOP_LOSS=%s | BANKROLL=%s | loss_streak=%s | RD_ANTES=%s | RD_DEPOIS=%s | PROX_TARGET=%s | RECOVERY_ACTIVE=%s",
             st["name"],
             w,
             direction,
@@ -3279,7 +3367,7 @@ class Bot:
         if not duplicate:
             ops.append(p)
             log.info(
-                "%s | V40 POSICAO EM ANDAMENTO DESACOPLADA | slug=%s | open_positions=%s | proxima rodada pode ser avaliada sem esperar resolucao",
+                "%s | V41 POSICAO EM ANDAMENTO DESACOPLADA | slug=%s | open_positions=%s | proxima rodada pode ser avaliada sem esperar resolucao",
                 st["name"], slug, len(ops),
             )
         st["pending"] = None
@@ -3317,7 +3405,7 @@ class Bot:
                 w = winner_for_position(pos)
             except Exception:
                 log.exception(
-                    "%s | erro detectando winner V40 | slug=%s",
+                    "%s | erro detectando winner V41 | slug=%s",
                     st["name"], pos.get("slug"),
                 )
                 continue
@@ -3326,7 +3414,7 @@ class Bot:
             if after and after != before:
                 cache_changed = True
                 log.info(
-                    "%s | V40 RESULTADO CACHEADO | slug=%s | winner=%s | fonte=%s | posicao_fifo=%s",
+                    "%s | V41 RESULTADO CACHEADO | slug=%s | winner=%s | fonte=%s | posicao_fifo=%s",
                     st["name"],
                     pos.get("slug"),
                     w,
@@ -3352,7 +3440,7 @@ class Bot:
                     save(self.s)
                 except Exception:
                     log.exception(
-                        "%s | erro resolvendo posicao V40 FIFO | slug=%s",
+                        "%s | erro resolvendo posicao V41 FIFO | slug=%s",
                         st["name"], oldest.get("slug"),
                     )
                     return
@@ -3362,12 +3450,132 @@ class Bot:
                     return
             except Exception:
                 log.exception(
-                    "%s | erro aplicando resolucao V40 FIFO | slug=%s",
+                    "%s | erro aplicando resolucao V41 FIFO | slug=%s",
                     st["name"], oldest.get("slug"),
                 )
                 return
 
     # ------------------------- LOOP -------------------------
+
+    def probability_preview_for_next_entry(self, st, next_start):
+        """
+        V41: antes de dimensionar B, estima o desfecho de A se A termina no
+        instante em que B comeca. O RD oficial permanece intocado.
+
+        Se a confianca ficar abaixo do limiar, usa o RD oficial (conservador).
+        Se houver uma posicao FIFO mais antiga ainda sem resultado, tambem nao
+        antecipa A, pois isso quebraria a ordem cronologica do martingale.
+        """
+        rd_official = max(D("0"), D(st.get("recovery_deficit", "0") or "0"))
+        result = {
+            "applied": False,
+            "official_recovery_deficit": str(rd_official),
+            "projected_recovery_deficit": str(rd_official),
+            "reason": "NAO_APLICADO",
+        }
+        if not PROB_PREVIEW_ENABLED or rd_official <= 0:
+            result["reason"] = "DESABILITADO_OU_SEM_RD"
+            return result
+
+        ops = [x for x in (st.get("open_positions") or []) if isinstance(x, dict)]
+        if not ops:
+            result["reason"] = "SEM_POSICAO_ANTERIOR_ABERTA"
+            return result
+
+        def dtv(v):
+            try:
+                d = datetime.fromisoformat(str(v))
+                return d if d.tzinfo else d.replace(tzinfo=UTC)
+            except Exception:
+                return None
+
+        target_end = next_start.astimezone(UTC)
+        candidates = []
+        for pos in ops:
+            if str(pos.get("resolved_winner") or "").upper() in ("UP", "DOWN"):
+                continue
+            rend = dtv(pos.get("round_end"))
+            rstart = dtv(pos.get("round_start"))
+            if not rend or not rstart:
+                continue
+            if abs((rend - target_end).total_seconds()) <= 2.0:
+                candidates.append((rend, rstart, pos))
+        if not candidates:
+            result["reason"] = "SEM_RODADA_A_TERMINANDO_COM_B"
+            return result
+        candidates.sort(key=lambda x: (x[0], x[1], str(x[2].get("slug") or "")))
+        rend, rstart, pos = candidates[0]
+
+        # Se existe algo cronologicamente anterior ainda sem winner, nao adivinha
+        # uma etapa posterior do FIFO.
+        for other in ops:
+            if other is pos or str(other.get("resolved_winner") or "").upper() in ("UP", "DOWN"):
+                continue
+            oend = dtv(other.get("round_end"))
+            if oend and oend < rend - timedelta(seconds=2):
+                result["reason"] = "FIFO_ANTERIOR_AINDA_PENDENTE"
+                return result
+
+        try:
+            forecast = binance_round_resolution_probability(st["tf"], rstart, rend)
+        except Exception as exc:
+            log.warning("%s | PREVIA V41 indisponivel | erro=%r", st["name"], exc)
+            result["reason"] = "ERRO_FORECAST"
+            return result
+        if not forecast:
+            result["reason"] = "FORECAST_INDISPONIVEL"
+            return result
+
+        result.update({
+            "slug_a": str(pos.get("slug") or ""),
+            "p_up": round(float(forecast["p_up"]), 6),
+            "p_down": round(float(forecast["p_down"]), 6),
+            "confidence": round(float(forecast["confidence"]), 6),
+            "predicted_winner": forecast["predicted_winner"],
+            "open_price": forecast["open_price"],
+            "current_price": forecast["current_price"],
+            "seconds_left": round(float(forecast["seconds_left"]), 3),
+            "sigma_1m": forecast["sigma_1m"],
+            "model": forecast["model"],
+        })
+        if float(forecast["confidence"]) < PROB_PREVIEW_MIN_CONFIDENCE:
+            result["reason"] = "CONFIANCA_ABAIXO_LIMIAR"
+            log.info(
+                "%s | PREVIA V41 NAO APLICADA | A=%s | P_UP=%.2f%% | P_DOWN=%.2f%% | confianca=%.2f%% < limiar=%.2f%% | RD_OFICIAL=%s",
+                st["name"], pos.get("slug"), forecast["p_up"]*100, forecast["p_down"]*100,
+                forecast["confidence"]*100, PROB_PREVIEW_MIN_CONFIDENCE*100, rd_official,
+            )
+            return result
+
+        predicted = forecast["predicted_winner"]
+        projected_pnl = projected_position_pnl(pos, predicted)
+        # V41 e assimetrico de proposito:
+        # - se A provavelmente RECUPERA dinheiro, B pode reduzir/zerar o RD provisoriamente;
+        # - se A provavelmente PERDE, B apenas continua com o RD oficial ja conhecido.
+        #   Nao soma uma perda ainda nao oficial. Se A realmente perder, a resolucao
+        #   oficial acrescenta a perda ao RD e C absorve a diferenca.
+        if projected_pnl > 0:
+            projected_rd = max(D("0"), rd_official - projected_pnl)
+        else:
+            projected_rd = rd_official
+
+        result.update({
+            "applied": True,
+            "reason": "CONFIANCA_APROVADA",
+            "projected_pnl_a": str(projected_pnl),
+            "projected_recovery_deficit": str(projected_rd),
+        })
+        log.info(
+            "%s | PREVIA V41 A->B APLICADA | A=%s | winner_previsto=%s | P_UP=%.2f%% | P_DOWN=%.2f%% | confianca=%.2f%% | preco_abertura=%.2f | preco_atual=%.2f | faltam=%.1fs | PNL_A_PROJETADO=%s | RD_OFICIAL=%s | RD_PROJETADO_B=%s | TARGET_B=%s",
+            st["name"], pos.get("slug"), predicted, forecast["p_up"]*100, forecast["p_down"]*100,
+            forecast["confidence"]*100, forecast["open_price"], forecast["current_price"], forecast["seconds_left"],
+            projected_pnl, rd_official, projected_rd, projected_rd + D(base_edge(st)),
+        )
+        audit({
+            "type": "probability_preview_v41", "strategy": st["name"], "slug_a": pos.get("slug"),
+            "next_round": next_start.astimezone(UTC).isoformat(), **result, "ts": datetime.now(UTC).isoformat(),
+        })
+        return result
 
     def tick(self, st, now):
         # V40: uma rodada ja iniciada nao bloqueia a captura T-30 da rodada seguinte.
@@ -3491,13 +3699,14 @@ class Bot:
             recovery_active,
             len(st.get("open_positions") or []),
         )
-        self.prepare_entry_window(st, next_start, direction)
+        recovery_preview = self.probability_preview_for_next_entry(st, next_start)
+        self.prepare_entry_window(st, next_start, direction, recovery_preview)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=40 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE_RESOLUCAO | RESOLUCAO=MULTIFONTE_GAMMA+CLOB | MIN_ORDER=CLOB_DINAMICO+USD1 | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=41 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE_RESOLUCAO+PREVIA_PROBABILISTICA | RESOLUCAO=MULTIFONTE_GAMMA+CLOB | MIN_ORDER=CLOB_DINAMICO+USD1 | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V40 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE_RESOLUCAO | RESOLUCAO=MULTIFONTE_GAMMA+CLOB | MIN_ORDER=CLOB_DINAMICO+USD1 | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V41 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE_RESOLUCAO+PREVIA_PROBABILISTICA | RESOLUCAO=MULTIFONTE_GAMMA+CLOB | MIN_ORDER=CLOB_DINAMICO+USD1 | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
