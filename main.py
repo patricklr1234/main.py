@@ -27,7 +27,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V42 FINAL - ENTRADAS SOBREPOSTAS + MINIMO CLOB DINAMICO + RD/STOP LOSS + MACD AO VIVO + RESET V34 PRESERVADO
+# POLYMARKET BTC V44 FINAL - ENTRADAS SOBREPOSTAS + MINIMO TOKEN-BOOK + USD1 NOTIONAL + RD/STOP LOSS + MACD AO VIVO + RESET V34 PRESERVADO
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -163,6 +163,13 @@ MAX_ENTRY = Decimal(os.getenv("MAX_ENTRY", "1000.00"))
 TARGET = Decimal(os.getenv("TARGET_BANKROLL", "200000.00"))
 WITHDRAWAL_SYNC_SECONDS = float(os.getenv("WITHDRAWAL_SYNC_SECONDS", "20"))
 BALANCE_SYNC_SECONDS = float(os.getenv("BALANCE_SYNC_SECONDS", "30"))
+# V43 - fast-path de resultado por credito real de auto-redeem no collateral.
+# O saldo NUNCA e usado por diferenca generica para adivinhar vencedor: somente
+# um credito positivo que bata, dentro da tolerancia, com uma combinacao UNICA
+# de payouts de posicoes ja encerradas e ainda sem winner pode antecipar Gamma/CLOB.
+BALANCE_RESULT_FASTPATH_ENABLED = os.getenv("BALANCE_RESULT_FASTPATH_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+BALANCE_RESULT_SYNC_SECONDS = float(os.getenv("BALANCE_RESULT_SYNC_SECONDS", "5"))
+BALANCE_RESULT_TOLERANCE_USD = Decimal(os.getenv("BALANCE_RESULT_TOLERANCE_USD", "0.0005"))
 
 ENTRY_SECONDS = 30  # FIXO: trava o sinal 30s antes da proxima rodada
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "0.5"))
@@ -246,7 +253,7 @@ def get(url, params=None):
     if params:
         url += "?" + urlencode(params)
     with urlopen(
-        Request(url, headers={"User-Agent": "btc-polymarket-v28"}),
+        Request(url, headers={"User-Agent": "btc-polymarket-v44"}),
         timeout=12,
     ) as r:
         return json.loads(r.read())
@@ -265,7 +272,7 @@ def js(x):
 
 def fresh():
     s = {
-        "version": 39,
+        "version": 43,
         "strategies": {},
         "maintenance": {
             "applied_resets": [],
@@ -283,6 +290,12 @@ def fresh():
             "processed_condition_ids": [],
             "queue": [],
             "last_redeem": None,
+        },
+        "balance_resolution_reconciliation": {
+            "last_balance": None,
+            "last_seen_epoch": 0,
+            "last_delta": "0",
+            "last_match": None,
         },
     }
     for tf in TFS:
@@ -384,6 +397,13 @@ def load():
             for field in ("processed_condition_ids", "queue", "last_redeem"):
                 if field in redemption:
                     dst_redemption[field] = redemption[field]
+
+        balance_resolution = old.get("balance_resolution_reconciliation")
+        if isinstance(balance_resolution, dict):
+            dst_balance_resolution = new["balance_resolution_reconciliation"]
+            for field in ("last_balance", "last_seen_epoch", "last_delta", "last_match"):
+                if field in balance_resolution:
+                    dst_balance_resolution[field] = balance_resolution[field]
 
         maintenance = old.get("maintenance")
         if isinstance(maintenance, dict):
@@ -772,15 +792,12 @@ def market(ev):
 
 def clob_constraints(condition_id, gamma_min_shares=Decimal("0"), gamma_tick=Decimal("0.01")):
     """
-    V37: consulta o CLOB oficial imediatamente antes do sizing/envio.
+    V44 fallback de constraints no nivel do mercado.
 
-    O endpoint /clob-markets/{condition_id} devolve:
-      mos = minimum order size EM SHARES
-      mts = minimum tick size
-
-    Usa o maior minimo entre CLOB e Gamma. Se a consulta CLOB falhar,
-    conserva o valor Gamma. Isso evita enviar uma ordem abaixo do minimo
-    reportado pelo proprio CLOB, como `Size (1.96) lower than the minimum: 5`.
+    O endpoint /clob-markets/{condition_id} continua util como fallback, mas
+    NAO e mais a fonte primaria do minimo executavel. Em producao observamos
+    `mos=5` nesse endpoint enquanto o orderbook do token e a interface aceitam
+    ordens menores. A fonte primaria V44 passa a ser GET /book por token.
     """
     gamma_min_shares = max(D("0"), D(gamma_min_shares or 0))
     gamma_tick = D(gamma_tick or "0.01")
@@ -790,14 +807,12 @@ def clob_constraints(condition_id, gamma_min_shares=Decimal("0"), gamma_tick=Dec
     result = {
         "minimum_order_shares": gamma_min_shares,
         "tick_size": gamma_tick,
-        "source": "GAMMA",
+        "source": "GAMMA_FALLBACK",
         "clob_min_shares": D("0"),
         "gamma_min_shares": gamma_min_shares,
     }
-
     if not condition_id:
         return result
-
     try:
         info = get(CLOB + "/clob-markets/" + str(condition_id))
         clob_min = D(info.get("mos") or 0)
@@ -807,14 +822,54 @@ def clob_constraints(condition_id, gamma_min_shares=Decimal("0"), gamma_tick=Dec
         result["clob_min_shares"] = clob_min
         result["minimum_order_shares"] = max(gamma_min_shares, clob_min)
         result["tick_size"] = clob_tick
-        result["source"] = "CLOB+GAMMA"
+        result["source"] = "CLOB_MARKET_FALLBACK+GAMMA"
     except Exception as exc:
         log.warning(
-            "CLOB CONSTRAINTS V37 | falha condition_id=%s | usando Gamma min_shares=%s tick=%s | err=%r",
+            "CLOB CONSTRAINTS V44 FALLBACK | falha condition_id=%s | Gamma min=%s tick=%s | err=%r",
             condition_id, gamma_min_shares, gamma_tick, exc,
         )
-
     return result
+
+
+def token_book_constraints(token_id, fallback_min_shares=Decimal("0"), fallback_tick=Decimal("0.01")):
+    """
+    V44: fonte primaria do minimo executavel por token.
+
+    GET /book retorna `min_order_size` e `tick_size` do proprio orderbook.
+    Esse valor e o que interessa para a ordem que sera realmente enviada.
+    Mantemos o piso nominal configurado de US$1 separadamente no sizing.
+
+    Se /book falhar, usa o fallback conservador fornecido pelo mercado.
+    """
+    fallback_min = max(D("0"), D(fallback_min_shares or 0))
+    fallback_tick = D(fallback_tick or "0.01")
+    if fallback_tick <= 0:
+        fallback_tick = D("0.01")
+    out = {
+        "minimum_order_shares": fallback_min,
+        "tick_size": fallback_tick,
+        "source": "MARKET_FALLBACK",
+        "book_min_shares": D("0"),
+    }
+    if not token_id:
+        return out
+    try:
+        book = get(CLOB + "/book", {"token_id": str(token_id)})
+        book_min = D(book.get("min_order_size") or 0)
+        book_tick = D(book.get("tick_size") or fallback_tick)
+        if book_tick <= 0:
+            book_tick = fallback_tick
+        if book_min > 0:
+            out["minimum_order_shares"] = book_min
+            out["source"] = "TOKEN_BOOK"
+        out["book_min_shares"] = book_min
+        out["tick_size"] = book_tick
+    except Exception as exc:
+        log.warning(
+            "TOKEN BOOK CONSTRAINTS V44 | falha token=%s | fallback_min=%s tick=%s | err=%r",
+            token_id, fallback_min, fallback_tick, exc,
+        )
+    return out
 
 
 def winner(sl):
@@ -1177,82 +1232,61 @@ def binance_round_resolution_probability(tf, round_start, round_end):
     }
 
 
-def sizing(st, min_shares, directional_limit_price, opposite_limit_price, recovery_deficit_override=None):
+def sizing(st, directional_min_shares, opposite_min_shares, directional_limit_price, opposite_limit_price, recovery_deficit_override=None):
     """
-    V37: PAR respeitando DOIS pisos em cada ponta:
-      1) valor nominal minimo configurado (MIN_LEG_USD, normalmente US$1);
-      2) minimum order size do mercado/CLOB EM SHARES.
+    V44 PAR: piso nominal de US$1 por ponta + minimo do ORDERBOOK do token.
 
-    A perna oposta usa:
-      qo = max(ceil(MIN_LEG_USD / po), minimum_order_shares)
-
-    A perna direcional usa o maior entre:
-      - shares necessarias para garantir target liquido;
-      - shares para o minimo nominal de US$1;
-      - minimum_order_shares do CLOB.
-
-    Assim nenhuma das duas pernas e enviada abaixo do `mos` oficial.
+    O minimo de shares agora e individual para cada token; nao usamos mais o
+    `mos` condition-level como piso primario quando /book esta disponivel.
     """
     pd = D(directional_limit_price)
     po = D(opposite_limit_price)
-    market_min = max(D("0"), D(min_shares or 0))
+    dir_market_min = max(D("0"), D(directional_min_shares or 0))
+    opp_market_min = max(D("0"), D(opposite_min_shares or 0))
     if pd <= 0 or pd >= 1 or po <= 0 or po >= 1:
-        raise ValueError("precos invalidos para sizing V37")
+        raise ValueError("precos invalidos para sizing V44")
 
     base, deficit, target = recovery_target(st, recovery_deficit_override)
-
     opposite_nominal_min = ceil_6(MIN_LEG_USD / po)
-    opposite_shares = max(opposite_nominal_min, market_min)
+    opposite_shares = max(opposite_nominal_min, opp_market_min)
     opposite_max_spend = opposite_shares * po
 
     shares_for_target = ceil_6((target + opposite_max_spend) / (D("1") - pd))
     directional_nominal_min = ceil_6(MIN_LEG_USD / pd)
-    directional_shares = max(shares_for_target, directional_nominal_min, market_min)
+    directional_shares = max(shares_for_target, directional_nominal_min, dir_market_min)
 
     directional_max_spend = directional_shares * pd
     guaranteed_net_at_limit = directional_shares - directional_max_spend - opposite_max_spend
 
     blocked = None
-    if market_min <= 0:
-        blocked = "MIN_ORDER_SHARES_UNAVAILABLE"
+    if dir_market_min <= 0 or opp_market_min <= 0:
+        blocked = "TOKEN_BOOK_MIN_UNAVAILABLE"
     elif opposite_max_spend > MAX_ENTRY or directional_max_spend > MAX_ENTRY:
         blocked = "MAX_ENTRY"
     elif guaranteed_net_at_limit < target:
         blocked = "TARGET_NOT_GUARANTEED"
 
     return {
-        "blocked": bool(blocked),
-        "reason": blocked,
-        "base_profit": base,
-        "recovery_deficit": deficit,
-        "target_net_profit": target,
-        "opposite_shares": opposite_shares,
-        "directional_shares": directional_shares,
-        "opposite_max_spend": opposite_max_spend,
-        "directional_max_spend": directional_max_spend,
-        "guaranteed_net_at_limit": guaranteed_net_at_limit,
-        "edge": target,
-        "martingale_base_edge": base,
-        "directional_limit_price": pd,
-        "opposite_limit_price": po,
-        "minimum_leg_usd": MIN_LEG_USD,
-        "reported_market_min_shares": market_min,
+        "blocked": bool(blocked), "reason": blocked, "base_profit": base,
+        "recovery_deficit": deficit, "target_net_profit": target,
+        "opposite_shares": opposite_shares, "directional_shares": directional_shares,
+        "opposite_max_spend": opposite_max_spend, "directional_max_spend": directional_max_spend,
+        "guaranteed_net_at_limit": guaranteed_net_at_limit, "edge": target,
+        "martingale_base_edge": base, "directional_limit_price": pd,
+        "opposite_limit_price": po, "minimum_leg_usd": MIN_LEG_USD,
+        "directional_market_min_shares": dir_market_min,
+        "opposite_market_min_shares": opp_market_min,
         "opposite_nominal_min_shares": opposite_nominal_min,
         "directional_nominal_min_shares": directional_nominal_min,
     }
 
 
-def sizing_directional_only(st, min_shares, directional_limit_price, recovery_deficit_override=None):
-    """
-    V37: DIRECIONAL-ONLY respeitando simultaneamente:
-      - target financeiro;
-      - minimo nominal de US$1;
-      - minimum order size oficial do mercado/CLOB em shares.
-    """
+def sizing_directional_only(st, directional_min_shares, directional_limit_price, recovery_deficit_override=None):
+    """V44 DIRECIONAL-ONLY: US$1 nominal + minimo do /book do token."""
     pd = D(directional_limit_price)
-    market_min = max(D("0"), D(min_shares or 0))
+    market_min = max(D("0"), D(directional_min_shares or 0))
     if pd <= 0 or pd >= 1:
-        raise ValueError("preco invalido para sizing directional-only V37")
+        raise ValueError("preco invalido para sizing directional-only V44")
 
     base, deficit, target = recovery_target(st, recovery_deficit_override)
     shares_for_profit = ceil_6(target / (D("1") - pd))
@@ -1263,30 +1297,21 @@ def sizing_directional_only(st, min_shares, directional_limit_price, recovery_de
 
     blocked = None
     if market_min <= 0:
-        blocked = "MIN_ORDER_SHARES_UNAVAILABLE"
+        blocked = "TOKEN_BOOK_MIN_UNAVAILABLE"
     elif directional_max_spend > MAX_ENTRY:
         blocked = "MAX_ENTRY"
     elif guaranteed_net_at_limit < target:
         blocked = "TARGET_NOT_GUARANTEED"
 
     return {
-        "blocked": bool(blocked),
-        "reason": blocked,
-        "base_profit": base,
-        "recovery_deficit": deficit,
-        "target_net_profit": target,
-        "opposite_shares": D("0"),
-        "directional_shares": directional_shares,
-        "opposite_max_spend": D("0"),
-        "directional_max_spend": directional_max_spend,
-        "guaranteed_net_at_limit": guaranteed_net_at_limit,
-        "edge": target,
-        "martingale_base_edge": base,
-        "directional_limit_price": pd,
-        "opposite_limit_price": None,
-        "minimum_leg_usd": MIN_LEG_USD,
-        "reported_market_min_shares": market_min,
-        "shares_for_min_usd": shares_for_min_usd,
+        "blocked": bool(blocked), "reason": blocked, "base_profit": base,
+        "recovery_deficit": deficit, "target_net_profit": target,
+        "opposite_shares": D("0"), "directional_shares": directional_shares,
+        "opposite_max_spend": D("0"), "directional_max_spend": directional_max_spend,
+        "guaranteed_net_at_limit": guaranteed_net_at_limit, "edge": target,
+        "martingale_base_edge": base, "directional_limit_price": pd,
+        "opposite_limit_price": None, "minimum_leg_usd": MIN_LEG_USD,
+        "directional_market_min_shares": market_min, "shares_for_min_usd": shares_for_min_usd,
     }
 
 
@@ -1399,6 +1424,7 @@ class Bot:
         self.last_withdrawal_sync = 0.0
         self.last_redemption_sync = 0.0
         self.last_balance_sync = 0.0
+        self.last_balance_resolution_sync = 0.0
         self.last_balance_snapshot = None
         self.initialize_withdrawal_tracker()
 
@@ -1785,13 +1811,207 @@ class Bot:
                 return getattr(obj, name)
         return default
 
+    @staticmethod
+    def _position_round_ended(pos, now_utc=None):
+        if not isinstance(pos, dict):
+            return False
+        raw = str(pos.get("round_end") or "").strip()
+        if not raw:
+            return False
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            now_utc = now_utc or datetime.now(UTC)
+            return now_utc >= dt.astimezone(UTC)
+        except Exception:
+            return False
+
+    def _ended_unresolved_positions_exist(self, st=None):
+        now_utc = datetime.now(UTC)
+        strategies = [st] if isinstance(st, dict) else list(self.s.get("strategies", {}).values())
+        for cur in strategies:
+            candidates = []
+            pending = cur.get("pending") if isinstance(cur, dict) else None
+            if isinstance(pending, dict) and pending.get("phase") == "await_resolution":
+                candidates.append(pending)
+            candidates.extend(x for x in (cur.get("open_positions") or []) if isinstance(x, dict))
+            for pos in candidates:
+                if str(pos.get("resolved_winner") or "").upper() in ("UP", "DOWN"):
+                    continue
+                if self._position_round_ended(pos, now_utc):
+                    return True
+        return False
+
+    @staticmethod
+    def _payout_options_for_position(pos):
+        """Retorna [(winner, payout_usd)] para lados realmente preenchidos."""
+        direction = str((pos or {}).get("direction") or "").upper()
+        if direction not in ("UP", "DOWN"):
+            return []
+        opposite = "DOWN" if direction == "UP" else "UP"
+        out = []
+        try:
+            dsh = max(D("0"), D((pos or {}).get("directional_shares_filled", "0") or "0"))
+        except Exception:
+            dsh = D("0")
+        try:
+            osh = max(D("0"), D((pos or {}).get("opposite_shares_filled", "0") or "0"))
+        except Exception:
+            osh = D("0")
+        if dsh > 0:
+            out.append((direction, dsh))
+        if osh > 0:
+            out.append((opposite, osh))
+        return out
+
+    def reconcile_balance_credit_fastpath(self, previous_balance, current_balance):
+        """
+        V43: usa o SALDO apenas como prova de settlement/auto-redeem ja ocorrido.
+
+        Regra de seguranca:
+          * considera somente aumento real de collateral;
+          * somente posicoes cujo round_end ja passou e ainda sem winner;
+          * o delta precisa bater com payout(s) de shares preenchidas;
+          * aceita apenas UMA combinacao logica possivel de posicao+winner.
+
+        Se houver ambiguidade (pares com shares iguais, varios candidatos iguais,
+        deposito, creditos misturados etc.), NAO infere nada e Gamma/CLOB continuam
+        soberanos como fallback.
+        """
+        if not BALANCE_RESULT_FASTPATH_ENABLED:
+            return False
+        try:
+            prev = D(previous_balance)
+            cur = D(current_balance)
+        except Exception:
+            return False
+        delta_units = cur - prev
+        if delta_units <= 0:
+            return False
+
+        unit = D("1000000")
+        tolerance_units = max(D("1"), BALANCE_RESULT_TOLERANCE_USD * unit)
+        now_utc = datetime.now(UTC)
+        positions = []
+        for st_name, st in self.s.get("strategies", {}).items():
+            candidates = []
+            pending = st.get("pending")
+            if isinstance(pending, dict) and pending.get("phase") == "await_resolution":
+                candidates.append(pending)
+            candidates.extend(x for x in (st.get("open_positions") or []) if isinstance(x, dict))
+            for pos in candidates:
+                if str(pos.get("resolved_winner") or "").upper() in ("UP", "DOWN"):
+                    continue
+                if not self._position_round_ended(pos, now_utc):
+                    continue
+                opts = self._payout_options_for_position(pos)
+                if not opts:
+                    continue
+                positions.append((st_name, st, pos, [(w, payout * unit) for w, payout in opts]))
+
+        if not positions:
+            return False
+
+        if len(positions) > 10:
+            log.warning(
+                "V43 SALDO FASTPATH IGNORADO | posicoes_encerradas_sem_resultado=%s > 10 | aguardando Gamma/CLOB",
+                len(positions),
+            )
+            return False
+
+        solutions = {}
+
+        def walk(i, running, chosen):
+            if running > delta_units + tolerance_units:
+                return
+            if i >= len(positions):
+                if chosen and abs(running - delta_units) <= tolerance_units:
+                    sig = tuple(sorted((x[0], str(x[2].get("slug") or ""), x[3]) for x in chosen))
+                    solutions[sig] = list(chosen)
+                return
+            st_name, st, pos, opts = positions[i]
+            walk(i + 1, running, chosen)
+            for winner_name, payout_units in opts:
+                walk(i + 1, running + payout_units, chosen + [(st_name, st, pos, winner_name, payout_units)])
+
+        walk(0, D("0"), [])
+
+        if len(solutions) != 1:
+            if solutions:
+                log.info(
+                    "V43 SALDO FASTPATH AMBIGUO | delta_units=%s | combinacoes=%s | nenhuma inferencia; aguardando Gamma/CLOB",
+                    delta_units, len(solutions),
+                )
+            return False
+
+        chosen = next(iter(solutions.values()))
+        affected = set()
+        matched = []
+        for st_name, st, pos, winner_name, payout_units in chosen:
+            if str(pos.get("resolved_winner") or "").upper() in ("UP", "DOWN"):
+                continue
+            pos["resolved_winner"] = winner_name
+            pos["resolved_winner_source"] = "BALANCE_REDEEM_V43"
+            pos["resolved_winner_at"] = now_utc.isoformat()
+            pos["balance_redeem_evidence"] = {
+                "previous_balance": str(prev),
+                "current_balance": str(cur),
+                "delta_units": str(delta_units),
+                "matched_payout_units": str(payout_units),
+                "tolerance_units": str(tolerance_units),
+                "detected_at": now_utc.isoformat(),
+            }
+            affected.add(st_name)
+            matched.append({
+                "strategy": st_name,
+                "slug": str(pos.get("slug") or ""),
+                "winner": winner_name,
+                "payout_usd": str(payout_units / unit),
+            })
+            log.warning(
+                "%s | V43 RESULTADO ANTECIPADO PELO SALDO | slug=%s | winner=%s | payout=%s | delta_saldo=%s | fonte=BALANCE_REDEEM | RD sera atualizado antes da proxima entrada",
+                st_name, pos.get("slug"), winner_name, payout_units / unit, delta_units / unit,
+            )
+
+        if not matched:
+            return False
+
+        tracker = self.s.setdefault("balance_resolution_reconciliation", {})
+        tracker["last_match"] = {
+            "previous_balance": str(prev),
+            "current_balance": str(cur),
+            "delta_units": str(delta_units),
+            "matched": matched,
+            "ts": now_utc.isoformat(),
+        }
+        save(self.s)
+
+        for st_name in sorted(affected):
+            st = self.s.get("strategies", {}).get(st_name)
+            if isinstance(st, dict):
+                self.resolve_open_positions(st)
+        return True
+
+    def sync_balance_for_resolution(self, force=False):
+        """Polling de saldo mais rapido somente enquanto existe round encerrado sem winner."""
+        if not LIVE or not self.c or not BALANCE_RESULT_FASTPATH_ENABLED:
+            return None
+        if not self._ended_unresolved_positions_exist():
+            return self.last_balance_snapshot
+        now_m = time.monotonic()
+        if not force and now_m - self.last_balance_resolution_sync < BALANCE_RESULT_SYNC_SECONDS:
+            return self.last_balance_snapshot
+        self.last_balance_resolution_sync = now_m
+        return self.sync_balance(force=True)
+
     def sync_balance(self, force=False):
         """
         Consulta o saldo/allowance de COLLATERAL da carteira autenticada.
 
-        Isto NAO altera os bankrolls logicos; serve para confirmar que a carteira
-        configurada no Railway e a carteira que possui collateral disponivel para
-        negociacao no CLOB da Polymarket.
+        V43: alem do monitoramento, um aumento de saldo pode antecipar o resultado
+        SOMENTE quando corresponder de forma unica ao payout de auto-redeem de
+        posicao encerrada. Diferencas genericas de saldo nunca viram winner.
         """
         if not LIVE or not self.c:
             return None
@@ -1814,6 +2034,23 @@ class Bot:
                 "signer": str(self.c.signer),
                 "raw_type": type(info).__name__,
             }
+
+            tracker = self.s.setdefault("balance_resolution_reconciliation", {
+                "last_balance": None, "last_seen_epoch": 0, "last_delta": "0", "last_match": None
+            })
+            previous_balance = tracker.get("last_balance")
+            if balance is not None and previous_balance is not None:
+                try:
+                    tracker["last_delta"] = str(D(balance) - D(previous_balance))
+                    self.reconcile_balance_credit_fastpath(previous_balance, balance)
+                except Exception:
+                    log.exception("V43 SALDO FASTPATH ERRO | seguindo com Gamma/CLOB")
+            if balance is not None:
+                changed_balance = str(tracker.get("last_balance")) != str(balance)
+                tracker["last_balance"] = str(balance)
+                tracker["last_seen_epoch"] = int(time.time())
+                if changed_balance:
+                    save(self.s)
 
             log.info(
                 "CARTEIRA OK | wallet=%s | signer=%s | collateral_balance=%s | allowance=%s",
@@ -2048,7 +2285,7 @@ class Bot:
                 })
                 req = Request(
                     f"https://data-api.polymarket.com/activity?{params}",
-                    headers={"User-Agent": "btc-polymarket-v28"},
+                    headers={"User-Agent": "btc-polymarket-v44"},
                 )
                 with urlopen(req, timeout=15) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -2318,8 +2555,10 @@ class Bot:
         shares = floor_6(D(shares))
         price = D(p.get(f"{leg}_limit_price") or p["limit_price"])
         min_shares_usd = ceil_6(MIN_LEG_USD / price)
+        book_min = D(p.get(f"{leg}_min_order_shares") or p.get("minimum_order_shares") or 0)
+        effective_min = max(min_shares_usd, book_min)
 
-        if shares < min_shares_usd:
+        if shares < effective_min:
             return False
 
         resp = self.place_gtc_limit(
@@ -2401,7 +2640,10 @@ class Bot:
         target_lag_total = floor_6(lag_req * lead_fraction)
         needed = floor_6(max(D("0"), target_lag_total - lag_fill))
         lag_price = D(p.get(f"{lag}_limit_price") or p["limit_price"])
-        min_shares = ceil_6(MIN_LEG_USD / lag_price)
+        min_shares = max(
+            ceil_6(MIN_LEG_USD / lag_price),
+            D(p.get(f"{lag}_min_order_shares") or p.get("minimum_order_shares") or 0),
+        )
 
         # Se uma perna ja executou 100%, a outra continua buscando 100%.
         if lead_fraction >= D("0.999999"):
@@ -2667,24 +2909,37 @@ class Bot:
 
         # V37: revalida os limites do mercado no CLOB oficial imediatamente
         # antes do sizing/envio. Nao confia apenas no valor salvo em T-30.
-        constraints = clob_constraints(
+        # V44: /book POR TOKEN e a fonte primaria do minimo realmente executavel.
+        # O antigo `mos` condition-level fica apenas como fallback conservador.
+        fallback = clob_constraints(
             m.get("condition_id") or p.get("condition_id"),
             m.get("min_order_shares", p.get("minimum_order_shares", "0")),
             m.get("tick_size", p.get("tick_size", "0.01")),
         )
-        tick = D(constraints["tick_size"])
-        min_shares = D(constraints["minimum_order_shares"])
-        p["minimum_order_shares"] = str(min_shares)
-        p["minimum_order_shares_gamma"] = str(constraints["gamma_min_shares"])
-        p["minimum_order_shares_clob"] = str(constraints["clob_min_shares"])
-        p["minimum_order_source"] = constraints["source"]
+        dir_c = token_book_constraints(
+            p.get("directional_token"), fallback["minimum_order_shares"], fallback["tick_size"]
+        )
+        opp_c = token_book_constraints(
+            p.get("opposite_token"), fallback["minimum_order_shares"], fallback["tick_size"]
+        )
+        tick = max(D(dir_c["tick_size"]), D(opp_c["tick_size"]))
+        dir_min_shares = D(dir_c["minimum_order_shares"])
+        opp_min_shares = D(opp_c["minimum_order_shares"])
+        p["minimum_order_shares"] = str(dir_min_shares)  # compat legado
+        p["directional_min_order_shares"] = str(dir_min_shares)
+        p["opposite_min_order_shares"] = str(opp_min_shares)
+        p["minimum_order_shares_gamma"] = str(fallback["gamma_min_shares"])
+        p["minimum_order_shares_clob"] = str(fallback["clob_min_shares"])
+        p["directional_book_min_shares"] = str(dir_c["book_min_shares"])
+        p["opposite_book_min_shares"] = str(opp_c["book_min_shares"])
+        p["minimum_order_source"] = f"DIR={dir_c['source']}|OPP={opp_c['source']}"
         p["tick_size"] = str(tick)
         save(self.s)
 
-        if min_shares <= 0:
+        if dir_min_shares <= 0 or opp_min_shares <= 0:
             log.warning(
-                "%s | BLOQUEADO V37 | minimum_order_shares indisponivel | condition_id=%s | fonte=%s",
-                st["name"], m.get("condition_id") or p.get("condition_id"), constraints["source"],
+                "%s | BLOQUEADO V44 | min_order_size /book indisponivel | DIR_MIN=%s OPP_MIN=%s | fonte=%s",
+                st["name"], dir_min_shares, opp_min_shares, p["minimum_order_source"],
             )
             st["pending"] = None
             save(self.s)
@@ -2702,8 +2957,10 @@ class Bot:
         # V35: o switch depende SOMENTE do deficit financeiro acumulado.
         # O lucro-base do timeframe nao antecipa mais a troca para uma ponta.
         # Assim, todo ciclo novo (deficit=0) obrigatoriamente comeca em PAR.
-        use_single = recovery_deficit >= dir_min_notional
-        single_reason = "RECOVERY_DEFICIT_ATINGIU_USD1" if use_single else None
+        # V44: ciclo NOVO (RD=0) e sempre PAR. DIRECIONAL-ONLY so existe
+        # quando ha deficit de recuperacao REAL >= US$1.
+        use_single = recovery_deficit > 0 and recovery_deficit >= dir_min_notional
+        single_reason = "RECOVERY_DEFICIT_REAL_ATINGIU_USD1" if use_single else None
 
         pair_sz = None
         pair_total = None
@@ -2725,7 +2982,7 @@ class Bot:
             if opp_limit > max_limit_price:
                 return
 
-            pair_sz = sizing(st, min_shares, dir_limit, opp_limit, recovery_deficit)
+            pair_sz = sizing(st, dir_min_shares, opp_min_shares, dir_limit, opp_limit, recovery_deficit)
             pair_total = pair_sz["directional_max_spend"] + pair_sz["opposite_max_spend"]
 
             # V35: SEM fallback para uma ponta por falta de caixa.
@@ -2734,7 +2991,7 @@ class Bot:
             # mais abaixo em vez de transformar a entrada em direcional-only.
 
         if use_single:
-            sz = sizing_directional_only(st, min_shares, dir_limit, recovery_deficit)
+            sz = sizing_directional_only(st, dir_min_shares, dir_limit, recovery_deficit)
             total_spend = sz["directional_max_spend"]
             if sz.get("blocked"):
                 log.warning(
@@ -2765,7 +3022,7 @@ class Bot:
             save(self.s)
 
             log.info(
-                "%s | SIZING V37 DIRECIONAL-ONLY | MOTIVO=%s | MIN_SHARES_EFETIVO=%s | MIN_GAMMA=%s | MIN_CLOB=%s | FONTE_MIN=%s | SWITCH_DEFICIT_USD=%s | DIR_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=0 | GASTO_MAX=%s | LUCRO_MIN=%s",
+                "%s | SIZING V44 DIRECIONAL-ONLY | MOTIVO=%s | DIR_MIN_BOOK_EFETIVO=%s | MIN_GAMMA_FALLBACK=%s | MIN_CLOB_FALLBACK=%s | FONTE_MIN=%s | SWITCH_DEFICIT_USD=%s | DIR_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=0 | GASTO_MAX=%s | LUCRO_MIN=%s",
                 st["name"], single_reason, p["minimum_order_shares"], p.get("minimum_order_shares_gamma"), p.get("minimum_order_shares_clob"), p.get("minimum_order_source"), dir_min_notional,
                 dir_limit, sz["base_profit"], sz["recovery_deficit"], sz["target_net_profit"],
                 sz["directional_shares"], total_spend, sz["guaranteed_net_at_limit"],
@@ -2856,8 +3113,8 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | SIZING V37 PAR-MIN-CLOB | MIN_SHARES_EFETIVO=%s | MIN_GAMMA=%s | MIN_CLOB=%s | FONTE_MIN=%s | MIN_USD_PONTA=%s | DIR_PX=%s | OPP_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=%s | GASTO_MAX=%s | LUCRO_MIN=%s",
-            st["name"], p["minimum_order_shares"], p.get("minimum_order_shares_gamma"), p.get("minimum_order_shares_clob"), p.get("minimum_order_source"), dir_min_notional, dir_limit, opp_limit,
+            "%s | SIZING V44 PAR-US$1+TOKEN-BOOK | DIR_MIN=%s | OPP_MIN=%s | FONTE_MIN=%s | MIN_USD_PONTA=%s | DIR_PX=%s | OPP_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=%s | GASTO_MAX=%s | LUCRO_MIN=%s",
+            st["name"], p.get("directional_min_order_shares"), p.get("opposite_min_order_shares"), p.get("minimum_order_source"), dir_min_notional, dir_limit, opp_limit,
             sz["base_profit"], sz["recovery_deficit"], sz["target_net_profit"],
             sz["directional_shares"], sz["opposite_shares"], total_spend,
             sz["guaranteed_net_at_limit"],
@@ -3251,9 +3508,16 @@ class Bot:
         pnl = winning_shares - dir_spent - opp_spent
         bankroll = D(st["bankroll"]) + pnl
 
-        # O resultado logico e contabilizado imediatamente; se houver shares
-        # vencedoras, o resgate real fica persistido numa fila com retry automatico.
-        self.enqueue_redemption(p, winning_shares)
+        # O resultado logico e contabilizado imediatamente. Na V43, quando o
+        # winner veio de BALANCE_REDEEM, o payout real JA entrou no collateral,
+        # portanto nao enfileiramos um resgate redundante.
+        if str(p.get("resolved_winner_source") or "").startswith("BALANCE_REDEEM"):
+            log.info(
+                "RESGATE | JA CONFIRMADO PELO SALDO V43 | condition_id=%s | slug=%s | winning_shares=%s",
+                p.get("condition_id"), p.get("slug"), winning_shares,
+            )
+        else:
+            self.enqueue_redemption(p, winning_shares)
 
         st["bankroll"] = str(bankroll)
         st["realized_pnl"] = str(D(st.get("realized_pnl", "0")) + pnl)
@@ -3340,7 +3604,7 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | RESOLUCAO V42 CASCATA | WINNER=%s | SINAL=%s | RESULTADO_FINANCEIRO=%s | PNL=%s | STOP_LOSS=%s | BANKROLL=%s | loss_streak=%s | RD_ANTES=%s | RD_DEPOIS=%s | PROX_TARGET=%s | RECOVERY_ACTIVE=%s",
+            "%s | RESOLUCAO V43 CASCATA | WINNER=%s | SINAL=%s | RESULTADO_FINANCEIRO=%s | PNL=%s | STOP_LOSS=%s | BANKROLL=%s | loss_streak=%s | RD_ANTES=%s | RD_DEPOIS=%s | PROX_TARGET=%s | RECOVERY_ACTIVE=%s",
             st["name"],
             w,
             direction,
@@ -3518,7 +3782,7 @@ class Bot:
                 w = winner_for_position(pos)
             except Exception:
                 log.exception(
-                    "%s | erro detectando winner V42 | slug=%s",
+                    "%s | erro detectando winner V43 | slug=%s",
                     st["name"], pos.get("slug"),
                 )
                 continue
@@ -3527,7 +3791,7 @@ class Bot:
             if after and after != before:
                 cache_changed = True
                 log.info(
-                    "%s | V42 RESULTADO CACHEADO | slug=%s | winner=%s | fonte=%s | posicao_fifo=%s",
+                    "%s | V43 RESULTADO CACHEADO | slug=%s | winner=%s | fonte=%s | posicao_fifo=%s",
                     st["name"],
                     pos.get("slug"),
                     w,
@@ -3553,7 +3817,7 @@ class Bot:
                     save(self.s)
                 except Exception:
                     log.exception(
-                        "%s | erro resolvendo posicao V42 FIFO | slug=%s",
+                        "%s | erro resolvendo posicao V43 FIFO | slug=%s",
                         st["name"], oldest.get("slug"),
                     )
                     return
@@ -3703,6 +3967,13 @@ class Bot:
         # por uma nova entrada. Se ainda nao houver winner, a posicao permanece na fila.
         self.resolve_open_positions(st)
 
+        # V43: se o round ja encerrou mas Gamma/CLOB ainda nao publicou winner,
+        # consulta o saldo em cadence curta. Um auto-redeem creditado e unicamente
+        # atribuivel atualiza o RD antes de qualquer nova entrada.
+        if self._ended_unresolved_positions_exist(st):
+            self.sync_balance_for_resolution(force=False)
+            self.resolve_open_positions(st)
+
         p = st.get("pending")
         if p:
             phase = p.get("phase")
@@ -3761,6 +4032,13 @@ class Bot:
         key = next_start.astimezone(UTC).isoformat()
         if st["last_trigger"] == key:
             return
+
+        # V43: ultima barreira antes de travar o sinal/sizing. Se uma rodada anterior
+        # ja terminou, forca uma leitura fresca do collateral para nao reutilizar RD
+        # antigo quando o auto-redeem ja tiver sido creditado.
+        if self._ended_unresolved_positions_exist(st):
+            self.sync_balance_for_resolution(force=True)
+            self.resolve_open_positions(st)
 
         st["last_trigger"] = key
         save(self.s)
@@ -3824,15 +4102,15 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction, recovery_preview)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=42 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=MULTIFONTE_GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=CLOB_DINAMICO+USD1 | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=44 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V42 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=MULTIFONTE_GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=CLOB_DINAMICO+USD1 | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
+            "POLYMARKET BTC V44 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
             "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
             "DAY=SEG-SEX_10-16_BRT | NEWS=US_HIGH_3ESTRELAS_RESILIENTE | NEWS_5M15M=+-15M | NEWS_1H=+-60M | "
-            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO | MARTINGALE=DEFICIT_ACUMULADO+BASE | SIZING=USD1_POR_PONTA+AUTO_DIRECIONAL_ONLY | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
+            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO+FASTPATH_REDEEM_UNICO | MARTINGALE=DEFICIT_ACUMULADO+BASE | SIZING=USD1_POR_PONTA+AUTO_DIRECIONAL_ONLY | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
             LIVE,
             gasless_mode,
             INITIAL,
