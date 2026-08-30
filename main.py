@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import time
+import asyncio
 import signal as signal_module
 import logging
 import subprocess
@@ -21,13 +22,15 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait
-from threading import Barrier, Thread
+from threading import Barrier, Thread, Lock
 from zoneinfo import ZoneInfo
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC V44 FINAL - ENTRADAS SOBREPOSTAS + MINIMO TOKEN-BOOK + USD1 NOTIONAL + RD/STOP LOSS + MACD AO VIVO + RESET V34 PRESERVADO
+# POLYMARKET BTC+ETH+HYPE V50 FINAL - CHAINLINK WS FAST-SETTLEMENT + CAIXA LIVRE + CAPITAL COMPROMETIDO + TOKEN-BOOK USD1 + RD/STOP LOSS
+# - resultado operacional das rodadas BTC pelo feed Chainlink live da Polymarket em segundos apos o boundary
+# - Gamma/CLOB e saldo de auto-redeem permanecem como redundancia/fallback
 #
 # 6 robos logicos independentes:
 #   5m / 15m / 1h x 24h / 10:00-16:00 Brasilia
@@ -125,7 +128,22 @@ def ensure_sdk():
 
 ensure_sdk()
 
+def ensure_runtime_deps():
+    try:
+        import websockets  # noqa: F401
+        return
+    except ImportError:
+        print("BOOTSTRAP | instalando websockets==15.0.1 para Chainlink WS", flush=True)
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "--no-cache-dir",
+        "--root-user-action=ignore", "websockets==15.0.1",
+    ])
+    importlib.invalidate_caches()
+
+ensure_runtime_deps()
+
 from polymarket import SecureClient, BuilderApiKey, RelayerApiKey  # noqa: E402
+import websockets  # noqa: E402
 
 
 TZ = ZoneInfo("America/Sao_Paulo")
@@ -135,6 +153,11 @@ UTC = timezone.utc
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 BINANCE = "https://api.binance.com"
+CHAINLINK_WS_URL = os.getenv("CHAINLINK_WS_URL", "wss://ws-live-data.polymarket.com").strip()
+CHAINLINK_RESULT_FASTPATH_ENABLED = os.getenv("CHAINLINK_RESULT_FASTPATH_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+CHAINLINK_RESULT_DELAY_SECONDS = float(os.getenv("CHAINLINK_RESULT_DELAY_SECONDS", "240"))
+CHAINLINK_BOUNDARY_MAX_LAG_SECONDS = float(os.getenv("CHAINLINK_BOUNDARY_MAX_LAG_SECONDS", "5"))
+CHAINLINK_HISTORY_SECONDS = float(os.getenv("CHAINLINK_HISTORY_SECONDS", "10800"))  # 3h: cobre 1h + reinicios curtos
 
 PK = (os.getenv("POLYMARKET_PRIVATE_KEY") or os.getenv("PRIVATE_KEY") or "").strip()
 WALLET = os.getenv("POLYMARKET_DEPOSIT_WALLET", "").strip()
@@ -205,6 +228,8 @@ ROOT.mkdir(parents=True, exist_ok=True)
 STATE = ROOT / "state.json"
 TRADES = ROOT / "trades.jsonl"
 NEWS_CACHE = ROOT / "news_calendar_cache.json"
+CHAINLINK_TICKS = ROOT / "chainlink_btc_usd_ticks.jsonl"
+CHAINLINK_TICK_FILES = {"BTC": ROOT / "chainlink_btc_usd_ticks.jsonl", "ETH": ROOT / "chainlink_eth_usd_ticks.jsonl", "HYPE": ROOT / "chainlink_hype_usd_ticks.jsonl"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -249,11 +274,61 @@ def ceil_6(x):
     return D(x).quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
 
 
+def position_committed_cash(pos):
+    """V45: capital efetivamente pago por uma posicao ja preenchida."""
+    if not isinstance(pos, dict):
+        return D("0")
+    return max(D("0"), D(pos.get("directional_spent", "0") or "0")) + max(
+        D("0"), D(pos.get("opposite_spent", "0") or "0")
+    )
+
+
+def pending_reserved_cash(p):
+    """V45: gasto ja feito + notional ainda reservado em ordens GTC ativas."""
+    if not isinstance(p, dict):
+        return D("0")
+    spent = position_committed_cash(p)
+    phase = str(p.get("phase") or "")
+    if phase not in ("orders_active", "proportional_rebalance", "single_leg_recovery"):
+        return spent
+
+    reserve = D("0")
+    for prefix in ("directional", "opposite"):
+        if not p.get(f"{prefix}_order_id"):
+            continue
+        requested = max(D("0"), D(p.get(f"{prefix}_shares_requested", "0") or "0"))
+        filled = max(D("0"), D(p.get(f"{prefix}_shares_filled", "0") or "0"))
+        remaining = max(D("0"), requested - filled)
+        px = D(p.get(f"{prefix}_limit_price", "0") or "0")
+        if remaining > 0 and px > 0:
+            reserve += remaining * px
+    return spent + reserve
+
+
+def logical_cash_snapshot(st):
+    """V45: equity contabil, capital comprometido e caixa livre do robo."""
+    equity = max(D("0"), D(st.get("bankroll", "0") or "0"))
+    open_committed = sum(
+        (position_committed_cash(x) for x in (st.get("open_positions") or []) if isinstance(x, dict)),
+        D("0"),
+    )
+    pending_committed = pending_reserved_cash(st.get("pending"))
+    committed = max(D("0"), open_committed + pending_committed)
+    free = max(D("0"), equity - committed)
+    return {
+        "equity": equity,
+        "open_committed": open_committed,
+        "pending_committed": pending_committed,
+        "committed": committed,
+        "free": free,
+    }
+
+
 def get(url, params=None):
     if params:
         url += "?" + urlencode(params)
     with urlopen(
-        Request(url, headers={"User-Agent": "btc-polymarket-v44"}),
+        Request(url, headers={"User-Agent": "btc-polymarket-v45"}),
         timeout=12,
     ) as r:
         return json.loads(r.read())
@@ -270,9 +345,19 @@ def js(x):
     return []
 
 
+ASSET_CONFIG = {
+    "BTC": {"spot_symbol": "BTCUSDT", "signal_base": BINANCE, "slug_prefix": "btc", "hour_name": "bitcoin", "chainlink_symbol": "btc/usd"},
+    "ETH": {"spot_symbol": "ETHUSDT", "signal_base": BINANCE, "slug_prefix": "eth", "hour_name": "ethereum", "chainlink_symbol": "eth/usd"},
+    # HYPE 5m/15m resolve via Chainlink HYPE/USD TWAP; hourly resolves by Binance Futures HYPEUSDT.
+    "HYPE": {"spot_symbol": "HYPEUSDT", "signal_base": "https://fapi.binance.com", "slug_prefix": "hype", "hour_name": "hype", "chainlink_symbol": "hype/usd"},
+}
+
+def strategy_name(asset, tf, session):
+    return f"{tf}_{session}" if asset == "BTC" else f"{asset.lower()}_{tf}_{session}"
+
 def fresh():
     s = {
-        "version": 43,
+        "version": 50,
         "strategies": {},
         "maintenance": {
             "applied_resets": [],
@@ -298,13 +383,15 @@ def fresh():
             "last_match": None,
         },
     }
-    for tf in TFS:
-        for session in ("24h", "day"):
-            name = f"{tf}_{session}"
-            s["strategies"][name] = {
-                "name": name,
-                "tf": tf,
-                "session": session,
+    for asset in ("BTC", "ETH", "HYPE"):
+        for tf in TFS:
+            for session in ("24h", "day"):
+                name = strategy_name(asset, tf, session)
+                s["strategies"][name] = {
+                    "name": name,
+                    "asset": asset,
+                    "tf": tf,
+                    "session": session,
                 "bankroll": str(INITIAL),
                 "loss_streak": 0,
                 "martingale_base_edge": None,  # legado; V25 usa recovery_deficit
@@ -359,6 +446,8 @@ def load():
             ):
                 if field in v:
                     dst[field] = v[field]
+
+            dst.setdefault("asset", "BTC" if not str(k).startswith(("eth_", "hype_")) else ("ETH" if str(k).startswith("eth_") else "HYPE"))
 
             # Compatibilidade com pending antigo (V9):
             p = dst.get("pending")
@@ -457,7 +546,7 @@ def load():
             st["recovery_deficit"] = str(max(D("0"), deficit))
             st["martingale_base_edge"] = None
 
-        new["version"] = 39
+        new["version"] = 50
         save(new)
         return new
     except Exception:
@@ -546,7 +635,7 @@ def apply_one_time_all_robots_reset(s):
         "reset_scope": "TOTAL_LOGICAL_STRATEGY_STATE",
         "before": before,
     }
-    s["version"] = 39
+    s["version"] = 50
     save(s)
 
     audit({
@@ -581,7 +670,7 @@ def ema(values, n):
     return out
 
 
-def trading_signal(tf):
+def trading_signal(tf, asset="BTC"):
     """
     V33 - direcao pelo candle ATUAL aberto + confirmacao MACD ao vivo.
 
@@ -616,9 +705,12 @@ def trading_signal(tf):
     Apos loss, permanece a confirmacao adicional: candle anterior fechado
     + candle atual aberto precisam estar na mesma direcao aprovada.
     """
+    cfg = ASSET_CONFIG.get(str(asset).upper(), ASSET_CONFIG["BTC"])
+    base = cfg["signal_base"]
+    path = "/fapi/v1/klines" if str(asset).upper() == "HYPE" else "/api/v3/klines"
     rows = get(
-        BINANCE + "/api/v3/klines",
-        {"symbol": "BTCUSDT", "interval": tf, "limit": 120},
+        base + path,
+        {"symbol": cfg["spot_symbol"], "interval": tf, "limit": 120},
     )
     now_ms = int(time.time() * 1000)
     closed = [r for r in rows if int(r[6]) < now_ms]
@@ -718,13 +810,16 @@ def bounds(now, mins):
     return start, start + timedelta(minutes=mins)
 
 
-def slug(tf, round_start):
+def slug(tf, round_start, asset="BTC"):
+    asset = str(asset or "BTC").upper()
+    cfg = ASSET_CONFIG.get(asset, ASSET_CONFIG["BTC"])
     if tf != "1h":
-        return f"btc-updown-{tf}-{int(round_start.astimezone(UTC).timestamp())}"
+        return f"{cfg['slug_prefix']}-updown-{tf}-{int(round_start.astimezone(UTC).timestamp())}"
 
     e = round_start.astimezone(ET)
+    # Polymarket hourly slugs use long-form names for BTC/ETH and HYPE.
     return (
-        f"bitcoin-up-or-down-{e.strftime('%B').lower()}-"
+        f"{cfg['hour_name']}-up-or-down-{e.strftime('%B').lower()}-"
         f"{e.day}-{e.year}-"
         f"{e.strftime('%I').lstrip('0')}{e.strftime('%p').lower()}-et"
     )
@@ -872,6 +967,250 @@ def token_book_constraints(token_id, fallback_min_shares=Decimal("0"), fallback_
     return out
 
 
+
+class ChainlinkPolymarketFeed:
+    """
+    V46: captura o mesmo feed Chainlink BTC/USD transmitido pelo websocket
+    live-data da Polymarket. O objetivo e obter um resultado operacional logo
+    apos o fim da rodada, sem depender da demora de Gamma/CLOB ou do auto-redeem.
+
+    Para aceitar um boundary, exige que o feed tenha ticks dos dois lados do
+    instante e que o primeiro tick em/apos o boundary esteja no maximo alguns
+    segundos atrasado. Assim, um reconnect no meio da janela nao e confundido
+    com o preco de abertura/fechamento.
+    """
+    SUBSCRIBE = {
+        "action": "subscribe",
+        "subscriptions": [{"topic": "crypto_prices_chainlink", "type": "update"}],
+    }
+    def __init__(self, asset="BTC"):
+        self.asset = str(asset).upper()
+        self.symbol = ASSET_CONFIG.get(self.asset, ASSET_CONFIG["BTC"])["chainlink_symbol"]
+        self.ticks_path = CHAINLINK_TICK_FILES.get(self.asset, CHAINLINK_TICKS)
+        self.lock = Lock()
+        self.history = []  # [(src_ts_seconds, price)]
+        self.latest = None
+        self.connected = False
+        self.thread = None
+        self._written_since_compact = 0
+        self._load_recent()
+
+    def _load_recent(self):
+        if not self.ticks_path.exists():
+            return
+        cutoff = time.time() - max(3600.0, CHAINLINK_HISTORY_SECONDS)
+        loaded = []
+        try:
+            for line in self.ticks_path.read_text(errors="ignore").splitlines():
+                try:
+                    obj = json.loads(line)
+                    ts = float(obj.get("ts", 0))
+                    px = float(obj.get("price"))
+                except Exception:
+                    continue
+                if ts >= cutoff and px > 0:
+                    loaded.append((ts, px))
+            loaded.sort(key=lambda x: x[0])
+            with self.lock:
+                self.history = loaded
+                self.latest = loaded[-1] if loaded else None
+            if loaded:
+                log.info("CHAINLINK V47 | HISTORICO RECENTE CARREGADO | ticks=%s | arquivo=%s", len(loaded), self.ticks_path)
+        except Exception as exc:
+            log.warning("CHAINLINK V47 | falha carregando historico | err=%r", exc)
+
+    def start(self):
+        if not CHAINLINK_RESULT_FASTPATH_ENABLED or self.thread is not None:
+            return
+        self.thread = Thread(target=self._thread_main, name=f"chainlink-polymarket-v50-{self.asset.lower()}", daemon=True)
+        self.thread.start()
+
+    def _thread_main(self):
+        try:
+            asyncio.run(self._run())
+        except Exception:
+            log.exception("CHAINLINK V47 | thread terminou inesperadamente")
+
+    async def _run(self):
+        backoff = 1.0
+        while not STOP:
+            try:
+                async with websockets.connect(CHAINLINK_WS_URL, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
+                    await ws.send(json.dumps(self.SUBSCRIBE))
+                    self.connected = True
+                    backoff = 1.0
+                    log.info("CHAINLINK V50 | WS CONECTADO | topic=crypto_prices_chainlink | symbol=%s", self.symbol)
+                    async for raw in ws:
+                        if STOP:
+                            break
+                        self._ingest(raw)
+            except Exception as exc:
+                self.connected = False
+                log.warning("CHAINLINK V47 | WS DESCONECTADO | retry=%.0fs | err=%r", backoff, exc)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2.0, 30.0)
+
+    def _ingest(self, raw):
+        try:
+            msg = json.loads(raw)
+            if msg.get("topic") != "crypto_prices_chainlink":
+                return
+            payload = msg.get("payload")
+            if not isinstance(payload, dict) or str(payload.get("symbol") or "").lower() != self.symbol:
+                return
+            px = float(payload.get("value"))
+            ts = float(payload.get("timestamp", 0)) / 1000.0
+            if ts <= 0 or px <= 0:
+                return
+        except Exception:
+            return
+
+        cutoff = time.time() - max(3600.0, CHAINLINK_HISTORY_SECONDS)
+        with self.lock:
+            self.history.append((ts, px))
+            self.latest = (ts, px)
+            # O feed e naturalmente ordenado. Faz trim barato periodicamente.
+            if len(self.history) > 12000:
+                self.history = [x for x in self.history if x[0] >= cutoff]
+
+        try:
+            with self.ticks_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"ts": ts, "price": px}, separators=(",", ":")) + "\n")
+            self._written_since_compact += 1
+            if self._written_since_compact >= 900:
+                self._compact_file(cutoff)
+                self._written_since_compact = 0
+        except Exception as exc:
+            log.warning("CHAINLINK V47 | falha persistindo tick | err=%r", exc)
+
+    def _compact_file(self, cutoff):
+        try:
+            with self.lock:
+                recent = [x for x in self.history if x[0] >= cutoff]
+                self.history = recent
+            tmp = self.ticks_path.with_suffix(".tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                for ts, px in recent:
+                    f.write(json.dumps({"ts": ts, "price": px}, separators=(",", ":")) + "\n")
+            tmp.replace(CHAINLINK_TICKS)
+        except Exception as exc:
+            log.warning("CHAINLINK V47 | falha compactando historico | err=%r", exc)
+
+    @staticmethod
+    def _parse_dt(value):
+        try:
+            d = datetime.fromisoformat(str(value))
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=UTC)
+            return d.astimezone(UTC)
+        except Exception:
+            return None
+
+    def _boundary_tick(self, boundary_ts):
+        """Retorna primeiro tick em/apos boundary, somente se o boundary foi testemunhado."""
+        with self.lock:
+            hist = list(self.history)
+        if not hist:
+            return None
+        before = None
+        after = None
+        for ts, px in hist:
+            if ts < boundary_ts:
+                before = (ts, px)
+                continue
+            after = (ts, px)
+            break
+        if before is None or after is None:
+            return None
+        max_lag = max(1.0, CHAINLINK_BOUNDARY_MAX_LAG_SECONDS)
+        if boundary_ts - before[0] > max_lag:
+            return None
+        if after[0] - boundary_ts > max_lag:
+            return None
+        return after
+
+    def _twap_between(self, start_ts, end_ts):
+        """TWAP aproximado dos ticks Chainlink observados no intervalo [start,end]."""
+        with self.lock:
+            hist = list(self.history)
+        if not hist or end_ts <= start_ts:
+            return None
+        before = None
+        points = []
+        after_end = None
+        for ts, px in hist:
+            if ts <= start_ts:
+                before = (ts, px)
+                continue
+            if ts <= end_ts:
+                points.append((ts, px))
+                continue
+            after_end = (ts, px)
+            break
+        max_lag = max(1.0, CHAINLINK_BOUNDARY_MAX_LAG_SECONDS)
+        if before is None or after_end is None:
+            return None
+        if start_ts - before[0] > max_lag or after_end[0] - end_ts > max_lag:
+            return None
+        seq = [(start_ts, before[1])] + points + [(end_ts, points[-1][1] if points else before[1])]
+        area = 0.0
+        for (t0, p0), (t1, _p1) in zip(seq, seq[1:]):
+            if t1 > t0:
+                area += (t1 - t0) * p0
+        duration = end_ts - start_ts
+        if duration <= 0:
+            return None
+        return area / duration, len(points), before
+
+    def winner_for_position(self, p):
+        """
+        V47: resultado OPERACIONAL PROVISORIO para 5m/15m, no maximo 4 min
+        apos o encerramento. Usa exclusivamente o feed Chainlink da Polymarket,
+        calcula um TWAP observado ao longo da janela e compara com o preco no
+        inicio. Nao e rotulado como resultado oficial; Gamma/CLOB continuam sendo
+        as fontes oficiais quando publicarem o winner.
+        """
+        if not CHAINLINK_RESULT_FASTPATH_ENABLED:
+            return None
+        slug = str((p or {}).get("slug") or "").lower()
+        asset = str((p or {}).get("asset") or "BTC").upper()
+        prefix = ASSET_CONFIG.get(asset, ASSET_CONFIG["BTC"])["slug_prefix"]
+        if f"{prefix}-updown-5m-" not in slug and f"{prefix}-updown-15m-" not in slug:
+            return None
+        rs = self._parse_dt((p or {}).get("round_start"))
+        re_ = self._parse_dt((p or {}).get("round_end"))
+        if not rs or not re_:
+            return None
+        now_ts = time.time()
+        if now_ts < re_.timestamp() + max(30.0, CHAINLINK_RESULT_DELAY_SECONDS):
+            return None
+        calc = self._twap_between(rs.timestamp(), re_.timestamp())
+        if not calc:
+            return None
+        twap_px, samples, start_anchor = calc
+        start_tick = self._boundary_tick(rs.timestamp())
+        if not start_tick:
+            return None
+        open_px = D(str(start_tick[1]))
+        twap = D(str(twap_px))
+        w = "UP" if twap >= open_px else "DOWN"
+        return {
+            "winner": w,
+            "open_price": str(open_px),
+            "twap_price": str(twap),
+            "samples": int(samples),
+            "open_src_ts": start_tick[0],
+            "delay_after_end_s": str(max(D("0"), D(str(now_ts - re_.timestamp())))),
+            "status": "PROVISIONAL_NOT_OFFICIAL",
+            "method": "CHAINLINK_RTDS_FULL_WINDOW_TWAP_V50",
+        }
+
+
+
+CHAINLINK_FEEDS = {a: ChainlinkPolymarketFeed(a) for a in ("BTC", "ETH", "HYPE")}
+CHAINLINK_FEED = CHAINLINK_FEEDS["BTC"]
+
+
 def winner(sl):
     m = market(event(sl))
     if not m or not m["closed"] or len(m["outcomes"]) != len(m["prices"]):
@@ -898,6 +1237,25 @@ def winner(sl):
     return None
 
 
+def hourly_provisional_winner_v50(p):
+    if not CHAINLINK_RESULT_FASTPATH_ENABLED or str((p or {}).get("tf") or "") != "1h":
+        return None
+    try:
+        rend = datetime.fromisoformat(str(p.get("round_end"))); rstart = datetime.fromisoformat(str(p.get("round_start")))
+        if rend.tzinfo is None: rend = rend.replace(tzinfo=UTC)
+        if rstart.tzinfo is None: rstart = rstart.replace(tzinfo=UTC)
+        rend, rstart = rend.astimezone(UTC), rstart.astimezone(UTC)
+        if time.time() < rend.timestamp() + max(30.0, CHAINLINK_RESULT_DELAY_SECONDS): return None
+        asset = str(p.get("asset") or "BTC").upper(); cfg = ASSET_CONFIG.get(asset, ASSET_CONFIG["BTC"])
+        path = "/fapi/v1/klines" if asset == "HYPE" else "/api/v3/klines"
+        rows = get(cfg["signal_base"] + path, {"symbol": cfg["spot_symbol"], "interval": "1h", "startTime": int(rstart.timestamp()*1000), "limit": 1})
+        if not rows or int(rows[0][6]) >= int(time.time()*1000): return None
+        op, cp = D(rows[0][1]), D(rows[0][4])
+        return {"winner": "UP" if cp >= op else "DOWN", "open_price": str(op), "close_price": str(cp), "status": "PROVISIONAL_NOT_OFFICIAL", "method": f"BINANCE_{asset}_1H_FINAL_CANDLE_V50"}
+    except Exception:
+        return None
+
+
 def winner_for_position(p):
     """
     V40: detecta o vencedor por múltiplas fontes e persiste o resultado na posição.
@@ -920,11 +1278,9 @@ def winner_for_position(p):
             pass
 
     condition_id = str((p or {}).get("condition_id") or "").strip()
-    if not condition_id:
-        return None
 
     # Parsing defensivo de respostas CLOB que exponham tokens/outcomes vencedores.
-    for path in (f"/clob-markets/{condition_id}", f"/markets/{condition_id}"):
+    for path in ((f"/clob-markets/{condition_id}", f"/markets/{condition_id}") if condition_id else ()):
         try:
             info = get(CLOB + path)
         except Exception:
@@ -954,6 +1310,30 @@ def winner_for_position(p):
             p["resolved_winner_source"] = "CLOB"
             p["resolved_winner_at"] = datetime.now(UTC).isoformat()
             return w
+
+    # V50: somente depois de tentar Gamma e CLOB, usa resultado operacional provisório em T+4m.
+    # V47: estimativa operacional provisoria pelo feed Chainlink da Polymarket.
+    # Gamma/CLOB permanecem as fontes oficiais quando publicarem o winner.
+    try:
+        cl = CHAINLINK_FEEDS.get(str((p or {}).get("asset") or "BTC").upper(), CHAINLINK_FEED).winner_for_position(p)
+    except Exception:
+        cl = None
+    if cl and cl.get("winner") in ("UP", "DOWN"):
+        w = cl["winner"]
+        p["resolved_winner"] = w
+        p["resolved_winner_source"] = "CHAINLINK_TWAP_PROVISIONAL_V50"
+        p["resolved_winner_at"] = datetime.now(UTC).isoformat()
+        p["chainlink_resolution_evidence"] = cl
+        return w
+
+    hp = hourly_provisional_winner_v50(p)
+    if hp and hp.get("winner") in ("UP", "DOWN"):
+        w = hp["winner"]
+        p["resolved_winner"] = w
+        p["resolved_winner_source"] = "BINANCE_HOURLY_PROVISIONAL_V50"
+        p["resolved_winner_at"] = datetime.now(UTC).isoformat()
+        p["hourly_resolution_evidence"] = hp
+        return w
 
     return None
 
@@ -1176,60 +1556,37 @@ def projected_position_pnl(pos, predicted_winner):
     return winning - dsp - osp
 
 
-def binance_round_resolution_probability(tf, round_start, round_end):
-    """
-    V42: estima P(UP) da rodada usando distancia do BTC ao preco de abertura
-    e volatilidade realizada de retornos de 1 minuto. Modelo sem drift:
-      log(P_final/P_atual) ~ N(0, sigma_1m^2 * segundos_restantes/60).
-
-    E uma estimativa probabilistica, nao uma resolucao oficial.
-    """
+def binance_round_resolution_probability(tf, round_start, round_end, asset="BTC"):
+    """V50: mesma previa probabilistica A->B para BTC/ETH/HYPE."""
+    asset = str(asset or "BTC").upper()
+    cfg = ASSET_CONFIG.get(asset, ASSET_CONFIG["BTC"])
     now = datetime.now(UTC)
     seconds_left = max(0.0, (round_end - now).total_seconds())
     if seconds_left <= 0 or seconds_left > PROB_PREVIEW_MAX_SECONDS_TO_END:
         return None
-
+    base = cfg["signal_base"]
+    kpath = "/fapi/v1/klines" if asset == "HYPE" else "/api/v3/klines"
+    tpath = "/fapi/v1/ticker/price" if asset == "HYPE" else "/api/v3/ticker/price"
+    symbol = cfg["spot_symbol"]
     start_ms = int(round_start.timestamp() * 1000)
-    row = get(BINANCE + "/api/v3/klines", {
-        "symbol": "BTCUSDT", "interval": tf, "startTime": start_ms, "limit": 1
-    })
-    if not row:
-        return None
+    row = get(base + kpath, {"symbol": symbol, "interval": tf, "startTime": start_ms, "limit": 1})
+    if not row: return None
     open_price = float(row[0][1])
-
-    ticker = get(BINANCE + "/api/v3/ticker/price", {"symbol": "BTCUSDT"})
+    ticker = get(base + tpath, {"symbol": symbol})
     current_price = float(ticker["price"])
-    if open_price <= 0 or current_price <= 0:
-        return None
-
-    rows = get(BINANCE + "/api/v3/klines", {
-        "symbol": "BTCUSDT", "interval": "1m",
-        "limit": max(20, min(1000, PROB_PREVIEW_VOL_LOOKBACK_MIN + 2)),
-    })
+    if open_price <= 0 or current_price <= 0: return None
+    rows = get(base + kpath, {"symbol": symbol, "interval": "1m", "limit": max(20, min(1000, PROB_PREVIEW_VOL_LOOKBACK_MIN + 2))})
     now_ms = int(time.time() * 1000)
     closed = [r for r in rows if int(r[6]) < now_ms]
     closes = [float(r[4]) for r in closed[-(PROB_PREVIEW_VOL_LOOKBACK_MIN + 1):]]
-    if len(closes) < 15:
-        return None
+    if len(closes) < 15: return None
     rets = [math.log(b / a) for a, b in zip(closes[:-1], closes[1:]) if a > 0 and b > 0]
-    if len(rets) < 10:
-        return None
+    if len(rets) < 10: return None
     sigma_1m = max(float(statistics.pstdev(rets)), PROB_PREVIEW_MIN_SIGMA_1M)
     sigma_h = sigma_1m * math.sqrt(max(seconds_left, 0.001) / 60.0)
     z = math.log(current_price / open_price) / sigma_h
-    p_up = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
-    p_up = min(0.9999, max(0.0001, p_up))
-    return {
-        "p_up": p_up,
-        "p_down": 1.0 - p_up,
-        "predicted_winner": "UP" if p_up >= 0.5 else "DOWN",
-        "confidence": max(p_up, 1.0 - p_up),
-        "open_price": open_price,
-        "current_price": current_price,
-        "seconds_left": seconds_left,
-        "sigma_1m": sigma_1m,
-        "model": "BINANCE_DISTANCE+REALIZED_VOL_NORMAL",
-    }
+    p_up = min(0.9999, max(0.0001, 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))))
+    return {"p_up": p_up, "p_down": 1.0-p_up, "predicted_winner": "UP" if p_up >= .5 else "DOWN", "confidence": max(p_up,1.0-p_up), "open_price": open_price, "current_price": current_price, "seconds_left": seconds_left, "sigma_1m": sigma_1m, "model": f"{asset}_DISTANCE+REALIZED_VOL_NORMAL"}
 
 
 def sizing(st, directional_min_shares, opposite_min_shares, directional_limit_price, opposite_limit_price, recovery_deficit_override=None):
@@ -1445,6 +1802,10 @@ class Bot:
         if NEWS_FILTER_ENABLED:
             self.news_thread = Thread(target=self._news_calendar_loop, name="news-calendar-v31", daemon=True)
             self.news_thread.start()
+
+        # V46: Chainlink WS roda mesmo em simulacao; em LIVE ele e o fast-path
+        # operacional de encerramento das rodadas BTC.
+        [feed.start() for feed in CHAINLINK_FEEDS.values()]
 
         if LIVE:
             self.sync_balance(force=True)
@@ -2285,7 +2646,7 @@ class Bot:
                 })
                 req = Request(
                     f"https://data-api.polymarket.com/activity?{params}",
-                    headers={"User-Agent": "btc-polymarket-v44"},
+                    headers={"User-Agent": "btc-polymarket-v45"},
                 )
                 with urlopen(req, timeout=15) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -2742,7 +3103,7 @@ class Bot:
           - se o par exceder o bankroll, tenta fallback direcional-only
           - se nenhuma estrutura valida ocorrer antes do inicio, descarta
         """
-        sl = slug(st["tf"], round_start)
+        sl = slug(st["tf"], round_start, st.get("asset", "BTC"))
         m = market(event(sl))
 
         if not m:
@@ -2793,6 +3154,7 @@ class Bot:
             "phase": "waiting_both_prices",
             "execution_mode": "undecided",
             "strategy": st["name"],
+            "asset": st.get("asset", "BTC"),
             "slug": sl,
             "condition_id": m.get("condition_id") or "",
             "round_start": round_start.astimezone(UTC).isoformat(),
@@ -3002,10 +3364,11 @@ class Bot:
                 st["pending"] = None
                 save(self.s)
                 return
-            if total_spend > D(st["bankroll"]):
+            cash = logical_cash_snapshot(st)
+            if total_spend > cash["free"]:
                 log.warning(
-                    "%s | BLOQUEADO V37 DIRECIONAL-ONLY | gasto=%s > bankroll=%s | target=%s",
-                    st["name"], total_spend, st["bankroll"], sz["target_net_profit"],
+                    "%s | BLOQUEADO V45 DIRECIONAL-ONLY | gasto=%s > caixa_livre=%s | equity=%s | comprometido=%s | target=%s",
+                    st["name"], total_spend, cash["free"], cash["equity"], cash["committed"], sz["target_net_profit"],
                 )
                 st["pending"] = None
                 save(self.s)
@@ -3093,10 +3456,11 @@ class Bot:
             st["pending"] = None
             save(self.s)
             return
-        if total_spend > D(st["bankroll"]):
+        cash = logical_cash_snapshot(st)
+        if total_spend > cash["free"]:
             log.warning(
-                "%s | BLOQUEADO V37 PAR | gasto=%s > bankroll=%s | SEM_FALLBACK_DIRECIONAL | deficit=%s | target=%s",
-                st["name"], total_spend, st["bankroll"], sz["recovery_deficit"], sz["target_net_profit"],
+                "%s | BLOQUEADO V45 PAR | gasto=%s > caixa_livre=%s | equity=%s | comprometido=%s | SEM_FALLBACK_DIRECIONAL | deficit=%s | target=%s",
+                st["name"], total_spend, cash["free"], cash["equity"], cash["committed"], sz["recovery_deficit"], sz["target_net_profit"],
             )
             st["pending"] = None
             save(self.s)
@@ -3604,7 +3968,7 @@ class Bot:
         save(self.s)
 
         log.info(
-            "%s | RESOLUCAO V43 CASCATA | WINNER=%s | SINAL=%s | RESULTADO_FINANCEIRO=%s | PNL=%s | STOP_LOSS=%s | BANKROLL=%s | loss_streak=%s | RD_ANTES=%s | RD_DEPOIS=%s | PROX_TARGET=%s | RECOVERY_ACTIVE=%s",
+            "%s | RESOLUCAO V47 CASCATA | WINNER=%s | SINAL=%s | RESULTADO_FINANCEIRO=%s | PNL=%s | STOP_LOSS=%s | BANKROLL=%s | loss_streak=%s | RD_ANTES=%s | RD_DEPOIS=%s | PROX_TARGET=%s | RECOVERY_ACTIVE=%s",
             st["name"],
             w,
             direction,
@@ -3617,6 +3981,11 @@ class Bot:
             deficit_after,
             deficit_after + D(base_edge(st)),
             deficit_after > 0,
+        )
+        cash = logical_cash_snapshot(st)
+        log.info(
+            "%s | CAIXA V45 APOS RESOLUCAO | EQUITY=%s | COMPROMETIDO=%s | CAIXA_LIVRE=%s",
+            st["name"], cash["equity"], cash["committed"], cash["free"],
         )
         return True
 
@@ -3641,6 +4010,11 @@ class Bot:
             )
         st["pending"] = None
         save(self.s)
+        cash = logical_cash_snapshot(st)
+        log.info(
+            "%s | CAIXA V45 APOS ENTRADA | EQUITY=%s | COMPROMETIDO=%s | CAIXA_LIVRE=%s",
+            st["name"], cash["equity"], cash["committed"], cash["free"],
+        )
         return True
 
     def detect_preview_mismatch_and_freeze(self, st, resolved_pos, official_winner):
@@ -3782,7 +4156,7 @@ class Bot:
                 w = winner_for_position(pos)
             except Exception:
                 log.exception(
-                    "%s | erro detectando winner V43 | slug=%s",
+                    "%s | erro detectando winner V46 | slug=%s",
                     st["name"], pos.get("slug"),
                 )
                 continue
@@ -3791,7 +4165,7 @@ class Bot:
             if after and after != before:
                 cache_changed = True
                 log.info(
-                    "%s | V43 RESULTADO CACHEADO | slug=%s | winner=%s | fonte=%s | posicao_fifo=%s",
+                    "%s | V46 RESULTADO CACHEADO | slug=%s | winner=%s | fonte=%s | posicao_fifo=%s",
                     st["name"],
                     pos.get("slug"),
                     w,
@@ -3817,7 +4191,7 @@ class Bot:
                     save(self.s)
                 except Exception:
                     log.exception(
-                        "%s | erro resolvendo posicao V43 FIFO | slug=%s",
+                        "%s | erro resolvendo posicao V46 FIFO | slug=%s",
                         st["name"], oldest.get("slug"),
                     )
                     return
@@ -3894,7 +4268,7 @@ class Bot:
                 return result
 
         try:
-            forecast = binance_round_resolution_probability(st["tf"], rstart, rend)
+            forecast = binance_round_resolution_probability(st["tf"], rstart, rend, st.get("asset", "BTC"))
         except Exception as exc:
             log.warning("%s | PREVIA V42 indisponivel | erro=%r", st["name"], exc)
             result["reason"] = "ERRO_FORECAST"
@@ -4050,7 +4424,7 @@ class Bot:
             next_start.isoformat(),
         )
 
-        direction, two_same, macd, sig, dirs, live_macd, live_sig, closed_hist, live_hist = trading_signal(st["tf"])
+        direction, two_same, macd, sig, dirs, live_macd, live_sig, closed_hist, live_hist = trading_signal(st["tf"], st.get("asset", "BTC"))
 
         if not direction:
             log.info(
@@ -4102,15 +4476,15 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction, recovery_preview)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=44 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=50 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC V44 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | LIVE=%s | GASLESS_AUTH=%s | 6 ROBOS | "
-            "BANKROLL_INICIAL=%s | MACD 7/21/9 | "
+            "POLYMARKET BTC+ETH+HYPE V50 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
+            "ATIVOS=BTC+ETH+HYPE | 18_ROBOS | BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=RECOVERY_DEFICIT>=USD1 | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
             "DAY=SEG-SEX_10-16_BRT | NEWS=US_HIGH_3ESTRELAS_RESILIENTE | NEWS_5M15M=+-15M | NEWS_1H=+-60M | "
-            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO+FASTPATH_REDEEM_UNICO | MARTINGALE=DEFICIT_ACUMULADO+BASE | SIZING=USD1_POR_PONTA+AUTO_DIRECIONAL_ONLY | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
+            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO+FASTPATH_REDEEM_UNICO | CHAINLINK_RESULT=BTC_ETH_HYPE_TWAP_5M15M<=4MIN+BINANCE_HOURLY<=4MIN | MARTINGALE=DEFICIT_ACUMULADO+BASE | SIZING=USD1_POR_PONTA+AUTO_DIRECIONAL_ONLY | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
             LIVE,
             gasless_mode,
             INITIAL,
@@ -4147,17 +4521,22 @@ class Bot:
                     log.exception("%s | erro no tick", st["name"])
 
             if time.time() - hb > 30:
-                summary = " | ".join(
-                    f'{st["name"]}:bank={st["bankroll"]},'
-                    f'L={st["loss_streak"]},'
-                    f'RD={st.get("recovery_deficit", "0")},'
-                    f'PNL={st.get("last_pnl", "0")},'
-                    f'SL={st.get("last_stop_loss", "0")},'
-                    f'R={st.get("last_result", "NONE")},'
-                    f'OPEN={len(st.get("open_positions") or [])},'
-                    f'phase={(st.get("pending") or {}).get("phase","-")}'
-                    for st in self.s["strategies"].values()
-                )
+                summary_parts = []
+                for st in self.s["strategies"].values():
+                    cash = logical_cash_snapshot(st)
+                    summary_parts.append(
+                        f'{st["name"]}:equity={cash["equity"]},'
+                        f'cash={cash["free"]},'
+                        f'committed={cash["committed"]},'
+                        f'L={st["loss_streak"]},'
+                        f'RD={st.get("recovery_deficit", "0")},'
+                        f'PNL={st.get("last_pnl", "0")},'
+                        f'SL={st.get("last_stop_loss", "0")},'
+                        f'R={st.get("last_result", "NONE")},'
+                        f'OPEN={len(st.get("open_positions") or [])},'
+                        f'phase={(st.get("pending") or {}).get("phase","-")}'
+                    )
+                summary = " | ".join(summary_parts)
                 recon = self.s.get("capital_reconciliation", {})
                 bal = self.last_balance_snapshot or {}
                 log.info(
@@ -4195,6 +4574,8 @@ def stop(*_):
 
 signal_module.signal(signal_module.SIGTERM, stop)
 signal_module.signal(signal_module.SIGINT, stop)
+
+
 
 
 if __name__ == "__main__":
