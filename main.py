@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# V53 - RESGATE DIRETO DOS DOIS OUTCOMES + RECUPERACAO DE PERNA UNICA
+# V54 - EXECUCAO FOK + TRAVA DE LUCRO DO PAR + PNL REAL DA CONTA
 # - inicia os 6 robos em bankroll 12, loss_streak 0 e recovery_deficit 0
 # - zera estatisticas logicas antigas (wins/losses/trades/realized_pnl/last_trigger)
 # - reset e aplicado uma unica vez e somente sem pending ativo
@@ -28,7 +28,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC+ETH+HYPE V53 FINAL - FOK RESCUE + DIRECT REDEEM + PATRIMONIO OPERACIONAL
+# POLYMARKET BTC+ETH+HYPE V54 FINAL - FOK EM TODAS AS COMPRAS + PNL REAL
 # - resultado operacional das rodadas BTC pelo feed Chainlink live da Polymarket em segundos apos o boundary
 # - Gamma/CLOB e saldo de auto-redeem permanecem como redundancia/fallback
 #
@@ -47,7 +47,7 @@ from urllib.parse import urlencode
 #   - SEM fallback para DIRECIONAL-ONLY por falta de caixa: abaixo de US$1 de
 #     deficit, se o PAR nao couber no bankroll, a rodada e bloqueada
 #   - nenhuma ordem e enviada acima de 0.55
-#   - no modo PAR, duas BUY LIMIT GTC, uma em cada outcome
+#   - no modo PAR, duas BUY FOK simultaneas, uma em cada outcome
 #   - no modo DIRECIONAL-ONLY, envia somente a BUY da direcao do sinal
 #   - no inicio da rodada, todo saldo ainda aberto e cancelado
 #   - se nao houve fill ate o inicio, a rodada e descartada
@@ -198,10 +198,14 @@ ENTRY_SECONDS = 30  # FIXO: trava o sinal 30s antes da proxima rodada
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "0.5"))
 MAX_BUY_PRICE = Decimal(os.getenv("MAX_BUY_PRICE", "0.55"))
 MIN_LEG_USD = Decimal(os.getenv("MIN_LEG_USD", "1.00"))  # minimo nominal por ponta
+MIN_PAIR_GUARANTEED_PROFIT_USD = Decimal(os.getenv("MIN_PAIR_GUARANTEED_PROFIT_USD", "0.05"))
+FOK_RETRY_SECONDS = float(os.getenv("FOK_RETRY_SECONDS", "2"))
+FOK_MAX_ATTEMPTS_PER_LEG = int(os.getenv("FOK_MAX_ATTEMPTS_PER_LEG", "15"))
+ACCOUNT_STARTING_CAPITAL_USD = Decimal(os.getenv("ACCOUNT_STARTING_CAPITAL_USD", "0"))
 SINGLE_LEG_RESCUE_ENABLED = os.getenv("SINGLE_LEG_RESCUE_ENABLED", "1").lower() in ("1", "true", "yes", "on")
-SINGLE_LEG_RESCUE_MAX_PRICE = Decimal(os.getenv("SINGLE_LEG_RESCUE_MAX_PRICE", "0.65"))
+SINGLE_LEG_RESCUE_MAX_PRICE = Decimal(os.getenv("SINGLE_LEG_RESCUE_MAX_PRICE", "0.55"))
 SINGLE_LEG_RESCUE_AFTER_SECONDS = float(os.getenv("SINGLE_LEG_RESCUE_AFTER_SECONDS", "2"))
-SINGLE_LEG_MAX_COMBINED_PRICE = Decimal(os.getenv("SINGLE_LEG_MAX_COMBINED_PRICE", "1.03"))
+SINGLE_LEG_MAX_COMBINED_PRICE = Decimal(os.getenv("SINGLE_LEG_MAX_COMBINED_PRICE", "0.99"))
 DIRECT_REDEEM_ENABLED = os.getenv("DIRECT_REDEEM_ENABLED", "1").lower() in ("1", "true", "yes", "on")
 
 # V42 - previa probabilistica da rodada anterior no T-30 da proxima.
@@ -289,7 +293,7 @@ def position_committed_cash(pos):
 
 
 def pending_reserved_cash(p):
-    """V45: gasto ja feito + notional ainda reservado em ordens GTC ativas."""
+    """Gasto ja feito; FOK nao deixa notional reservado no livro."""
     if not isinstance(p, dict):
         return D("0")
     spent = position_committed_cash(p)
@@ -329,14 +333,11 @@ def logical_cash_snapshot(st):
     }
 
 
-def aggregate_operational_snapshot(state, wallet_balance_units=None):
+def aggregate_operational_snapshot(state, wallet_balance_units=None, wallet_token_market_value=None):
     """
-    V52: separa caixa USDC livre de capital convertido em tokens.
-
-    `wallet_cost_basis` nao e mark-to-market: soma o saldo collateral disponivel
-    ao custo efetivamente pago pelas posicoes ainda abertas. Assim, uma compra
-    deixa de parecer perda imediata apenas porque USDC virou token binario.
-    O lucro definitivo continua sendo reconhecido somente na resolucao/resgate.
+    V54: separa caixa USDC, custo pago e valor atual dos tokens. Quando a API
+    fornece o mark-to-market, o patrimonio real usa o valor atual, igual ao
+    conceito exibido na carteira; o custo fica apenas para auditoria.
     """
     strategies = list((state or {}).get("strategies", {}).values())
     actual_committed = D("0")
@@ -355,10 +356,14 @@ def aggregate_operational_snapshot(state, wallet_balance_units=None):
 
     wallet_cash = None
     wallet_cost_basis = None
+    real_account_pnl = None
     if wallet_balance_units not in (None, "", "?"):
         try:
             wallet_cash = D(wallet_balance_units) / D("1000000")
-            wallet_cost_basis = wallet_cash + actual_committed
+            token_value = actual_committed if wallet_token_market_value is None else D(wallet_token_market_value)
+            wallet_cost_basis = wallet_cash + token_value
+            if ACCOUNT_STARTING_CAPITAL_USD > 0:
+                real_account_pnl = wallet_cost_basis - ACCOUNT_STARTING_CAPITAL_USD
         except Exception:
             wallet_cash = None
             wallet_cost_basis = None
@@ -366,7 +371,10 @@ def aggregate_operational_snapshot(state, wallet_balance_units=None):
     return {
         "wallet_cash_usd": wallet_cash,
         "actual_committed_usd": actual_committed,
+        "wallet_token_market_value_usd": wallet_token_market_value,
         "wallet_cost_basis_usd": wallet_cost_basis,
+        "account_starting_capital_usd": ACCOUNT_STARTING_CAPITAL_USD if ACCOUNT_STARTING_CAPITAL_USD > 0 else None,
+        "real_account_pnl_usd": real_account_pnl,
         "logical_equity": logical_equity,
         "realized_pnl": realized_pnl,
         "wins": wins,
@@ -407,7 +415,7 @@ def strategy_name(asset, tf, session):
 
 def fresh():
     s = {
-        "version": 53,
+        "version": 54,
         "strategies": {},
         "maintenance": {
             "applied_resets": [],
@@ -1672,6 +1680,8 @@ def sizing(st, directional_min_shares, opposite_min_shares, directional_limit_pr
         blocked = "MAX_ENTRY"
     elif guaranteed_net_at_limit < target:
         blocked = "TARGET_NOT_GUARANTEED"
+    elif guaranteed_net_at_limit < MIN_PAIR_GUARANTEED_PROFIT_USD:
+        blocked = "PAIR_PROFIT_BELOW_MINIMUM"
 
     return {
         "blocked": bool(blocked), "reason": blocked, "base_profit": base,
@@ -2098,7 +2108,7 @@ class Bot:
         try:
             positions = list(self.c.list_positions(user=WALLET, page_size=100).iter_items())
         except Exception as exc:
-            log.warning("RESGATE V53 | descoberta de posicoes falhou | erro=%r", exc)
+            log.warning("RESGATE V54 | descoberta de posicoes falhou | erro=%r", exc)
             return False
 
         queued_ids = {str(x.get("condition_id") or "").lower() for x in queue if isinstance(x, dict)}
@@ -2133,12 +2143,12 @@ class Bot:
                 "queued_at": datetime.now(UTC).isoformat(),
             })
             changed = True
-            log.warning("RESGATE V53 | TOKEN RESOLVIDO DESCOBERTO NA CARTEIRA | condition_id=%s | size=%s", cid, total_size)
+            log.warning("RESGATE V54 | TOKEN RESOLVIDO DESCOBERTO NA CARTEIRA | condition_id=%s | size=%s", cid, total_size)
         return changed
 
     def process_redemptions(self, force=False):
         """
-        V53: descobre posicoes resolvidas e usa redeem_positions oficial para
+        V54: descobre posicoes resolvidas e usa redeem_positions oficial para
         queimar os dois outcomes e receber o payout vencedor.
         """
         if not LIVE or not self.c:
@@ -2238,16 +2248,16 @@ class Bot:
                 log.info("RESGATE | AINDA NAO RESGATAVEL | condition_id=%s | size=%s | retry=60s", condition_id, inspection.get("total_size"))
                 continue
 
-            # V53 REDEEMABLE: o SDK oficial resgata os dois outcomes em uma
+            # V54 REDEEMABLE: o SDK oficial resgata os dois outcomes em uma
             # unica transacao. O vencedor vira pUSD e o perdedor e queimado a
             # zero, removendo os tokens encerrados da carteira.
-            if DIRECT_REDEEM_ENABLED:
+            if DIRECT_REDEEM_ENABLED and not item.get("direct_redeem_unavailable"):
                 if item.get("direct_redeem_submitted_at"):
                     item["next_try_epoch"] = now_epoch + 30
                     kept.append(item)
                     changed = True
                     log.info(
-                        "RESGATE DIRETO V53 | transacao ja enviada; aguardando posicao desaparecer | condition_id=%s",
+                        "RESGATE DIRETO V54 | transacao ja enviada; aguardando posicao desaparecer | condition_id=%s",
                         condition_id,
                     )
                     continue
@@ -2264,21 +2274,33 @@ class Bot:
                     kept.append(item)
                     changed = True
                     log.warning(
-                        "RESGATE DIRETO V53 ENVIADO | condition_id=%s | ambos outcomes: vencedor->pUSD, perdedor->0 | confirmacao em 20s",
+                        "RESGATE DIRETO V54 ENVIADO | condition_id=%s | ambos outcomes: vencedor->pUSD, perdedor->0 | confirmacao em 20s",
                         condition_id,
                     )
                     continue
                 except Exception as exc:
+                    no_market = "no market found for condition" in str(exc).lower()
                     item["attempts"] = int(item.get("attempts") or 0) + 1
                     item["last_error"] = repr(exc)
-                    item["next_try_epoch"] = now_epoch + min(600, 30 * (2 ** min(item["attempts"], 4)))
-                    kept.append(item)
                     changed = True
-                    log.warning(
-                        "RESGATE DIRETO V53 FALHOU | condition_id=%s | tentativa=%s | retry_at=%s | erro=%r",
-                        condition_id, item["attempts"], item["next_try_epoch"], exc,
-                    )
-                    continue
+                    if no_market:
+                        # O SDK nao conhece mercados antigos descobertos apenas
+                        # pela carteira. Nao insiste para sempre: passa ao
+                        # operator oficial e continua reconciliando o saldo.
+                        item["direct_redeem_unavailable"] = True
+                        item["next_try_epoch"] = now_epoch + 60
+                        log.warning(
+                            "RESGATE DIRETO V54 INDISPONIVEL PARA MERCADO ANTIGO | condition_id=%s | usando AUTO-OPERATOR",
+                            condition_id,
+                        )
+                    else:
+                        item["next_try_epoch"] = now_epoch + min(600, 30 * (2 ** min(item["attempts"], 4)))
+                        kept.append(item)
+                        log.warning(
+                            "RESGATE DIRETO V54 FALHOU | condition_id=%s | tentativa=%s | retry_at=%s | erro=%r",
+                            condition_id, item["attempts"], item["next_try_epoch"], exc,
+                        )
+                        continue
 
             # Fallback opcional: deixa o operator oficial liquidar.
             queued_at = item.get("queued_at")
@@ -2314,6 +2336,33 @@ class Bot:
             if hasattr(obj, name):
                 return getattr(obj, name)
         return default
+
+    def wallet_token_mark_to_market(self):
+        """Soma o valor atual das posições conforme a API da Polymarket."""
+        if not LIVE or not self.c:
+            return D("0")
+        total = D("0")
+        try:
+            positions = self.c.list_positions(user=WALLET, page_size=100).iter_items()
+            for pos in positions:
+                size = D(self._obj_field(pos, "size", default="0") or "0")
+                if size <= 0:
+                    continue
+                current_value = self._obj_field(
+                    pos, "current_value", "currentValue", "value", default=None
+                )
+                if current_value not in (None, ""):
+                    total += max(D("0"), D(current_value))
+                    continue
+                current_price = self._obj_field(
+                    pos, "current_price", "currentPrice", "cur_price", default=None
+                )
+                if current_price not in (None, ""):
+                    total += max(D("0"), size * D(current_price))
+            return total
+        except Exception as exc:
+            log.warning("PATRIMONIO V54 | mark-to-market indisponivel | erro=%r", exc)
+            return None
 
     @staticmethod
     def _position_round_ended(pos, now_utc=None):
@@ -2873,8 +2922,9 @@ class Bot:
 
     def place_gtc_limit(self, token, price, shares):
         """
-        BUY LIMIT GTC a no maximo 0.55.
-        A ordem pode executar imediatamente ou permanecer no livro.
+        V54: BUY FOK com teto de preco. O nome foi preservado para manter
+        compatibilidade interna, mas nenhuma ordem fica pendurada no livro:
+        executa integralmente naquele instante ou cancela integralmente.
         """
         if not LIVE:
             return {
@@ -2904,20 +2954,23 @@ class Bot:
                         "Configure RELAYER ou BUILDER no Railway."
                     )
 
-        try:
-            return self.c.place_limit_order(
-                token_id=token,
-                price=price,
-                size=shares,
-                side="BUY",
-                post_only=False,
+        price = min(D(price), MAX_BUY_PRICE)
+        shares = floor_6(D(shares))
+        usd_amount = floor_6(price * shares)
+        if shares <= 0 or usd_amount < MIN_LEG_USD:
+            raise ValueError(
+                f"FOK abaixo do minimo: shares={shares} amount={usd_amount}"
             )
+
+        try:
+            return self.place_market_fok_buy(token, usd_amount, price)
         except Exception as exc:
-            log.exception(
-                "ORDEM REJEITADA | token=%s | price=%s | shares=%s | erro=%s | tipo=%s",
+            log.warning(
+                "ORDEM FOK NAO EXECUTADA | token=%s | max_price=%s | shares_alvo=%s | amount=%s | erro=%s | tipo=%s",
                 token,
                 price,
                 shares,
+                usd_amount,
                 exc,
                 type(exc).__name__,
             )
@@ -2933,7 +2986,7 @@ class Bot:
     def place_market_fok_buy(self, token, usd_amount, max_price):
         """Compra imediata FOK: executa o notional inteiro ou executa zero."""
         usd_amount = floor_6(max(D("0"), D(usd_amount)))
-        max_price = D(max_price)
+        max_price = min(D(max_price), MAX_BUY_PRICE)
         if usd_amount <= 0 or max_price <= 0 or max_price >= 1:
             return None
         if not LIVE:
@@ -3121,17 +3174,26 @@ class Bot:
 
             total_shares = D("0")
             total_spent = D("0")
+            current_snapshot = None
 
             for oid in ids:
                 if not oid:
                     continue
                 snap = self.get_order_snapshot(oid)
+                if str(oid) == str(p.get(f"{leg}_order_id") or ""):
+                    current_snapshot = snap
                 sh, spent = self.fills_for_order(oid, token, snap)
                 total_shares += sh
                 total_spent += spent
 
             p[f"{leg}_shares_filled"] = str(total_shares)
             p[f"{leg}_spent"] = str(total_spent)
+            if total_shares <= 0 and current_snapshot is not None:
+                status = str(self._obj_field(
+                    current_snapshot, "status", "state", default=""
+                ) or "").upper()
+                if status in {"CANCELED", "CANCELLED", "EXPIRED", "FAILED", "REJECTED"}:
+                    p[f"{leg}_order_id"] = None
 
     def cancel_leg(self, p, leg):
         oid = p.get(f"{leg}_order_id")
@@ -3141,7 +3203,7 @@ class Bot:
 
     def place_rebalanced_leg(self, p, leg, shares):
         """
-        Cria uma nova GTC para a quantidade proporcional restante.
+        Cria uma nova FOK para a quantidade proporcional restante.
         V29 usa piso nominal local de US$1,00 para ordens de reposicao.
         """
         shares = floor_6(D(shares))
@@ -3186,7 +3248,7 @@ class Bot:
         Se a perna de referencia executou 100%, a outra continua buscando 100%.
 
         Como a API nao possui alteracao in-place do tamanho, o ajuste e feito
-        por cancelamento + nova limit GTC. Se a quantidade proporcional ficar
+        por nova tentativa FOK. Se a quantidade proporcional ficar
         abaixo do minimo do mercado, nao envia ordem invalida; nesse caso
         mantem a estrutura original buscando o preenchimento integral.
         """
@@ -3700,6 +3762,15 @@ class Bot:
             st["pending"] = None
             save(self.s)
             return
+        if D(sz.get("guaranteed_net_at_limit") or 0) < MIN_PAIR_GUARANTEED_PROFIT_USD:
+            log.warning(
+                "%s | PAR BLOQUEADO SEM LUCRO | lucro_direcional_garantido=%s < minimo=%s | gasto=%s",
+                st["name"], sz.get("guaranteed_net_at_limit"),
+                MIN_PAIR_GUARANTEED_PROFIT_USD, total_spend,
+            )
+            st["pending"] = None
+            save(self.s)
+            return
         cash = logical_cash_snapshot(st)
         if total_spend > cash["free"]:
             log.warning(
@@ -3798,8 +3869,8 @@ class Bot:
 
     def retry_missing_order(self, p):
         """
-        Se uma das duas ordens falhou ao ser criada, tenta manter a outra perna
-        PENDENTE a 0.55 ate o final da rodada.
+        V54: repete FOK em intervalos controlados. Cada tentativa executa tudo
+        ou zero; nenhuma ordem fica pendente e nao ha fill parcial novo.
         """
         if not LIVE:
             return
@@ -3810,6 +3881,17 @@ class Bot:
             # V29 directional-only nunca deve recriar uma perna oposta inexistente.
             if D(p.get(f"{leg}_shares_requested", "0") or "0") <= 0:
                 continue
+
+            attempts_key = f"{leg}_fok_attempts"
+            next_key = f"{leg}_next_fok_epoch"
+            attempts = int(p.get(attempts_key) or 0)
+            if attempts >= FOK_MAX_ATTEMPTS_PER_LEG:
+                continue
+            if time.time() < float(p.get(next_key) or 0):
+                continue
+
+            p[attempts_key] = attempts + 1
+            p[next_key] = time.time() + FOK_RETRY_SECONDS
 
             try:
                 resp = self.place_gtc_limit(
@@ -3823,9 +3905,11 @@ class Bot:
                     p.setdefault(f"{leg}_order_ids", []).append(str(oid))
                     p[f"{leg}_error"] = None
                     log.warning(
-                        "%s | perna %s recriada e deixada GTC ate o final | order=%s",
+                        "%s | FOK perna=%s enviada | tentativa=%s/%s | order=%s",
                         p["strategy"],
                         leg,
+                        p[attempts_key],
+                        FOK_MAX_ATTEMPTS_PER_LEG,
                         oid,
                     )
             except Exception as e:
@@ -3836,7 +3920,7 @@ class Bot:
         Regras definitivas depois que o par foi enviado:
 
         ANTES DO INICIO
-          - deixa ambas GTC
+          - repete FOK com intervalo controlado enquanto houver tempo
           - se ambas executarem, cancela apenas eventuais restos e acompanha
 
         NO INICIO
@@ -3844,7 +3928,7 @@ class Bot:
           - se os dois lados executaram: cancela restos e acompanha
           - se SOMENTE UM lado executou:
                 cancela resto do lado que ja executou
-                MANTEM/RECRIA o outro lado GTC @ <=0.55
+                tenta o outro lado em FOK @ <=0.55
                 ate o FINAL da rodada
 
         DURANTE A RODADA
@@ -4027,7 +4111,7 @@ class Bot:
                 if not p.get(f"{missing_leg}_order_id"):
                     self.retry_missing_order(p)
 
-                # V53: depois de uma curta janela no limite original, cancela a
+                # V54: depois de uma curta janela no limite original, cancela a
                 # ordem resting e tenta a quantidade faltante como FOK em um
                 # limite adaptativo. FOK impede uma segunda execução parcial.
                 self.rescue_missing_leg_fok(st, p, filled_leg, missing_leg, now)
@@ -4041,7 +4125,7 @@ class Bot:
                     save(self.s)
                     log.warning(
                         "%s | APENAS UM LADO EXECUTOU | %s preenchido; "
-                        "%s fica GTC @ %s ATE O FINAL DA RODADA",
+                        "%s sera tentado em FOK @ %s; executa tudo ou cancela",
                         st["name"],
                         filled_leg,
                         missing_leg,
@@ -4734,10 +4818,10 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction, recovery_preview)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=52 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=54 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC+ETH+HYPE V53 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE=RD_FINANCEIRO_EXATO | SEGUNDA_PERNA=FOK_ADAPTATIVO | RESGATE=DIRETO_AMBOS_OUTCOMES | RESOLUCAO=CHAINLINK+SALDO+GAMMA+CLOB | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
+            "POLYMARKET BTC+ETH+HYPE V54 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE=RD_FINANCEIRO_EXATO | SEGUNDA_PERNA=FOK_ADAPTATIVO | RESGATE=DIRETO_AMBOS_OUTCOMES | RESOLUCAO=CHAINLINK+SALDO+GAMMA+CLOB | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
             "ATIVOS=BTC+ETH+HYPE | 18_ROBOS | BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
@@ -4797,15 +4881,22 @@ class Bot:
                 summary = " | ".join(summary_parts)
                 recon = self.s.get("capital_reconciliation", {})
                 bal = self.last_balance_snapshot or {}
-                portfolio = aggregate_operational_snapshot(self.s, bal.get("balance"))
+                token_mtm = self.wallet_token_mark_to_market()
+                portfolio = aggregate_operational_snapshot(
+                    self.s, bal.get("balance"), token_mtm
+                )
                 log.info(
-                    "HEARTBEAT V53 | LIVE=%s | wallet_cash_usd=%s | capital_em_tokens_custo=%s | "
-                    "capital_operacional_custo=%s | pnl_realizado_logico=%s | wins=%s | losses=%s | "
+                    "HEARTBEAT V54 | LIVE=%s | wallet_cash_usd=%s | capital_em_tokens_custo=%s | "
+                    "tokens_valor_atual=%s | patrimonio_real=%s | capital_inicial_real=%s | pnl_real_conta=%s | "
+                    "pnl_realizado_logico=%s | wins=%s | losses=%s | "
                     "withdrawn_applied=%s | %s",
                     LIVE,
                     portfolio.get("wallet_cash_usd"),
                     portfolio.get("actual_committed_usd"),
+                    portfolio.get("wallet_token_market_value_usd"),
                     portfolio.get("wallet_cost_basis_usd"),
+                    portfolio.get("account_starting_capital_usd"),
+                    portfolio.get("real_account_pnl_usd"),
                     portfolio.get("realized_pnl"),
                     portfolio.get("wins"),
                     portfolio.get("losses"),
@@ -4817,7 +4908,7 @@ class Bot:
             time.sleep(POLL_SECONDS)
 
     def close(self):
-        # Ao encerrar o processo, cancela ordens GTC conhecidas.
+        # Compatibilidade defensiva: cancela qualquer id que o SDK ainda reporte aberto.
         if self.c:
             ids = []
             for st in self.s["strategies"].values():
