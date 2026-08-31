@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# V54 - EXECUCAO FOK + TRAVA DE LUCRO DO PAR + PNL REAL DA CONTA
+# V58 - ORDENS GTC 0.60 + COMPLEMENTOS PARCIAIS MATEMATICOS T-5 ATE 0.65
 # - inicia os 6 robos em bankroll 12, loss_streak 0 e recovery_deficit 0
 # - zera estatisticas logicas antigas (wins/losses/trades/realized_pnl/last_trigger)
 # - reset e aplicado uma unica vez e somente sem pending ativo
@@ -28,7 +28,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC+ETH+HYPE V54 FINAL - FOK EM TODAS AS COMPRAS + PNL REAL
+# POLYMARKET BTC+ETH+HYPE V58 - GTC 0.60 + COMPLEMENTO T-5 0.65 + PNL REAL
 # - resultado operacional das rodadas BTC pelo feed Chainlink live da Polymarket em segundos apos o boundary
 # - Gamma/CLOB e saldo de auto-redeem permanecem como redundancia/fallback
 #
@@ -46,8 +46,8 @@ from urllib.parse import urlencode
 #   - modo DIRECIONAL-ONLY somente quando recovery_deficit >= US$1,00
 #   - SEM fallback para DIRECIONAL-ONLY por falta de caixa: abaixo de US$1 de
 #     deficit, se o PAR nao couber no bankroll, a rodada e bloqueada
-#   - nenhuma ordem e enviada acima de 0.55
-#   - no modo PAR, duas BUY FOK simultaneas, uma em cada outcome
+#   - ordens iniciais GTC somente quando o book executavel esta <= 0.60
+#   - no modo PAR, duas BUY GTC simultaneas, uma em cada outcome
 #   - no modo DIRECIONAL-ONLY, envia somente a BUY da direcao do sinal
 #   - no inicio da rodada, todo saldo ainda aberto e cancelado
 #   - se nao houve fill ate o inicio, a rodada e descartada
@@ -199,16 +199,18 @@ BALANCE_RESULT_TOLERANCE_USD = Decimal(os.getenv("BALANCE_RESULT_TOLERANCE_USD",
 
 ENTRY_SECONDS = 30  # FIXO: trava o sinal 30s antes da proxima rodada
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "0.5"))
-MAX_BUY_PRICE = Decimal(os.getenv("MAX_BUY_PRICE", "0.55"))
+MAX_BUY_PRICE = Decimal(os.getenv("MAX_BUY_PRICE", "0.60"))
 MIN_LEG_USD = Decimal(os.getenv("MIN_LEG_USD", "1.00"))  # minimo nominal por ponta
 MIN_PAIR_GUARANTEED_PROFIT_USD = Decimal(os.getenv("MIN_PAIR_GUARANTEED_PROFIT_USD", "0.05"))
 FOK_RETRY_SECONDS = float(os.getenv("FOK_RETRY_SECONDS", "2"))
 FOK_MAX_ATTEMPTS_PER_LEG = int(os.getenv("FOK_MAX_ATTEMPTS_PER_LEG", "15"))
 ACCOUNT_STARTING_CAPITAL_USD = Decimal(os.getenv("ACCOUNT_STARTING_CAPITAL_USD", "0"))
 SINGLE_LEG_RESCUE_ENABLED = os.getenv("SINGLE_LEG_RESCUE_ENABLED", "1").lower() in ("1", "true", "yes", "on")
-SINGLE_LEG_RESCUE_MAX_PRICE = Decimal(os.getenv("SINGLE_LEG_RESCUE_MAX_PRICE", "0.55"))
-SINGLE_LEG_RESCUE_AFTER_SECONDS = float(os.getenv("SINGLE_LEG_RESCUE_AFTER_SECONDS", "2"))
+SINGLE_LEG_RESCUE_MAX_PRICE = Decimal(os.getenv("SINGLE_LEG_RESCUE_MAX_PRICE", "0.65"))
+SINGLE_LEG_RESCUE_AFTER_SECONDS = float(os.getenv("SINGLE_LEG_RESCUE_AFTER_SECONDS", "5"))
 SINGLE_LEG_MAX_COMBINED_PRICE = Decimal(os.getenv("SINGLE_LEG_MAX_COMBINED_PRICE", "0.99"))
+LATE_RESCUE_SECONDS = float(os.getenv("LATE_RESCUE_SECONDS", "5"))
+LATE_REPRICE_SECONDS = float(os.getenv("LATE_REPRICE_SECONDS", "0.75"))
 DIRECT_REDEEM_ENABLED = os.getenv("DIRECT_REDEEM_ENABLED", "1").lower() in ("1", "true", "yes", "on")
 
 # V42 - previa probabilistica da rodada anterior no T-30 da proxima.
@@ -418,7 +420,7 @@ def strategy_name(asset, tf, session):
 
 def fresh():
     s = {
-        "version": 56,
+        "version": 58,
         "strategies": {},
         "maintenance": {
             "applied_resets": [],
@@ -1026,6 +1028,24 @@ def token_book_constraints(token_id, fallback_min_shares=Decimal("0"), fallback_
             token_id, fallback_min, fallback_tick, exc,
         )
     return out
+
+
+def token_best_ask(token_id):
+    """Melhor ask executavel do CLOB; nunca usa o preco indicativo da Gamma."""
+    if not token_id:
+        return None
+    try:
+        book = get(CLOB + "/book", {"token_id": str(token_id)})
+        asks = book.get("asks") or []
+        prices = []
+        for row in asks:
+            raw = row.get("price") if isinstance(row, dict) else getattr(row, "price", None)
+            if raw is not None:
+                prices.append(D(raw))
+        return min(prices) if prices else None
+    except Exception as exc:
+        log.warning("BOOK ASK INDISPONIVEL | token=%s | err=%r", token_id, exc)
+        return None
 
 
 
@@ -2973,11 +2993,10 @@ class Bot:
 
     # ------------------------- ORDERS -------------------------
 
-    def place_gtc_limit(self, token, price, shares):
+    def place_gtc_limit(self, token, price, shares, hard_cap=None):
         """
-        V54: BUY FOK com teto de preco. O nome foi preservado para manter
-        compatibilidade interna, mas nenhuma ordem fica pendurada no livro:
-        executa integralmente naquele instante ou cancela integralmente.
+        V57: BUY LIMIT GTC. A ordem pode executar imediatamente, parcialmente
+        ou permanecer no livro ate ser cancelada explicitamente pelo robo.
         """
         if not LIVE:
             return {
@@ -3007,19 +3026,22 @@ class Bot:
                         "Configure RELAYER ou BUILDER no Railway."
                     )
 
-        price = min(D(price), MAX_BUY_PRICE)
+        price = min(D(price), D(hard_cap) if hard_cap is not None else MAX_BUY_PRICE)
         shares = floor_6(D(shares))
         usd_amount = floor_6(price * shares)
         if shares <= 0 or usd_amount < MIN_LEG_USD:
             raise ValueError(
-                f"FOK abaixo do minimo: shares={shares} amount={usd_amount}"
+                f"GTC abaixo do minimo: shares={shares} amount={usd_amount}"
             )
 
         try:
-            return self.place_market_fok_buy(token, usd_amount, price)
+            return self.c.place_limit_order(
+                token_id=str(token), side="BUY", price=str(price), size=str(shares),
+                post_only=False,
+            )
         except Exception as exc:
             log.warning(
-                "ORDEM FOK NAO EXECUTADA | token=%s | max_price=%s | shares_alvo=%s | amount=%s | erro=%s | tipo=%s",
+                "ORDEM GTC REJEITADA | token=%s | limit=%s | shares=%s | amount=%s | erro=%s | tipo=%s",
                 token,
                 price,
                 shares,
@@ -3060,68 +3082,151 @@ class Bot:
                 max_price=str(max_price), order_type="FOK",
             )
 
-    def rescue_missing_leg_fok(self, st, p, filled_leg, missing_leg, now):
-        """Tenta completar uma perna faltante sem deixar nova ordem resting."""
-        if not SINGLE_LEG_RESCUE_ENABLED or p.get("single_leg_rescue_done"):
+    def complete_partial_pair_gtc(self, st, p, now):
+        """V58: no T-5, completa a perna atrasada; nunca vende nem zera tokens."""
+        if not SINGLE_LEG_RESCUE_ENABLED or p.get("late_completion_stopped"):
             return False
 
-        first = p.get("single_leg_detected_at")
-        if not first:
-            p["single_leg_detected_at"] = now.isoformat()
-            return False
-        try:
-            first_dt = datetime.fromisoformat(str(first))
-        except Exception:
-            first_dt = now
-        if (now - first_dt).total_seconds() < SINGLE_LEG_RESCUE_AFTER_SECONDS:
+        round_start = datetime.fromisoformat(p["round_start"])
+        seconds_left = (round_start - now).total_seconds()
+        if seconds_left > LATE_RESCUE_SECONDS or seconds_left <= 0:
             return False
 
-        filled_shares = D(p.get(f"{filled_leg}_shares_filled", "0") or "0")
-        filled_spent = D(p.get(f"{filled_leg}_spent", "0") or "0")
-        missing_requested = D(p.get(f"{missing_leg}_shares_requested", "0") or "0")
-        missing_filled = D(p.get(f"{missing_leg}_shares_filled", "0") or "0")
-        remaining = max(D("0"), missing_requested - missing_filled)
-        if filled_shares <= 0 or remaining <= 0:
-            return False
+        if not p.get("late_completion_initialized"):
+            p["late_completion_initialized"] = True
+            p["late_completion_started_at"] = now.isoformat()
+            self.cancel_ids([p.get("directional_order_id"), p.get("opposite_order_id")])
+            p["directional_order_id"] = None
+            p["opposite_order_id"] = None
+        if LIVE:
+            self.refresh_fills(p)
 
-        filled_avg = filled_spent / filled_shares if filled_spent > 0 else D(
-            p.get(f"{filled_leg}_limit_price") or p.get("limit_price") or MAX_BUY_PRICE
-        )
-        economic_cap = max(D("0.01"), SINGLE_LEG_MAX_COMBINED_PRICE - filled_avg)
-        rescue_cap = floor_to_step(
-            min(SINGLE_LEG_RESCUE_MAX_PRICE, economic_cap),
-            D(p.get("tick_size") or "0.01"),
-        )
-        original_cap = D(p.get(f"{missing_leg}_limit_price") or p.get("limit_price") or MAX_BUY_PRICE)
-        if rescue_cap <= original_cap:
-            p["single_leg_rescue_done"] = True
-            p["single_leg_rescue_result"] = "SEM_ESPACO_ECONOMICO_PARA_SUBIR_PRECO"
+        d_req = D(p.get("directional_shares_requested", "0") or "0")
+        o_req = D(p.get("opposite_shares_requested", "0") or "0")
+        d_fill = D(p.get("directional_shares_filled", "0") or "0")
+        o_fill = D(p.get("opposite_shares_filled", "0") or "0")
+        if d_req <= 0 or o_req <= 0 or (d_fill <= 0 and o_fill <= 0):
+            p["late_completion_result"] = "SEM_FILL_PARCIAL"
             save(self.s)
             return False
 
-        self.cancel_leg(p, missing_leg)
-        usd_amount = floor_6(remaining * rescue_cap)
-        try:
-            resp = self.place_market_fok_buy(p[f"{missing_leg}_token"], usd_amount, rescue_cap)
-            oid = resp.get("order_id") if isinstance(resp, dict) else order_id_of(resp)
-            if oid:
-                p[f"{missing_leg}_order_id"] = str(oid)
-                p.setdefault(f"{missing_leg}_order_ids", []).append(str(oid))
-            p["single_leg_rescue_done"] = True
-            p["single_leg_rescue_cap"] = str(rescue_cap)
-            p["single_leg_rescue_amount"] = str(usd_amount)
-            p["single_leg_rescue_result"] = "FOK_ENVIADA" if oid else rejected_reason(resp)
+        fd = min(D("1"), d_fill / d_req)
+        fo = min(D("1"), o_fill / o_req)
+        if abs(fd - fo) <= D("0.000001"):
+            self.cancel_ids([p.get("directional_order_id"), p.get("opposite_order_id")])
+            p["directional_order_id"] = None
+            p["opposite_order_id"] = None
+            p["late_completion_result"] = "PROPORCAO_IDEAL_ATINGIDA"
+            p["late_completion_stopped"] = True
             save(self.s)
-            log.warning(
-                "%s | RESGATE DA SEGUNDA PERNA FOK | perna=%s | cap=%s | amount=%s | order=%s | combinado_max=%s",
-                st["name"], missing_leg, rescue_cap, usd_amount, oid, SINGLE_LEG_MAX_COMBINED_PRICE,
+            return False
+
+        if fd > fo:
+            lead, lag, target_total = "directional", "opposite", floor_6(o_req * fd)
+        else:
+            lead, lag, target_total = "opposite", "directional", floor_6(d_req * fo)
+        lag_fill = D(p.get(f"{lag}_shares_filled", "0") or "0")
+        needed = floor_6(max(D("0"), target_total - lag_fill))
+
+        m = market(event(p["slug"]))
+        px = token_best_ask(p.get(f"{lag}_token"))
+        if px is None or D(px) > SINGLE_LEG_RESCUE_MAX_PRICE:
+            p["late_completion_result"] = "BOOK_ACIMA_065_OU_INDISPONIVEL"
+            save(self.s)
+            log.warning("%s | T-5 AGUARDANDO COMPLEMENTO | perna=%s book=%s teto=%s", st["name"], lag, px, SINGLE_LEG_RESCUE_MAX_PRICE)
+            return False
+
+        tick = D(p.get("tick_size") or "0.01")
+        rescue_price = ceil_to_step(D(px), tick)
+        rescue_price = min(rescue_price, SINGLE_LEG_RESCUE_MAX_PRICE)
+        min_shares = max(
+            ceil_6(MIN_LEG_USD / rescue_price),
+            D(p.get(f"{lag}_min_order_shares") or p.get("minimum_order_shares") or 0),
+        )
+        if needed < min_shares:
+            p["late_completion_result"] = "RESTANTE_ABAIXO_DO_MINIMO"
+            save(self.s)
+            return False
+
+        # Se somente a direcional executou, nao compra a oposta quando isso
+        # pioraria a expectativa pelo proprio book. Nos demais casos, completar
+        # a proporcao reduz a exposicao acidental da perna errada.
+        d_spent = D(p.get("directional_spent", "0") or "0")
+        o_spent = D(p.get("opposite_spent", "0") or "0")
+        qd_raw = token_best_ask(p.get("directional_token"))
+        qo_raw = token_best_ask(p.get("opposite_token"))
+        qd = D(qd_raw if qd_raw is not None else "0.5")
+        qo = D(qo_raw if qo_raw is not None else "0.5")
+        qsum = qd + qo
+        if qsum > 0:
+            qd, qo = qd / qsum, qo / qsum
+        spent = d_spent + o_spent
+        ev_before = qd * d_fill + qo * o_fill - spent
+        nd = d_fill + (needed if lag == "directional" else D("0"))
+        no = o_fill + (needed if lag == "opposite" else D("0"))
+        ev_after = qd * nd + qo * no - spent - needed * rescue_price
+        if lead == "directional" and o_fill <= 0 and ev_after < ev_before:
+            p["late_completion_result"] = "DIRECIONAL_PARCIAL_MATEMATICAMENTE_MELHOR_SOZINHA"
+            p["late_completion_ev_before"] = str(ev_before)
+            p["late_completion_ev_after"] = str(ev_after)
+            p["late_completion_stopped"] = True
+            save(self.s)
+            log.warning("%s | T-5 MANTENDO DIRECIONAL PARCIAL | EV=%s > EV_COM_HEDGE=%s", st["name"], ev_before, ev_after)
+            return False
+
+        # Uma GTC pode executar em varios pedacos. Enquanto a ordem atual ainda
+        # cobre exatamente o restante calculado, ela permanece pendente. Se o
+        # ask subir, cancela e reposiciona somente o saldo necessario, ate 0.65.
+        active_leg = p.get("late_completion_leg")
+        active_oid = p.get(f"{active_leg}_order_id") if active_leg else None
+        active_limit = D(p.get("late_completion_price", "0") or "0")
+        if active_oid and active_leg == lag and active_limit >= rescue_price:
+            p["late_completion_remaining_shares"] = str(needed)
+            p["late_completion_result"] = "GTC_PENDENTE_AGUARDANDO_FILLS_PARCIAIS"
+            save(self.s)
+            return True
+
+        if active_oid:
+            last_reprice = float(p.get("late_completion_last_reprice_epoch") or 0)
+            if time.time() - last_reprice < LATE_REPRICE_SECONDS:
+                return True
+            self.cancel_leg(p, active_leg)
+            if LIVE:
+                self.refresh_fills(p)
+            # Recalcula o restante depois do cancelamento, incluindo qualquer
+            # fill que tenha ocorrido durante a chamada de cancelamento.
+            lag_fill = D(p.get(f"{lag}_shares_filled", "0") or "0")
+            needed = floor_6(max(D("0"), target_total - lag_fill))
+            if needed < min_shares:
+                p["late_completion_result"] = "RESTANTE_ABAIXO_DO_MINIMO_APOS_FILL"
+                save(self.s)
+                return False
+
+        try:
+            resp = self.place_gtc_limit(
+                p[f"{lag}_token"], rescue_price, needed,
+                hard_cap=SINGLE_LEG_RESCUE_MAX_PRICE,
             )
-            return bool(oid)
-        except Exception as exc:
-            p["single_leg_rescue_done"] = True
-            p["single_leg_rescue_result"] = repr(exc)
+            oid = order_id_of(resp)
+            if not oid:
+                raise RuntimeError(rejected_reason(resp) or "GTC sem order_id")
+            p[f"{lag}_order_id"] = str(oid)
+            p.setdefault(f"{lag}_order_ids", []).append(str(oid))
+            p["late_completion_result"] = "GTC_PENDENTE_ENVIADA"
+            p["late_completion_leg"] = lag
+            p["late_completion_price"] = str(rescue_price)
+            p["late_completion_shares"] = str(needed)
+            p["late_completion_remaining_shares"] = str(needed)
+            p["late_completion_last_reprice_epoch"] = time.time()
+            p["late_completion_ev_before"] = str(ev_before)
+            p["late_completion_ev_after"] = str(ev_after)
             save(self.s)
-            log.exception("%s | FALHA RESGATE DA SEGUNDA PERNA FOK", st["name"])
+            log.warning("%s | T-5 COMPLEMENTO GTC | frente=%s faltante=%s shares=%s limit=%s order=%s | pode preencher em varias partes", st["name"], lead, lag, needed, rescue_price, oid)
+            return True
+        except Exception as exc:
+            p["late_completion_result"] = f"ERRO:{exc!r}"
+            save(self.s)
+            log.exception("%s | T-5 FALHA AO COMPLETAR PERNA", st["name"])
             return False
 
     def cancel_ids(self, ids):
@@ -3599,9 +3704,8 @@ class Bot:
         if not m:
             return
 
-        prices = m.get("price_map", {})
-        dp = prices.get(p["directional_side"])
-        op = prices.get(p["opposite_side"])
+        dp = token_best_ask(p.get("directional_token"))
+        op = token_best_ask(p.get("opposite_token"))
         max_limit_price = D(p["limit_price"])
 
         # Sem preco direcional <= teto nao existe entrada em nenhum dos modos.
@@ -3940,10 +4044,18 @@ class Bot:
 
     def retry_missing_order(self, p):
         """
-        V54: repete FOK em intervalos controlados. Cada tentativa executa tudo
-        ou zero; nenhuma ordem fica pendente e nao ha fill parcial novo.
+        V57: recria somente uma GTC que tenha sido rejeitada, revalidando o
+        book antes do envio. Nunca recria ordens depois da decisao do T-5.
         """
-        if not LIVE:
+        if not LIVE or p.get("late_completion_initialized"):
+            return
+
+        dp = token_best_ask(p.get("directional_token"))
+        op = token_best_ask(p.get("opposite_token"))
+        cap = D(p.get("limit_price") or MAX_BUY_PRICE)
+        if dp is None or D(dp) > cap:
+            return
+        if p.get("execution_mode") == "pair" and (op is None or D(op) > cap):
             return
 
         for leg in ("directional", "opposite"):
@@ -3976,7 +4088,7 @@ class Bot:
                     p.setdefault(f"{leg}_order_ids", []).append(str(oid))
                     p[f"{leg}_error"] = None
                     log.warning(
-                        "%s | FOK perna=%s enviada | tentativa=%s/%s | order=%s",
+                        "%s | GTC perna=%s recriada | tentativa=%s/%s | order=%s",
                         p["strategy"],
                         leg,
                         p[attempts_key],
@@ -4032,7 +4144,8 @@ class Bot:
         # se executar, acompanha a posicao ate a resolucao.
         if p.get("execution_mode") == "directional_only":
             if now < round_start:
-                if dsh > 0:
+                dreq = D(p.get("directional_shares_requested", "0") or "0")
+                if dreq > 0 and dsh >= dreq - D("0.000001"):
                     self.cancel_ids([p.get("directional_order_id")])
                     if LIVE:
                         self.refresh_fills(p)
@@ -4092,22 +4205,23 @@ class Bot:
             save(self.s)
             return
 
-        # Ajuste matematico de fills parciais.
-        # Ex.: 40% de uma perna => a outra passa a buscar 40% do tamanho original.
-        # Se uma perna estiver 100%, a outra continua buscando 100%.
-        if dsh > 0 or osh > 0:
-            if self.rebalance_partial_pair(st, p):
-                return
-
         # Se faltou criar uma ordem por erro, tenta novamente.
         if p.get("phase") == "orders_active" and (
             not p.get("directional_order_id") or not p.get("opposite_order_id")
         ):
             self.retry_missing_order(p)
 
-        # Antes do inicio: se ambos ja tiveram fill, encerra a janela cedo.
+        # Antes do inicio as GTC permanecem abertas. Somente um preenchimento
+        # integral das duas pernas encerra cedo; parcial e tratado no T-5.
         if now < round_start:
-            if dsh > 0 and osh > 0:
+            self.complete_partial_pair_gtc(st, p, now)
+            if LIVE:
+                self.refresh_fills(p)
+            dsh = D(p.get("directional_shares_filled", "0"))
+            osh = D(p.get("opposite_shares_filled", "0"))
+            dreq = D(p.get("directional_shares_requested", "0") or "0")
+            oreq = D(p.get("opposite_shares_requested", "0") or "0")
+            if dreq > 0 and oreq > 0 and dsh >= dreq - D("0.000001") and osh >= oreq - D("0.000001"):
                 self.cancel_ids([
                     p.get("directional_order_id"),
                     p.get("opposite_order_id"),
@@ -4120,6 +4234,26 @@ class Bot:
                 log.info("%s | PAR EXECUTADO ANTES DO INICIO", st["name"])
             else:
                 save(self.s)
+            return
+
+        # No boundary nenhuma compra nova e permitida. Cancela toda sobra,
+        # consolida os fills efetivos e acompanha somente o que foi executado.
+        if now < round_end:
+            self.cancel_ids([p.get("directional_order_id"), p.get("opposite_order_id")])
+            if LIVE:
+                self.refresh_fills(p)
+            dsh = D(p.get("directional_shares_filled", "0"))
+            osh = D(p.get("opposite_shares_filled", "0"))
+            if dsh <= 0 and osh <= 0:
+                audit({"type": "round_discarded_no_fill_at_start", "strategy": st["name"], "slug": p["slug"], "ts": now.isoformat()})
+                st["pending"] = None
+            else:
+                p["phase"] = "await_resolution"
+                p["pair_complete"] = bool(dsh > 0 and osh > 0)
+                p["final_directional_shares"] = str(dsh)
+                p["final_opposite_shares"] = str(osh)
+                log.info("%s | ENTRY FECHADA NO INICIO | DIR=%s OPP=%s | par=%s", st["name"], dsh, osh, p["pair_complete"])
+            save(self.s)
             return
 
         # Do inicio ate o fim.
@@ -4889,10 +5023,10 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction, recovery_preview)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=56 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | RESET_TOTAL_UNICO=V34_PRESERVADO | AUTO_RESET_RECOVERY_SEM_CAIXA=%s | NEWS_INIT_CORRIGIDO=SIM | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", AUTO_RESET_UNFUNDED_RECOVERY, ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=58 | EXECUCAO=GTC_PENDENTE_BOOK_REAL_060+COMPLEMENTOS_PARCIAIS_MATEMATICOS_T5_065 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | RESET_TOTAL_UNICO=V34_PRESERVADO | AUTO_RESET_RECOVERY_SEM_CAIXA=%s | NEWS_INIT_CORRIGIDO=SIM | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", AUTO_RESET_UNFUNDED_RECOVERY, ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC+ETH+HYPE V54 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE=RD_FINANCEIRO_EXATO | SEGUNDA_PERNA=FOK_ADAPTATIVO | RESGATE=DIRETO_AMBOS_OUTCOMES | RESOLUCAO=CHAINLINK+SALDO+GAMMA+CLOB | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
+            "POLYMARKET BTC+ETH+HYPE V58 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE=RD_FINANCEIRO_EXATO | ENTRY=GTC_BOOK_060 | SEGUNDA_PERNA=T5_GTC_PARCIAL_RECALCULADO_ATE_065 | RESGATE_TOKEN=DIRETO_AMBOS_OUTCOMES | RESOLUCAO=CHAINLINK+SALDO+GAMMA+CLOB | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
             "ATIVOS=BTC+ETH+HYPE | 18_ROBOS | BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
