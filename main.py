@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# V58 - ORDENS GTC 0.60 + COMPLEMENTOS PARCIAIS MATEMATICOS T-5 ATE 0.65
+# V61 - LUCRO DIRECIONAL + PROTECAO OPOSTA MINIMA + GTC 0.60/0.65
 # - inicia os 6 robos em bankroll 12, loss_streak 0 e recovery_deficit 0
 # - zera estatisticas logicas antigas (wins/losses/trades/realized_pnl/last_trigger)
 # - reset e aplicado uma unica vez e somente sem pending ativo
@@ -28,7 +28,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC+ETH+HYPE V58 - GTC 0.60 + COMPLEMENTO T-5 0.65 + PNL REAL
+# POLYMARKET BTC+ETH+HYPE V61 - ALVO NA PONTA DIRECIONAL
 # - resultado operacional das rodadas BTC pelo feed Chainlink live da Polymarket em segundos apos o boundary
 # - Gamma/CLOB e saldo de auto-redeem permanecem como redundancia/fallback
 #
@@ -202,6 +202,8 @@ POLL_SECONDS = float(os.getenv("POLL_SECONDS", "0.5"))
 MAX_BUY_PRICE = Decimal(os.getenv("MAX_BUY_PRICE", "0.60"))
 MIN_LEG_USD = Decimal(os.getenv("MIN_LEG_USD", "1.00"))  # minimo nominal por ponta
 MIN_PAIR_GUARANTEED_PROFIT_USD = Decimal(os.getenv("MIN_PAIR_GUARANTEED_PROFIT_USD", "0.05"))
+PAIR_MAX_COMBINED_PRICE = Decimal(os.getenv("PAIR_MAX_COMBINED_PRICE", "1.00"))
+PAIR_FEE_RESERVE_PCT = Decimal(os.getenv("PAIR_FEE_RESERVE_PCT", "0.02"))
 FOK_RETRY_SECONDS = float(os.getenv("FOK_RETRY_SECONDS", "2"))
 FOK_MAX_ATTEMPTS_PER_LEG = int(os.getenv("FOK_MAX_ATTEMPTS_PER_LEG", "15"))
 ACCOUNT_STARTING_CAPITAL_USD = Decimal(os.getenv("ACCOUNT_STARTING_CAPITAL_USD", "0"))
@@ -420,7 +422,7 @@ def strategy_name(asset, tf, session):
 
 def fresh():
     s = {
-        "version": 58,
+        "version": 61,
         "strategies": {},
         "maintenance": {
             "applied_resets": [],
@@ -1672,7 +1674,8 @@ def binance_round_resolution_probability(tf, round_start, round_end, asset="BTC"
 
 def sizing(st, directional_min_shares, opposite_min_shares, directional_limit_price, opposite_limit_price, recovery_deficit_override=None):
     """
-    V44 PAR: piso nominal de US$1 por ponta + minimo do ORDERBOOK do token.
+    V61: a ponta oposta e somente protecao minima. O tamanho adicional fica
+    exclusivamente na direcional, garantindo o alvo se a direcional vencer.
 
     O minimo de shares agora e individual para cada token; nao usamos mais o
     `mos` condition-level como piso primario quando /book esta disponivel.
@@ -1682,38 +1685,62 @@ def sizing(st, directional_min_shares, opposite_min_shares, directional_limit_pr
     dir_market_min = max(D("0"), D(directional_min_shares or 0))
     opp_market_min = max(D("0"), D(opposite_min_shares or 0))
     if pd <= 0 or pd >= 1 or po <= 0 or po >= 1:
-        raise ValueError("precos invalidos para sizing V44")
+        raise ValueError("precos invalidos para sizing V61")
 
     base, deficit, target = recovery_target(st, recovery_deficit_override)
+    combined_price = pd + po
     opposite_nominal_min = ceil_6(MIN_LEG_USD / po)
-    opposite_shares = max(opposite_nominal_min, opp_market_min)
-    opposite_max_spend = opposite_shares * po
-
-    shares_for_target = ceil_6((target + opposite_max_spend) / (D("1") - pd))
     directional_nominal_min = ceil_6(MIN_LEG_USD / pd)
-    directional_shares = max(shares_for_target, directional_nominal_min, dir_market_min)
 
+    # Lucro se a direcional vencer:
+    #   qd - (pd*qd + po*qo) * (1 + reserva) >= alvo
+    # A protecao oposta usa somente o minimo nominal/book. Resolvemos a
+    # desigualdade acima para obter a MENOR quantidade direcional suficiente.
+    fee_factor = D("1") + PAIR_FEE_RESERVE_PCT
+    directional_edge_after_fee = D("1") - pd * fee_factor
+    opposite_shares = max(opposite_nominal_min, opp_market_min)
+    if directional_edge_after_fee > 0:
+        directional_for_target = ceil_6(
+            (target + po * opposite_shares * fee_factor) / directional_edge_after_fee
+        )
+    else:
+        directional_for_target = D("0")
+    directional_shares = max(
+        directional_for_target, directional_nominal_min, dir_market_min
+    )
     directional_max_spend = directional_shares * pd
-    guaranteed_net_at_limit = directional_shares - directional_max_spend - opposite_max_spend
+    opposite_max_spend = opposite_shares * po
+    total_max_spend = directional_max_spend + opposite_max_spend
+    fee_reserve = total_max_spend * PAIR_FEE_RESERVE_PCT
+    directional_payout = directional_shares
+    directional_net_at_limit = directional_payout - total_max_spend - fee_reserve
+    opposite_net_at_limit = opposite_shares - total_max_spend - fee_reserve
 
     blocked = None
     if dir_market_min <= 0 or opp_market_min <= 0:
         blocked = "TOKEN_BOOK_MIN_UNAVAILABLE"
+    elif directional_edge_after_fee <= 0:
+        blocked = "DIRECTIONAL_PRICE_HAS_NO_EDGE_AFTER_FEES"
     elif opposite_max_spend > MAX_ENTRY or directional_max_spend > MAX_ENTRY:
         blocked = "MAX_ENTRY"
-    elif guaranteed_net_at_limit < target:
-        blocked = "TARGET_NOT_GUARANTEED"
-    elif guaranteed_net_at_limit < MIN_PAIR_GUARANTEED_PROFIT_USD:
-        blocked = "PAIR_PROFIT_BELOW_MINIMUM"
+    elif directional_net_at_limit < target:
+        blocked = "DIRECTIONAL_TARGET_NOT_GUARANTEED"
 
     return {
         "blocked": bool(blocked), "reason": blocked, "base_profit": base,
         "recovery_deficit": deficit, "target_net_profit": target,
         "opposite_shares": opposite_shares, "directional_shares": directional_shares,
         "opposite_max_spend": opposite_max_spend, "directional_max_spend": directional_max_spend,
-        "guaranteed_net_at_limit": guaranteed_net_at_limit, "edge": target,
+        "guaranteed_net_at_limit": directional_net_at_limit, "edge": target,
         "martingale_base_edge": base, "directional_limit_price": pd,
         "opposite_limit_price": po, "minimum_leg_usd": MIN_LEG_USD,
+        "combined_price": combined_price,
+        "fee_reserve": fee_reserve,
+        "fee_reserve_pct": PAIR_FEE_RESERVE_PCT,
+        "directional_payout": directional_payout,
+        "directional_net_at_limit": directional_net_at_limit,
+        "opposite_net_at_limit": opposite_net_at_limit,
+        "directional_edge_after_fee": directional_edge_after_fee,
         "directional_market_min_shares": dir_market_min,
         "opposite_market_min_shares": opp_market_min,
         "opposite_nominal_min_shares": opposite_nominal_min,
@@ -3110,15 +3137,153 @@ class Bot:
             save(self.s)
             return False
 
+        # V61: o objetivo economico e exclusivamente a vitoria DIRECIONAL.
+        # A ponta oposta ja comprada e tratada como protecao; nunca aumentamos
+        # essa ponta no T-5, pois isso reduziria o lucro direcional. Calculamos
+        # apenas quantos shares DIRECIONAIS ainda faltam para que seu payout
+        # pague custo realizado + reserva de taxas + lucro-alvo.
+        target_profit = D(
+            p.get("target_net_profit")
+            or p.get("guaranteed_net_at_limit")
+            or MIN_PAIR_GUARANTEED_PROFIT_USD
+        )
+        fee_factor = D("1") + PAIR_FEE_RESERVE_PCT
+        spent = D(p.get("directional_spent", "0") or "0") + D(p.get("opposite_spent", "0") or "0")
+        current_directional_net = d_fill - spent * fee_factor
+        p["late_completion_current_directional_net"] = str(current_directional_net)
+        p["late_completion_target_directional_net"] = str(target_profit)
+
+        if current_directional_net >= target_profit:
+            self.cancel_ids([p.get("directional_order_id"), p.get("opposite_order_id")])
+            p["directional_order_id"] = None
+            p["opposite_order_id"] = None
+            p["late_completion_result"] = "ALVO_DIRECIONAL_JA_GARANTIDO"
+            p["late_completion_stopped"] = True
+            save(self.s)
+            log.info(
+                "%s | T-5 ALVO DIRECIONAL JA COBERTO | lucro_dir=%s alvo=%s | nenhuma compra adicional",
+                st["name"], current_directional_net, target_profit,
+            )
+            return False
+
+        px = token_best_ask(p.get("directional_token"))
+        if px is None or D(px) > SINGLE_LEG_RESCUE_MAX_PRICE:
+            p["late_completion_result"] = "BOOK_DIRECIONAL_ACIMA_065_OU_INDISPONIVEL"
+            save(self.s)
+            log.warning(
+                "%s | T-5 AGUARDANDO DIRECIONAL | book=%s teto=%s",
+                st["name"], px, SINGLE_LEG_RESCUE_MAX_PRICE,
+            )
+            return False
+
+        tick = D(p.get("tick_size") or "0.01")
+        rescue_price = min(ceil_to_step(D(px), tick), SINGLE_LEG_RESCUE_MAX_PRICE)
+        incremental_edge = D("1") - rescue_price * fee_factor
+        if incremental_edge <= 0:
+            p["late_completion_result"] = "DIRECIONAL_SEM_EDGE_APOS_TAXAS"
+            p["late_completion_stopped"] = True
+            save(self.s)
+            return False
+
+        needed = ceil_6((target_profit - current_directional_net) / incremental_edge)
+        min_shares = max(
+            ceil_6(MIN_LEG_USD / rescue_price),
+            D(p.get("directional_min_order_shares") or p.get("minimum_order_shares") or 0),
+        )
+        needed = max(needed, min_shares)
+        additional_spend = needed * rescue_price
+        projected_spent = spent + additional_spend
+        projected_directional_payout = d_fill + needed
+        projected_directional_net = projected_directional_payout - projected_spent * fee_factor
+
+        if additional_spend > MAX_ENTRY or projected_directional_net < target_profit:
+            p["late_completion_result"] = "COMPLEMENTO_DIRECIONAL_BLOQUEADO"
+            p["late_completion_projected_spent"] = str(projected_spent)
+            p["late_completion_projected_directional_net"] = str(projected_directional_net)
+            p["late_completion_stopped"] = True
+            save(self.s)
+            return False
+
+        cash = logical_cash_snapshot(st)
+        if additional_spend > cash["free"]:
+            p["late_completion_result"] = "SEM_CAIXA_PARA_COMPLEMENTO_DIRECIONAL"
+            p["late_completion_required_cash"] = str(additional_spend)
+            p["late_completion_free_cash"] = str(cash["free"])
+            save(self.s)
+            return False
+
+        active_oid = p.get("directional_order_id")
+        active_limit = D(p.get("late_completion_price", "0") or "0")
+        if active_oid and p.get("late_completion_leg") == "directional" and active_limit >= rescue_price:
+            p["late_completion_remaining_shares"] = str(needed)
+            p["late_completion_result"] = "GTC_DIRECIONAL_PENDENTE"
+            save(self.s)
+            return True
+
+        if active_oid:
+            last_reprice = float(p.get("late_completion_last_reprice_epoch") or 0)
+            if time.time() - last_reprice < LATE_REPRICE_SECONDS:
+                return True
+            self.cancel_leg(p, "directional")
+            if LIVE:
+                self.refresh_fills(p)
+
+        try:
+            resp = self.place_gtc_limit(
+                p["directional_token"], rescue_price, needed,
+                hard_cap=SINGLE_LEG_RESCUE_MAX_PRICE,
+            )
+            oid = order_id_of(resp)
+            if not oid:
+                raise RuntimeError(rejected_reason(resp) or "GTC direcional sem order_id")
+            p["directional_order_id"] = str(oid)
+            p.setdefault("directional_order_ids", []).append(str(oid))
+            p["late_completion_result"] = "GTC_DIRECIONAL_ENVIADA"
+            p["late_completion_leg"] = "directional"
+            p["late_completion_price"] = str(rescue_price)
+            p["late_completion_shares"] = str(needed)
+            p["late_completion_remaining_shares"] = str(needed)
+            p["late_completion_last_reprice_epoch"] = time.time()
+            p["late_completion_projected_spent"] = str(projected_spent)
+            p["late_completion_projected_directional_net"] = str(projected_directional_net)
+            save(self.s)
+            log.warning(
+                "%s | T-5 COMPLEMENTO DIRECIONAL GTC | shares=%s limit=%s order=%s | lucro_dir_projetado=%s alvo=%s",
+                st["name"], needed, rescue_price, oid, projected_directional_net, target_profit,
+            )
+            return True
+        except Exception as exc:
+            p["late_completion_result"] = f"ERRO_DIRECIONAL:{exc!r}"
+            save(self.s)
+            log.exception("%s | T-5 FALHA NO COMPLEMENTO DIRECIONAL", st["name"])
+            return False
+
         fd = min(D("1"), d_fill / d_req)
         fo = min(D("1"), o_fill / o_req)
         if abs(fd - fo) <= D("0.000001"):
             self.cancel_ids([p.get("directional_order_id"), p.get("opposite_order_id")])
             p["directional_order_id"] = None
             p["opposite_order_id"] = None
-            p["late_completion_result"] = "PROPORCAO_IDEAL_ATINGIDA"
+            actual_spent = D(p.get("directional_spent", "0") or "0") + D(p.get("opposite_spent", "0") or "0")
+            actual_payout = min(d_fill, o_fill)
+            actual_fee_reserve = actual_spent * PAIR_FEE_RESERVE_PCT
+            actual_net = actual_payout - actual_spent - actual_fee_reserve
+            p["late_completion_result"] = (
+                "PROPORCAO_IDEAL_E_LUCRO_SEGURO"
+                if actual_net >= MIN_PAIR_GUARANTEED_PROFIT_USD
+                else "PAR_PREENCHIDO_COM_PREJUIZO_ESTRUTURAL_DETECTADO"
+            )
+            p["actual_pair_worst_payout"] = str(actual_payout)
+            p["actual_pair_total_spent"] = str(actual_spent)
+            p["actual_pair_fee_reserve"] = str(actual_fee_reserve)
+            p["actual_pair_guaranteed_net"] = str(actual_net)
             p["late_completion_stopped"] = True
             save(self.s)
+            if actual_net < MIN_PAIR_GUARANTEED_PROFIT_USD:
+                log.critical(
+                    "%s | ALERTA PAR JA EXECUTADO COM PERDA ESTRUTURAL | payout=%s custo=%s reserva=%s liquido=%s",
+                    st["name"], actual_payout, actual_spent, actual_fee_reserve, actual_net,
+                )
             return False
 
         if fd > fo:
@@ -3164,7 +3329,32 @@ class Bot:
         ev_before = qd * d_fill + qo * o_fill - spent
         nd = d_fill + (needed if lag == "directional" else D("0"))
         no = o_fill + (needed if lag == "opposite" else D("0"))
-        ev_after = qd * nd + qo * no - spent - needed * rescue_price
+        projected_spent = spent + needed * rescue_price
+        projected_fee_reserve = projected_spent * PAIR_FEE_RESERVE_PCT
+        projected_worst_payout = min(nd, no)
+        projected_guaranteed_net = projected_worst_payout - projected_spent - projected_fee_reserve
+        ev_after = qd * nd + qo * no - projected_spent
+
+        # Trava absoluta V60: nunca transforma um fill parcial em um par cujo
+        # payout maximo do pior lado seja menor que custo + reserva de taxas.
+        if projected_guaranteed_net < MIN_PAIR_GUARANTEED_PROFIT_USD:
+            self.cancel_ids([p.get("directional_order_id"), p.get("opposite_order_id")])
+            p["directional_order_id"] = None
+            p["opposite_order_id"] = None
+            p["late_completion_result"] = "COMPLEMENTO_PROIBIDO_POR_PREJUIZO_GARANTIDO"
+            p["late_completion_projected_spent"] = str(projected_spent)
+            p["late_completion_projected_payout"] = str(projected_worst_payout)
+            p["late_completion_projected_fee_reserve"] = str(projected_fee_reserve)
+            p["late_completion_projected_guaranteed_net"] = str(projected_guaranteed_net)
+            p["late_completion_stopped"] = True
+            save(self.s)
+            log.error(
+                "%s | COMPLEMENTO BLOQUEADO PARA EVITAR PERDA CERTA | payout=%s custo=%s reserva_taxa=%s liquido=%s minimo=%s",
+                st["name"], projected_worst_payout, projected_spent,
+                projected_fee_reserve, projected_guaranteed_net,
+                MIN_PAIR_GUARANTEED_PROFIT_USD,
+            )
+            return False
         if lead == "directional" and o_fill <= 0 and ev_after < ev_before:
             p["late_completion_result"] = "DIRECIONAL_PARCIAL_MATEMATICAMENTE_MELHOR_SOZINHA"
             p["late_completion_ev_before"] = str(ev_before)
@@ -3796,6 +3986,8 @@ class Bot:
         if opp_limit > max_limit_price:
             return
 
+        combined_limit = dir_limit + opp_limit
+
         min_pair_capital = (dir_min_shares * dir_limit) + (opp_min_shares * opp_limit)
         single_switch_threshold = max(MIN_LEG_USD, min_pair_capital)
         p["single_leg_switch_threshold"] = str(single_switch_threshold)
@@ -3851,6 +4043,7 @@ class Bot:
             p["directional_shares_requested"] = str(sz["directional_shares"])
             p["opposite_shares_requested"] = "0"
             p["guaranteed_net_at_limit"] = str(sz["guaranteed_net_at_limit"])
+            p["target_net_profit"] = str(sz["target_net_profit"])
             p["edge_at_limit"] = str(sz["edge"])
             save(self.s)
 
@@ -3921,39 +4114,47 @@ class Bot:
         total_spend = pair_total
         if sz.get("blocked"):
             log.warning(
-                "%s | BLOQUEADO V37 PAR | motivo=%s | DIR_LIMIT=%s | OPP_LIMIT=%s | base=%s | deficit=%s | target=%s",
+                "%s | PAR AINDA NAO CABE MATEMATICAMENTE | motivo=%s | DIR_LIMIT=%s | OPP_LIMIT=%s | base=%s | deficit=%s | target=%s | aguardando book melhorar",
                 st["name"], sz.get("reason"), dir_limit, opp_limit, sz["base_profit"],
                 sz["recovery_deficit"], sz["target_net_profit"],
+            )
+            p["last_wait_log"] = time.time()
+            save(self.s)
+            return
+        if D(sz.get("directional_net_at_limit") or 0) < D(sz.get("target_net_profit") or 0):
+            log.warning(
+                "%s | ENTRADA BLOQUEADA SEM ALVO DIRECIONAL | lucro_direcional=%s < alvo=%s | gasto=%s",
+                st["name"], sz.get("directional_net_at_limit"),
+                sz.get("target_net_profit"), total_spend,
+            )
+            p["last_wait_log"] = time.time()
+            save(self.s)
+            return
+        # Defesa redundante imediatamente antes do envio: a ponta direcional
+        # deve pagar todo o custo, a reserva e o lucro-alvo. A oposta e hedge.
+        preflight_dsh = D(sz.get("directional_shares") or 0)
+        preflight_osh = D(sz.get("opposite_shares") or 0)
+        preflight_cost = preflight_dsh * dir_limit + preflight_osh * opp_limit
+        preflight_payout = preflight_dsh
+        preflight_fee = preflight_cost * PAIR_FEE_RESERVE_PCT
+        preflight_net = preflight_payout - preflight_cost - preflight_fee
+        if preflight_net < D(sz.get("target_net_profit") or 0):
+            log.critical(
+                "%s | PREFLIGHT BLOQUEOU ALVO DIRECIONAL | DIR_SH=%s OPP_SH=%s payout_dir=%s custo=%s reserva=%s lucro_dir=%s alvo=%s",
+                st["name"], preflight_dsh, preflight_osh, preflight_payout,
+                preflight_cost, preflight_fee, preflight_net, sz.get("target_net_profit"),
             )
             st["pending"] = None
             save(self.s)
             return
-        if D(sz.get("guaranteed_net_at_limit") or 0) < MIN_PAIR_GUARANTEED_PROFIT_USD:
-            log.warning(
-                "%s | PAR BLOQUEADO SEM LUCRO | lucro_direcional_garantido=%s < minimo=%s | gasto=%s",
-                st["name"], sz.get("guaranteed_net_at_limit"),
-                MIN_PAIR_GUARANTEED_PROFIT_USD, total_spend,
-            )
-            if not self.reset_unfunded_recovery(
-                st, f"PAIR_SIZING_{sz.get('reason')}",
-                required_spend=total_spend,
-                free_cash=logical_cash_snapshot(st)["free"],
-            ):
-                st["pending"] = None
-                save(self.s)
-            return
         cash = logical_cash_snapshot(st)
         if total_spend > cash["free"]:
             log.warning(
-                "%s | BLOQUEADO V45 PAR | gasto=%s > caixa_livre=%s | equity=%s | comprometido=%s | SEM_FALLBACK_DIRECIONAL | deficit=%s | target=%s",
+                "%s | PAR MATEMATICO AGUARDANDO BOOK MAIS BARATO | gasto_necessario=%s > caixa_livre=%s | equity=%s | comprometido=%s | SEM_FALLBACK_DIRECIONAL | deficit=%s | target=%s",
                 st["name"], total_spend, cash["free"], cash["equity"], cash["committed"], sz["recovery_deficit"], sz["target_net_profit"],
             )
-            if not self.reset_unfunded_recovery(
-                st, "PAIR_REQUIRED_SPEND_EXCEEDS_FREE_CASH",
-                required_spend=total_spend, free_cash=cash["free"],
-            ):
-                st["pending"] = None
-                save(self.s)
+            p["last_wait_log"] = time.time()
+            save(self.s)
             return
 
         p["execution_mode"] = "pair"
@@ -3963,15 +4164,16 @@ class Bot:
         p["directional_shares_requested"] = str(sz["directional_shares"])
         p["opposite_shares_requested"] = str(sz["opposite_shares"])
         p["guaranteed_net_at_limit"] = str(sz["guaranteed_net_at_limit"])
+        p["target_net_profit"] = str(sz["target_net_profit"])
         p["edge_at_limit"] = str(sz["edge"])
         save(self.s)
 
         log.info(
-            "%s | SIZING V44 PAR-US$1+TOKEN-BOOK | DIR_MIN=%s | OPP_MIN=%s | FONTE_MIN=%s | MIN_USD_PONTA=%s | DIR_PX=%s | OPP_PX=%s | BASE=%s | DEFICIT=%s | TARGET_LIQUIDO=%s | DIR_SHARES=%s | OPP_SHARES=%s | GASTO_MAX=%s | LUCRO_MIN=%s",
-            st["name"], p.get("directional_min_order_shares"), p.get("opposite_min_order_shares"), p.get("minimum_order_source"), dir_min_notional, dir_limit, opp_limit,
-            sz["base_profit"], sz["recovery_deficit"], sz["target_net_profit"],
+            "%s | SIZING V61 LUCRO-DIRECIONAL | DIR_MIN=%s | OPP_MIN=%s | FONTE_MIN=%s | DIR_PX=%s | OPP_PX=%s | SOMA_PRECOS=%s | TAXA_RESERVA=%s | PAYOUT_DIRECIONAL=%s | DIR_SHARES=%s | OPP_SHARES_PROTECAO=%s | GASTO_MAX=%s | LUCRO_SE_DIRECIONAL_VENCER=%s | RESULTADO_SE_OPOSTA_VENCER=%s",
+            st["name"], p.get("directional_min_order_shares"), p.get("opposite_min_order_shares"), p.get("minimum_order_source"), dir_limit, opp_limit,
+            sz["combined_price"], sz["fee_reserve"], sz["directional_payout"],
             sz["directional_shares"], sz["opposite_shares"], total_spend,
-            sz["guaranteed_net_at_limit"],
+            sz["directional_net_at_limit"], sz["opposite_net_at_limit"],
         )
         log.info(
             "%s | CONDICAO DE PRECO OK | modo=PAR | DIR=%s OPP=%s | enviando par",
@@ -5023,15 +5225,16 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction, recovery_preview)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=58 | EXECUCAO=GTC_PENDENTE_BOOK_REAL_060+COMPLEMENTOS_PARCIAIS_MATEMATICOS_T5_065 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | RESET_TOTAL_UNICO=V34_PRESERVADO | AUTO_RESET_RECOVERY_SEM_CAIXA=%s | NEWS_INIT_CORRIGIDO=SIM | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", AUTO_RESET_UNFUNDED_RECOVERY, ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=61 | OBJETIVO=LUCRO_EXCLUSIVO_NA_PONTA_DIRECIONAL | INVARIANTE=SHARES_DIR-CUSTO_TOTAL-RESERVA_TAXAS>=ALVO | PROTECAO_OPPOSTA=MINIMA | SIZING=DINAMICO_POR_PRECO+ALVO+CAIXA | EXECUCAO_NORMAL=GTC_MAX_060 | T5=COMPLEMENTA_SOMENTE_DIRECIONAL_MAX_065 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | AUTO_RESET_RECOVERY_SEM_CAIXA=%s | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | NEWS_FAIL_OPEN=%s", AUTO_RESET_UNFUNDED_RECOVERY, ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC+ETH+HYPE V58 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE=RD_FINANCEIRO_EXATO | ENTRY=GTC_BOOK_060 | SEGUNDA_PERNA=T5_GTC_PARCIAL_RECALCULADO_ATE_065 | RESGATE_TOKEN=DIRETO_AMBOS_OUTCOMES | RESOLUCAO=CHAINLINK+SALDO+GAMMA+CLOB | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
+            "POLYMARKET BTC+ETH+HYPE V61 FINAL | LUCRO=EXCLUSIVO_DIRECIONAL | ENTRY=GTC_BOOK_060 | FEE_RESERVE=%s | T5=SO_DIRECIONAL_ATE_065 | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
             "ATIVOS=BTC+ETH+HYPE | 18_ROBOS | BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
             "DAY=SEG-SEX_10-16_BRT | NEWS=US_HIGH_3ESTRELAS_RESILIENTE | NEWS_5M15M=+-15M | NEWS_1H=+-60M | "
             "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO+FASTPATH_REDEEM_UNICO | CHAINLINK_RESULT=BTC_ETH_HYPE_TWAP_5M15M<=4MIN+BINANCE_HOURLY<=4MIN | MARTINGALE=DEFICIT_ACUMULADO+BASE | SIZING=USD1_POR_PONTA+AUTO_DIRECIONAL_ONLY | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
+            PAIR_FEE_RESERVE_PCT,
             LIVE,
             gasless_mode,
             INITIAL,
@@ -5091,7 +5294,7 @@ class Bot:
                     self.s, bal.get("balance"), token_mtm
                 )
                 log.info(
-                    "HEARTBEAT V56 | LIVE=%s | wallet_cash_usd=%s | capital_em_tokens_custo=%s | "
+                    "HEARTBEAT V61 | LIVE=%s | wallet_cash_usd=%s | capital_em_tokens_custo=%s | "
                     "tokens_valor_atual=%s | patrimonio_real=%s | capital_inicial_real=%s | pnl_real_conta=%s | "
                     "pnl_realizado_logico=%s | wins=%s | losses=%s | "
                     "withdrawn_applied=%s | %s",
