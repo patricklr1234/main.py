@@ -418,7 +418,7 @@ def strategy_name(asset, tf, session):
 
 def fresh():
     s = {
-        "version": 55,
+        "version": 56,
         "strategies": {},
         "maintenance": {
             "applied_resets": [],
@@ -1841,6 +1841,43 @@ class Bot:
         else:
             log.info("SIMULACAO")
 
+        self.last_withdrawal_sync = 0.0
+        self.last_redemption_sync = 0.0
+        self.last_redeem_discovery = 0.0
+        self.last_balance_sync = 0.0
+        self.last_balance_resolution_sync = 0.0
+        self.last_balance_snapshot = None
+        self.initialize_withdrawal_tracker()
+
+        # Cache persistente carregado antes da thread. O T-30 nunca acessa a rede.
+        cached_events, cached_ts, cached_source, cached_error = load_news_cache()
+        self.news_events = cached_events
+        self.news_last_success = cached_ts
+        self.news_last_attempt = 0.0
+        self.news_source = cached_source or "nenhuma"
+        self.news_last_error = cached_error or ""
+        self.news_thread = None
+        if cached_events:
+            age = max(0.0, time.time() - cached_ts)
+            log.info(
+                "NEWS V31 | CACHE CARREGADO | fonte=%s | eventos=%s | idade=%.1fh | arquivo=%s",
+                self.news_source, len(cached_events), age / 3600.0, NEWS_CACHE,
+            )
+        elif cached_error:
+            log.warning("NEWS V31 | cache nao disponivel | detalhe=%s", cached_error)
+        if NEWS_FILTER_ENABLED:
+            self.news_thread = Thread(
+                target=self._news_calendar_loop,
+                name="news-calendar-v31",
+                daemon=True,
+            )
+            self.news_thread.start()
+
+        [feed.start() for feed in CHAINLINK_FEEDS.values()]
+
+        if LIVE:
+            self.sync_balance(force=True)
+
     def reset_unfunded_recovery(self, st, reason, required_spend=None, free_cash=None):
         """Reinicia um ciclo sem caixa sem criar saldo ou apagar historico."""
         deficit = max(D("0"), D(st.get("recovery_deficit", "0") or "0"))
@@ -1879,46 +1916,13 @@ class Bot:
         maintenance["last_unfunded_recovery_reset"] = before
         save(self.s)
         log.warning(
-            "%s | AUTO-RESET V55 RECOVERY SEM CAIXA | motivo=%s | "
+            "%s | AUTO-RESET V56 RECOVERY SEM CAIXA | motivo=%s | "
             "RD_DESCARTADO=%s | loss_streak=0 | bankroll_preservado=%s | "
             "gasto_necessario=%s | caixa_livre=%s | historico_preservado=SIM",
             st.get("name"), reason, deficit, st.get("bankroll"),
             required_spend, free_cash,
         )
         return True
-
-        self.last_withdrawal_sync = 0.0
-        self.last_redemption_sync = 0.0
-        self.last_redeem_discovery = 0.0
-        self.last_balance_sync = 0.0
-        self.last_balance_resolution_sync = 0.0
-        self.last_balance_snapshot = None
-        self.initialize_withdrawal_tracker()
-
-        # V31: cache persistente carregado antes da thread; rede nunca e consultada no T-30.
-        cached_events, cached_ts, cached_source, cached_error = load_news_cache()
-        self.news_events = cached_events
-        self.news_last_success = cached_ts
-        self.news_last_attempt = 0.0
-        self.news_source = cached_source or "nenhuma"
-        self.news_last_error = cached_error or ""
-        self.news_thread = None
-        if cached_events:
-            age = max(0.0, time.time() - cached_ts)
-            log.info("NEWS V31 | CACHE CARREGADO | fonte=%s | eventos=%s | idade=%.1fh | arquivo=%s",
-                     self.news_source, len(cached_events), age / 3600.0, NEWS_CACHE)
-        elif cached_error:
-            log.warning("NEWS V31 | cache nao disponivel | detalhe=%s", cached_error)
-        if NEWS_FILTER_ENABLED:
-            self.news_thread = Thread(target=self._news_calendar_loop, name="news-calendar-v31", daemon=True)
-            self.news_thread.start()
-
-        # V46: Chainlink WS roda mesmo em simulacao; em LIVE ele e o fast-path
-        # operacional de encerramento das rodadas BTC.
-        [feed.start() for feed in CHAINLINK_FEEDS.values()]
-
-        if LIVE:
-            self.sync_balance(force=True)
 
     # -------------------- V31 ECONOMIC NEWS FILTER --------------------
 
@@ -4885,7 +4889,7 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction, recovery_preview)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=55 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | RESET_TOTAL_UNICO=V34_PRESERVADO | AUTO_RESET_RECOVERY_SEM_CAIXA=%s | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", AUTO_RESET_UNFUNDED_RECOVERY, ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=56 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | RESET_TOTAL_UNICO=V34_PRESERVADO | AUTO_RESET_RECOVERY_SEM_CAIXA=%s | NEWS_INIT_CORRIGIDO=SIM | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", AUTO_RESET_UNFUNDED_RECOVERY, ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
             "POLYMARKET BTC+ETH+HYPE V54 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE=RD_FINANCEIRO_EXATO | SEGUNDA_PERNA=FOK_ADAPTATIVO | RESGATE=DIRETO_AMBOS_OUTCOMES | RESOLUCAO=CHAINLINK+SALDO+GAMMA+CLOB | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
@@ -4953,7 +4957,7 @@ class Bot:
                     self.s, bal.get("balance"), token_mtm
                 )
                 log.info(
-                    "HEARTBEAT V55 | LIVE=%s | wallet_cash_usd=%s | capital_em_tokens_custo=%s | "
+                    "HEARTBEAT V56 | LIVE=%s | wallet_cash_usd=%s | capital_em_tokens_custo=%s | "
                     "tokens_valor_atual=%s | patrimonio_real=%s | capital_inicial_real=%s | pnl_real_conta=%s | "
                     "pnl_realizado_logico=%s | wins=%s | losses=%s | "
                     "withdrawn_applied=%s | %s",
