@@ -174,6 +174,9 @@ BUILDER_SECRET = os.getenv("POLYMARKET_BUILDER_SECRET", "").strip()
 BUILDER_PASSPHRASE = os.getenv("POLYMARKET_BUILDER_PASSPHRASE", "").strip()
 
 INITIAL = Decimal(os.getenv("INITIAL_BANKROLL", "12.00"))
+AUTO_RESET_UNFUNDED_RECOVERY = os.getenv(
+    "AUTO_RESET_UNFUNDED_RECOVERY", "1"
+).lower() in ("1", "true", "yes", "on")
 EDGE_5M = Decimal("0.25")
 EDGE_15M = Decimal("0.50")
 EDGE_1H = Decimal("0.75")
@@ -415,7 +418,7 @@ def strategy_name(asset, tf, session):
 
 def fresh():
     s = {
-        "version": 54,
+        "version": 55,
         "strategies": {},
         "maintenance": {
             "applied_resets": [],
@@ -1837,6 +1840,52 @@ class Bot:
             )
         else:
             log.info("SIMULACAO")
+
+    def reset_unfunded_recovery(self, st, reason, required_spend=None, free_cash=None):
+        """Reinicia um ciclo sem caixa sem criar saldo ou apagar historico."""
+        deficit = max(D("0"), D(st.get("recovery_deficit", "0") or "0"))
+        if not AUTO_RESET_UNFUNDED_RECOVERY or deficit <= 0:
+            return False
+        if st.get("open_positions"):
+            return False
+
+        p = st.get("pending")
+        if isinstance(p, dict) and any(
+            p.get(k) for k in (
+                "directional_order_id", "opposite_order_id",
+                "directional_shares_filled", "opposite_shares_filled",
+            )
+        ):
+            return False
+
+        before = {
+            "epoch": int(time.time()),
+            "strategy": st.get("name"),
+            "reason": str(reason),
+            "bankroll_preserved": str(st.get("bankroll", "0")),
+            "loss_streak_before": int(st.get("loss_streak", 0) or 0),
+            "recovery_deficit_before": str(deficit),
+            "required_spend": None if required_spend is None else str(required_spend),
+            "free_cash": None if free_cash is None else str(free_cash),
+        }
+        st["loss_streak"] = 0
+        st["recovery_deficit"] = "0"
+        st["last_result"] = "RECOVERY_RESET_UNFUNDED"
+        st["pending"] = None
+        maintenance = self.s.setdefault("maintenance", {})
+        resets = maintenance.setdefault("unfunded_recovery_resets", [])
+        resets.append(before)
+        del resets[:-200]
+        maintenance["last_unfunded_recovery_reset"] = before
+        save(self.s)
+        log.warning(
+            "%s | AUTO-RESET V55 RECOVERY SEM CAIXA | motivo=%s | "
+            "RD_DESCARTADO=%s | loss_streak=0 | bankroll_preservado=%s | "
+            "gasto_necessario=%s | caixa_livre=%s | historico_preservado=SIM",
+            st.get("name"), reason, deficit, st.get("bankroll"),
+            required_spend, free_cash,
+        )
+        return True
 
         self.last_withdrawal_sync = 0.0
         self.last_redemption_sync = 0.0
@@ -3665,8 +3714,13 @@ class Bot:
                     st["name"], sz.get("reason"), dir_limit, sz["base_profit"],
                     sz["recovery_deficit"], sz["target_net_profit"],
                 )
-                st["pending"] = None
-                save(self.s)
+                if not self.reset_unfunded_recovery(
+                    st, f"DIRECTIONAL_SIZING_{sz.get('reason')}",
+                    required_spend=total_spend,
+                    free_cash=logical_cash_snapshot(st)["free"],
+                ):
+                    st["pending"] = None
+                    save(self.s)
                 return
             cash = logical_cash_snapshot(st)
             if total_spend > cash["free"]:
@@ -3674,8 +3728,12 @@ class Bot:
                     "%s | BLOQUEADO V45 DIRECIONAL-ONLY | gasto=%s > caixa_livre=%s | equity=%s | comprometido=%s | target=%s",
                     st["name"], total_spend, cash["free"], cash["equity"], cash["committed"], sz["target_net_profit"],
                 )
-                st["pending"] = None
-                save(self.s)
+                if not self.reset_unfunded_recovery(
+                    st, "DIRECTIONAL_REQUIRED_SPEND_EXCEEDS_FREE_CASH",
+                    required_spend=total_spend, free_cash=cash["free"],
+                ):
+                    st["pending"] = None
+                    save(self.s)
                 return
 
             p["execution_mode"] = "directional_only"
@@ -3768,8 +3826,13 @@ class Bot:
                 st["name"], sz.get("guaranteed_net_at_limit"),
                 MIN_PAIR_GUARANTEED_PROFIT_USD, total_spend,
             )
-            st["pending"] = None
-            save(self.s)
+            if not self.reset_unfunded_recovery(
+                st, f"PAIR_SIZING_{sz.get('reason')}",
+                required_spend=total_spend,
+                free_cash=logical_cash_snapshot(st)["free"],
+            ):
+                st["pending"] = None
+                save(self.s)
             return
         cash = logical_cash_snapshot(st)
         if total_spend > cash["free"]:
@@ -3777,8 +3840,12 @@ class Bot:
                 "%s | BLOQUEADO V45 PAR | gasto=%s > caixa_livre=%s | equity=%s | comprometido=%s | SEM_FALLBACK_DIRECIONAL | deficit=%s | target=%s",
                 st["name"], total_spend, cash["free"], cash["equity"], cash["committed"], sz["recovery_deficit"], sz["target_net_profit"],
             )
-            st["pending"] = None
-            save(self.s)
+            if not self.reset_unfunded_recovery(
+                st, "PAIR_REQUIRED_SPEND_EXCEEDS_FREE_CASH",
+                required_spend=total_spend, free_cash=cash["free"],
+            ):
+                st["pending"] = None
+                save(self.s)
             return
 
         p["execution_mode"] = "pair"
@@ -4818,7 +4885,7 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction, recovery_preview)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=54 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | RESET_TOTAL_UNICO=V34_PRESERVADO | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=55 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | RESET_TOTAL_UNICO=V34_PRESERVADO | AUTO_RESET_RECOVERY_SEM_CAIXA=%s | SINAL=MACD_FECHADO+MACD_LIVE_FORTALECENDO | SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_DIRECIONAL | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | MARTINGALE=PNL_LIQUIDO_NEGATIVO->RD+BASE | STOP_LOSS=EXPLICITO | DAY=SEG-SEX_10-16_BRT | NEWS_CACHE=PERSISTENTE | NEWS_FAIL_OPEN=%s | NEWS_5M15M=+-15M | NEWS_1H=+-60M", AUTO_RESET_UNFUNDED_RECOVERY, ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
             "POLYMARKET BTC+ETH+HYPE V54 FINAL | OVERLAP_ROUNDS=ON | MARTINGALE=RD_FINANCEIRO_EXATO | SEGUNDA_PERNA=FOK_ADAPTATIVO | RESGATE=DIRETO_AMBOS_OUTCOMES | RESOLUCAO=CHAINLINK+SALDO+GAMMA+CLOB | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
@@ -4886,7 +4953,7 @@ class Bot:
                     self.s, bal.get("balance"), token_mtm
                 )
                 log.info(
-                    "HEARTBEAT V54 | LIVE=%s | wallet_cash_usd=%s | capital_em_tokens_custo=%s | "
+                    "HEARTBEAT V55 | LIVE=%s | wallet_cash_usd=%s | capital_em_tokens_custo=%s | "
                     "tokens_valor_atual=%s | patrimonio_real=%s | capital_inicial_real=%s | pnl_real_conta=%s | "
                     "pnl_realizado_logico=%s | wins=%s | losses=%s | "
                     "withdrawn_applied=%s | %s",
