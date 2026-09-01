@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# V62 - LUCRO DIRECIONAL + AUTO-REDEEM REAL + PATRIMONIO REDEEMABLE + GTC 0.60/0.65
+# V63 - PREDICT/POLYMARKET - AUTO-REDEEM + SALDO pUSD ON-CHAIN + GTC 0.60/0.65
 # - inicia os 6 robos em bankroll 12, loss_streak 0 e recovery_deficit 0
 # - zera estatisticas logicas antigas (wins/losses/trades/realized_pnl/last_trigger)
 # - reset e aplicado uma unica vez e somente sem pending ativo
@@ -28,7 +28,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
 # ============================================================
-# POLYMARKET BTC+ETH+HYPE V61 - ALVO NA PONTA DIRECIONAL
+# PREDICT/POLYMARKET BTC+ETH+HYPE V63 - ALVO NA PONTA DIRECIONAL
 # - resultado operacional das rodadas BTC pelo feed Chainlink live da Polymarket em segundos apos o boundary
 # - Gamma/CLOB e saldo de auto-redeem permanecem como redundancia/fallback
 #
@@ -177,6 +177,19 @@ UTC = timezone.utc
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
+
+# V63: fonte de verdade do caixa Polymarket = pUSD ERC-20 diretamente na Polygon.
+# pUSD oficial (6 decimais): https://docs.polymarket.com/resources/contracts
+PUSD_CONTRACT = os.getenv(
+    "POLYMARKET_PUSD_CONTRACT",
+    "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+).strip()
+POLYGON_RPC_URLS = tuple(
+    x.strip() for x in os.getenv(
+        "POLYGON_RPC_URLS",
+        "https://polygon-bor-rpc.publicnode.com,https://polygon-rpc.com",
+    ).split(",") if x.strip()
+)
 BINANCE = "https://api.binance.com"
 CHAINLINK_WS_URL = os.getenv("CHAINLINK_WS_URL", "wss://ws-live-data.polymarket.com").strip()
 CHAINLINK_RESULT_FASTPATH_ENABLED = os.getenv("CHAINLINK_RESULT_FASTPATH_ENABLED", "1").lower() in ("1", "true", "yes", "on")
@@ -191,8 +204,8 @@ LIVE = os.getenv("LIVE_TRADING", "0").lower() in ("1", "true", "yes", "on")
 # Credencial opcional/necessaria para operacoes gasless (Deposit Wallet).
 # Prioridade: RELAYER, se os 2 campos existirem; caso contrario BUILDER,
 # se os 3 campos existirem. Nenhum segredo e impresso nos logs.
-RELAYER_API_KEY = os.getenv("POLYMARKET_RELAYER_API_KEY", "").strip()
-RELAYER_API_KEY_ADDRESS = os.getenv("POLYMARKET_RELAYER_API_KEY_ADDRESS", "").strip()
+RELAYER_API_KEY = (os.getenv("POLYMARKET_RELAYER_API_KEY") or os.getenv("RELAYER_API_KEY") or "").strip()
+RELAYER_API_KEY_ADDRESS = (os.getenv("POLYMARKET_RELAYER_API_KEY_ADDRESS") or os.getenv("RELAYER_API_KEY_ADDRESS") or "").strip()
 
 BUILDER_API_KEY = os.getenv("POLYMARKET_BUILDER_API_KEY", "").strip()
 BUILDER_SECRET = os.getenv("POLYMARKET_BUILDER_SECRET", "").strip()
@@ -2400,16 +2413,43 @@ class Bot:
                         raise RuntimeError("SDK sem metodo redeem_positions")
                     handle = fn(condition_id=condition_id)
                     outcome = handle.wait() if hasattr(handle, "wait") else handle
+
+                    def _redeem_field(obj, *names):
+                        for name in names:
+                            if isinstance(obj, dict) and name in obj:
+                                return obj.get(name)
+                            if hasattr(obj, name):
+                                try:
+                                    return getattr(obj, name)
+                                except Exception:
+                                    pass
+                        return None
+
+                    tx_id = _redeem_field(outcome, "transaction_id", "transactionId", "id")
+                    tx_hash = _redeem_field(outcome, "transaction_hash", "transactionHash", "tx_hash", "hash")
+                    tx_state = _redeem_field(outcome, "state", "status")
+                    if tx_id is None:
+                        tx_id = _redeem_field(handle, "transaction_id", "transactionId", "id")
+                    if tx_hash is None:
+                        tx_hash = _redeem_field(handle, "transaction_hash", "transactionHash", "tx_hash", "hash")
+
                     item["direct_redeem_submitted_at"] = datetime.now(UTC).isoformat()
                     item["direct_redeem_outcome"] = str(outcome)
+                    item["direct_redeem_tx_id"] = str(tx_id) if tx_id is not None else None
+                    item["direct_redeem_tx_hash"] = str(tx_hash) if tx_hash is not None else None
+                    item["direct_redeem_state"] = str(tx_state) if tx_state is not None else None
                     item["next_try_epoch"] = now_epoch + 20
                     item["absent_confirmations"] = 0
                     kept.append(item)
                     changed = True
                     log.warning(
-                        "RESGATE DIRETO V54 ENVIADO | condition_id=%s | ambos outcomes: vencedor->pUSD, perdedor->0 | confirmacao em 20s",
-                        condition_id,
+                        "RESGATE DIRETO V63 CONFIRMADO | condition_id=%s | tx_id=%s | tx_hash=%s | state=%s | outcome=%s | confirmacao_posicao=20s",
+                        condition_id, tx_id, tx_hash, tx_state, outcome,
                     )
+                    try:
+                        self.sync_balance(force=True)
+                    except Exception:
+                        log.exception("RESGATE V63 | falha ao atualizar saldo apos redeem")
                     continue
                 except Exception as exc:
                     item["attempts"] = int(item.get("attempts") or 0) + 1
@@ -2418,7 +2458,7 @@ class Bot:
                     kept.append(item)
                     changed = True
                     log.error(
-                        "RESGATE DIRETO V62 FALHOU | condition_id=%s | tentativa=%s | retry_at=%s | erro=%r",
+                        "RESGATE DIRETO V63 FALHOU | condition_id=%s | tentativa=%s | retry_at=%s | erro=%r",
                         condition_id, item["attempts"], item["next_try_epoch"], exc,
                     )
                     # Nao converte falha de redeem em 'saldo perdido' e nao volta
@@ -2692,6 +2732,49 @@ class Bot:
                 self.resolve_open_positions(st)
         return True
 
+    def _pusd_balance_onchain(self):
+        """V63: lê pUSD.balanceOf(DEPOSIT_WALLET) diretamente na Polygon.
+
+        Retorna unidades inteiras de 1e-6 pUSD, iguais às unidades usadas pelo
+        balance-allowance do CLOB. Em falha de RPC retorna None e preserva o
+        fallback do SDK, sem interromper o robô.
+        """
+        wallet = str(WALLET or "").strip()
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", wallet):
+            return None
+
+        # balanceOf(address) selector = 0x70a08231; argumento address em 32 bytes.
+        data = "0x70a08231" + wallet[2:].lower().rjust(64, "0")
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 63,
+            "method": "eth_call",
+            "params": [{"to": PUSD_CONTRACT, "data": data}, "latest"],
+        }).encode("utf-8")
+
+        last_error = None
+        for rpc in POLYGON_RPC_URLS:
+            try:
+                req = Request(
+                    rpc,
+                    data=payload,
+                    headers={"Content-Type": "application/json", "User-Agent": "predict-v63"},
+                    method="POST",
+                )
+                with urlopen(req, timeout=8) as resp:
+                    body = json.loads(resp.read().decode("utf-8") or "{}")
+                if body.get("error"):
+                    raise RuntimeError(str(body["error"]))
+                result = str(body.get("result") or "")
+                if not result.startswith("0x"):
+                    raise RuntimeError(f"eth_call sem result valido: {result!r}")
+                return int(result, 16)
+            except Exception as exc:
+                last_error = exc
+
+        log.warning("PUSD ONCHAIN | todos RPCs falharam | erro=%r", last_error)
+        return None
+
     def sync_balance_for_resolution(self, force=False):
         """Polling de saldo mais rapido somente enquanto existe round encerrado sem winner."""
         if not LIVE or not self.c or not BALANCE_RESULT_FASTPATH_ENABLED:
@@ -2705,12 +2788,10 @@ class Bot:
         return self.sync_balance(force=True)
 
     def sync_balance(self, force=False):
-        """
-        Consulta o saldo/allowance de COLLATERAL da carteira autenticada.
+        """V63: sincroniza allowances pelo CLOB e caixa real pelo pUSD on-chain.
 
-        V43: alem do monitoramento, um aumento de saldo pode antecipar o resultado
-        SOMENTE quando corresponder de forma unica ao payout de auto-redeem de
-        posicao encerrada. Diferencas genericas de saldo nunca viram winner.
+        O endpoint balance-allowance pode permanecer em cache após redeem.
+        Para patrimônio/caixa, pUSD.balanceOf(WALLET) na Polygon tem prioridade.
         """
         if not LIVE or not self.c:
             return None
@@ -2722,12 +2803,28 @@ class Bot:
 
         try:
             info = self.c.get_balance_allowance(asset_type="COLLATERAL")
-
-            balance = self._obj_field(info, "balance", default=None)
+            clob_balance = self._obj_field(info, "balance", default=None)
             allowances = self._obj_field(info, "allowances", "allowance", default=None)
+
+            onchain_balance = self._pusd_balance_onchain()
+            balance = onchain_balance if onchain_balance is not None else clob_balance
+            source = "PUSD_ONCHAIN" if onchain_balance is not None else "CLOB_FALLBACK"
+
+            if onchain_balance is not None and clob_balance is not None:
+                try:
+                    if D(onchain_balance) != D(clob_balance):
+                        log.warning(
+                            "BALANCE CACHE STALE | clob=%s | pusd_onchain=%s | usando ONCHAIN como fonte de verdade",
+                            clob_balance, onchain_balance,
+                        )
+                except Exception:
+                    pass
 
             self.last_balance_snapshot = {
                 "balance": str(balance) if balance is not None else None,
+                "clob_balance": str(clob_balance) if clob_balance is not None else None,
+                "pusd_onchain_balance": str(onchain_balance) if onchain_balance is not None else None,
+                "balance_source": source,
                 "allowances": allowances,
                 "wallet": str(self.c.wallet),
                 "signer": str(self.c.signer),
@@ -2743,7 +2840,7 @@ class Bot:
                     tracker["last_delta"] = str(D(balance) - D(previous_balance))
                     self.reconcile_balance_credit_fastpath(previous_balance, balance)
                 except Exception:
-                    log.exception("V43 SALDO FASTPATH ERRO | seguindo com Gamma/CLOB")
+                    log.exception("V63 SALDO FASTPATH ERRO | seguindo com Gamma/CLOB")
             if balance is not None:
                 changed_balance = str(tracker.get("last_balance")) != str(balance)
                 tracker["last_balance"] = str(balance)
@@ -2752,16 +2849,10 @@ class Bot:
                     save(self.s)
 
             log.info(
-                "CARTEIRA OK | wallet=%s | signer=%s | collateral_balance=%s | allowance=%s",
-                self.c.wallet,
-                self.c.signer,
-                balance,
-                allowances,
+                "CARTEIRA OK V63 | wallet=%s | signer=%s | source=%s | collateral_balance=%s | clob_cache=%s | pusd_onchain=%s | allowance=%s",
+                self.c.wallet, self.c.signer, source, balance, clob_balance, onchain_balance, allowances,
             )
 
-            # Diagnostico objetivo para Deposit Wallet: se todos os allowances
-            # conhecidos estiverem zerados e nenhuma credencial gasless foi
-            # configurada, a primeira ordem seria inevitavelmente rejeitada.
             try:
                 allowance_values = []
                 if isinstance(allowances, dict):
@@ -2773,32 +2864,25 @@ class Bot:
 
                 all_zero = bool(allowance_values) and all(v <= 0 for v in allowance_values)
                 gasless_api_key, gasless_mode = build_gasless_api_key()
-
                 if all_zero and gasless_api_key is None:
                     log.error(
                         "ALLOWANCE BLOQUEADO | todos os allowances de COLLATERAL estao em 0 "
-                        "| configure RELAYER (2 vars) ou BUILDER (3 vars) no Railway "
-                        "antes de permitir ordens LIVE"
+                        "| configure RELAYER (2 vars) ou BUILDER (3 vars) no Railway"
                     )
                 elif all_zero and gasless_api_key is not None:
                     log.warning(
-                        "ALLOWANCE=0 | gasless_auth=%s configurada; o SDK tentara "
-                        "aprovar automaticamente no primeiro envio de ordem",
+                        "ALLOWANCE=0 | gasless_auth=%s configurada; o SDK tentara aprovar automaticamente",
                         gasless_mode,
                     )
                 elif allowance_values:
-                    log.info(
-                        "ALLOWANCE PRONTO | ao menos um spender possui allowance > 0"
-                    )
+                    log.info("ALLOWANCE PRONTO | ao menos um spender possui allowance > 0")
             except Exception:
                 log.exception("ALLOWANCE DIAGNOSTICO ERRO")
 
             return self.last_balance_snapshot
 
         except Exception:
-            log.exception(
-                "CARTEIRA ERRO | nao foi possivel consultar balance/allowance de COLLATERAL"
-            )
+            log.exception("CARTEIRA ERRO | nao foi possivel consultar balance/allowance de COLLATERAL")
             return None
 
     # -------------------- CAPITAL / WITHDRAWALS --------------------
@@ -5271,10 +5355,10 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction, recovery_preview)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=62 | OBJETIVO=LUCRO_EXCLUSIVO_NA_PONTA_DIRECIONAL | INVARIANTE=SHARES_DIR-CUSTO_TOTAL-RESERVA_TAXAS>=ALVO | PROTECAO_OPPOSTA=MINIMA | SIZING=DINAMICO_POR_PRECO+ALVO+CAIXA | EXECUCAO_NORMAL=GTC_MAX_060 | T5=COMPLEMENTA_SOMENTE_DIRECIONAL_MAX_065 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | AUTO_RESET_RECOVERY_SEM_CAIXA=%s | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | NEWS_FAIL_OPEN=%s", AUTO_RESET_UNFUNDED_RECOVERY, ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=63 | OBJETIVO=LUCRO_EXCLUSIVO_NA_PONTA_DIRECIONAL | INVARIANTE=SHARES_DIR-CUSTO_TOTAL-RESERVA_TAXAS>=ALVO | PROTECAO_OPPOSTA=MINIMA | SIZING=DINAMICO_POR_PRECO+ALVO+CAIXA | EXECUCAO_NORMAL=GTC_MAX_060 | T5=COMPLEMENTA_SOMENTE_DIRECIONAL_MAX_065 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | AUTO_RESET_RECOVERY_SEM_CAIXA=%s | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | NEWS_FAIL_OPEN=%s", AUTO_RESET_UNFUNDED_RECOVERY, ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
-            "POLYMARKET BTC+ETH+HYPE V61 FINAL | LUCRO=EXCLUSIVO_DIRECIONAL | ENTRY=GTC_BOOK_060 | FEE_RESERVE=%s | T5=SO_DIRECIONAL_ATE_065 | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
+            "PREDICT/POLYMARKET BTC+ETH+HYPE V63 FINAL | LUCRO=EXCLUSIVO_DIRECIONAL | ENTRY=GTC_BOOK_060 | FEE_RESERVE=%s | T5=SO_DIRECIONAL_ATE_065 | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
             "ATIVOS=BTC+ETH+HYPE | 18_ROBOS | BANKROLL_INICIAL=%s | MACD 7/21/9 | "
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
@@ -5340,7 +5424,7 @@ class Bot:
                     self.s, bal.get("balance"), token_mtm
                 )
                 log.info(
-                    "HEARTBEAT V62 | LIVE=%s | wallet_cash_usd=%s | capital_em_tokens_custo=%s | "
+                    "HEARTBEAT V63 | LIVE=%s | wallet_cash_usd=%s | capital_em_tokens_custo=%s | "
                     "tokens_valor_atual=%s | patrimonio_real=%s | capital_inicial_real=%s | pnl_real_conta=%s | "
                     "pnl_realizado_logico=%s | wins=%s | losses=%s | "
                     "withdrawn_applied=%s | %s",
