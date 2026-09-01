@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# V61 - LUCRO DIRECIONAL + PROTECAO OPOSTA MINIMA + GTC 0.60/0.65
+# V62 - LUCRO DIRECIONAL + AUTO-REDEEM REAL + PATRIMONIO REDEEMABLE + GTC 0.60/0.65
 # - inicia os 6 robos em bankroll 12, loss_streak 0 e recovery_deficit 0
 # - zera estatisticas logicas antigas (wins/losses/trades/realized_pnl/last_trigger)
 # - reset e aplicado uma unica vez e somente sem pending ativo
@@ -99,30 +99,55 @@ from urllib.parse import urlencode
 
 
 def ensure_sdk():
-    try:
-        import polymarket  # noqa: F401
-        print("BOOTSTRAP | polymarket SDK ja disponivel", flush=True)
-        return
-    except ImportError:
-        print("BOOTSTRAP | instalando polymarket-client==0.3.0b1", flush=True)
+    """Garante SDK oficial com correção de redeem para mercados fechados.
 
+    V62 exige polymarket-client >= 0.7.1. A série antiga usada pelo V61
+    podia resolver `redeem_positions(condition_id=...)` apenas contra mercados
+    ainda abertos e acabava deixando posições vencedoras eternamente como
+    redeemable. O SDK 0.7.1 resolve o contexto com closed=True.
+    """
+    required = (0, 7, 1)
+    installed = None
+    try:
+        from importlib.metadata import version as package_version
+        raw = package_version("polymarket-client")
+        nums = []
+        for piece in raw.split("."):
+            digits = "".join(ch for ch in piece if ch.isdigit())
+            nums.append(int(digits or 0))
+            if len(nums) == 3:
+                break
+        while len(nums) < 3:
+            nums.append(0)
+        installed = tuple(nums[:3])
+        import polymarket  # noqa: F401
+    except Exception:
+        installed = None
+
+    if installed is not None and installed >= required:
+        print(f"BOOTSTRAP | polymarket-client pronto | versao={'.'.join(map(str, installed))}", flush=True)
+        return
+
+    print("BOOTSTRAP | atualizando polymarket-client para >=0.7.1,<0.8", flush=True)
     subprocess.check_call([
         sys.executable,
         "-m",
         "pip",
         "install",
+        "--upgrade",
         "--no-cache-dir",
         "--root-user-action=ignore",
-        "polymarket-client==0.3.0b1",
+        "polymarket-client>=0.7.1,<0.8",
     ])
     importlib.invalidate_caches()
 
     try:
         import polymarket  # noqa: F401
-        print("BOOTSTRAP | SDK instalado e importado com sucesso", flush=True)
-    except ImportError as exc:
+        from importlib.metadata import version as package_version
+        print(f"BOOTSTRAP | SDK instalado | polymarket-client={package_version('polymarket-client')}", flush=True)
+    except Exception as exc:
         raise RuntimeError(
-            "polymarket-client foi instalado, mas o modulo polymarket nao pode ser importado"
+            "polymarket-client foi atualizado, mas nao pode ser importado"
         ) from exc
 
 
@@ -1885,6 +1910,12 @@ class Bot:
                 self.c.wallet_type,
                 gasless_mode,
             )
+            if DIRECT_REDEEM_ENABLED and gasless_mode == "NONE":
+                raise RuntimeError(
+                    "DIRECT_REDEEM_ENABLED=1 exige credencial gasless. Configure "
+                    "POLYMARKET_RELAYER_API_KEY + POLYMARKET_RELAYER_API_KEY_ADDRESS "
+                    "(recomendado) ou o conjunto BUILDER."
+                )
         else:
             log.info("SIMULACAO")
 
@@ -2348,10 +2379,12 @@ class Bot:
                 log.info("RESGATE | AINDA NAO RESGATAVEL | condition_id=%s | size=%s | retry=60s", condition_id, inspection.get("total_size"))
                 continue
 
-            # V54 REDEEMABLE: o SDK oficial resgata os dois outcomes em uma
-            # unica transacao. O vencedor vira pUSD e o perdedor e queimado a
-            # zero, removendo os tokens encerrados da carteira.
-            if DIRECT_REDEEM_ENABLED and not item.get("direct_redeem_unavailable"):
+            # V62 REDEEMABLE: resgate REAL pelo SDK oficial/Relayer.
+            # Flags `direct_redeem_unavailable` gravadas por versões antigas são
+            # descartadas: o SDK >=0.7.1 suporta lookup de mercados fechados.
+            if item.pop("direct_redeem_unavailable", None) is not None:
+                changed = True
+            if DIRECT_REDEEM_ENABLED:
                 if item.get("direct_redeem_submitted_at"):
                     item["next_try_epoch"] = now_epoch + 30
                     kept.append(item)
@@ -2379,30 +2412,20 @@ class Bot:
                     )
                     continue
                 except Exception as exc:
-                    no_market = "no market found for condition" in str(exc).lower()
                     item["attempts"] = int(item.get("attempts") or 0) + 1
                     item["last_error"] = repr(exc)
+                    item["next_try_epoch"] = now_epoch + min(600, 20 * (2 ** min(item["attempts"], 4)))
+                    kept.append(item)
                     changed = True
-                    if no_market:
-                        # O SDK nao conhece mercados antigos descobertos apenas
-                        # pela carteira. Nao insiste para sempre: passa ao
-                        # operator oficial e continua reconciliando o saldo.
-                        item["direct_redeem_unavailable"] = True
-                        item["next_try_epoch"] = now_epoch + 60
-                        log.warning(
-                            "RESGATE DIRETO V54 INDISPONIVEL PARA MERCADO ANTIGO | condition_id=%s | usando AUTO-OPERATOR",
-                            condition_id,
-                        )
-                    else:
-                        item["next_try_epoch"] = now_epoch + min(600, 30 * (2 ** min(item["attempts"], 4)))
-                        kept.append(item)
-                        log.warning(
-                            "RESGATE DIRETO V54 FALHOU | condition_id=%s | tentativa=%s | retry_at=%s | erro=%r",
-                            condition_id, item["attempts"], item["next_try_epoch"], exc,
-                        )
-                        continue
+                    log.error(
+                        "RESGATE DIRETO V62 FALHOU | condition_id=%s | tentativa=%s | retry_at=%s | erro=%r",
+                        condition_id, item["attempts"], item["next_try_epoch"], exc,
+                    )
+                    # Nao converte falha de redeem em 'saldo perdido' e nao volta
+                    # ao antigo modo passivo. Mantem na fila e tenta novamente.
+                    continue
 
-            # Fallback opcional: deixa o operator oficial liquidar.
+            # DIRECT_REDEEM_ENABLED=0 e apenas modo diagnostico.
             queued_at = item.get("queued_at")
             age = 0
             try:
@@ -2413,13 +2436,11 @@ class Bot:
             item["next_try_epoch"] = now_epoch + delay
             kept.append(item)
             changed = True
-            log.info(
-                "RESGATE | REDEEMABLE CONFIRMADO | condition_id=%s | redeemable_size=%s | AUTO-OPERATOR aguardando | sem POST /submit | retry=%ss",
+            log.warning(
+                "RESGATE V62 DESATIVADO POR VARIABLE | condition_id=%s | redeemable_size=%s | "
+                "DIRECT_REDEEM_ENABLED=0 | retry=%ss",
                 condition_id, inspection.get("redeemable_size"), delay,
             )
-            if age >= 1800 and not item.get("warned_30m"):
-                item["warned_30m"] = True
-                log.warning("AUTO-OPERATOR AINDA PENDENTE HA >30min | condition_id=%s | posicao continua redeemable", condition_id)
 
         if changed:
             rec["processed_condition_ids"] = list(processed)[-5000:]
@@ -2438,16 +2459,34 @@ class Bot:
         return default
 
     def wallet_token_mark_to_market(self):
-        """Soma o valor atual das posições conforme a API da Polymarket."""
+        """Valor econômico real dos tokens, incluindo vencedores redeemable.
+
+        A Data API pode devolver currentValue/curPrice=0 para mercados já
+        resolvidos mesmo quando `redeemable=True`. Nessa fase, cada token
+        vencedor é resgatável por US$1, portanto `size` é o valor econômico.
+        Isso impede que dezenas de dólares aguardando redeem apareçam como
+        prejuízo total no heartbeat.
+        """
         if not LIVE or not self.c:
             return D("0")
         total = D("0")
+        redeemable_total = D("0")
+        redeemable_count = 0
         try:
             positions = self.c.list_positions(user=WALLET, page_size=100).iter_items()
             for pos in positions:
                 size = D(self._obj_field(pos, "size", default="0") or "0")
                 if size <= 0:
                     continue
+
+                redeemable = bool(self._obj_field(pos, "redeemable", default=False))
+                if redeemable:
+                    # Polymarket: token vencedor resolvido = US$1 por share.
+                    redeemable_total += size
+                    redeemable_count += 1
+                    total += size
+                    continue
+
                 current_value = self._obj_field(
                     pos, "current_value", "currentValue", "value", default=None
                 )
@@ -2459,9 +2498,16 @@ class Bot:
                 )
                 if current_price not in (None, ""):
                     total += max(D("0"), size * D(current_price))
+
+            if redeemable_count:
+                log.warning(
+                    "PATRIMONIO V62 | redeemable_count=%s | redeemable_usd=%s | "
+                    "incluido no patrimonio ate o credito virar cash",
+                    redeemable_count, redeemable_total,
+                )
             return total
         except Exception as exc:
-            log.warning("PATRIMONIO V54 | mark-to-market indisponivel | erro=%r", exc)
+            log.warning("PATRIMONIO V62 | mark-to-market indisponivel | erro=%r", exc)
             return None
 
     @staticmethod
@@ -5225,7 +5271,7 @@ class Bot:
         self.prepare_entry_window(st, next_start, direction, recovery_preview)
 
     def run(self):
-        log.info("STARTUP OK | codigo carregado | versao=61 | OBJETIVO=LUCRO_EXCLUSIVO_NA_PONTA_DIRECIONAL | INVARIANTE=SHARES_DIR-CUSTO_TOTAL-RESERVA_TAXAS>=ALVO | PROTECAO_OPPOSTA=MINIMA | SIZING=DINAMICO_POR_PRECO+ALVO+CAIXA | EXECUCAO_NORMAL=GTC_MAX_060 | T5=COMPLEMENTA_SOMENTE_DIRECIONAL_MAX_065 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | AUTO_RESET_RECOVERY_SEM_CAIXA=%s | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | NEWS_FAIL_OPEN=%s", AUTO_RESET_UNFUNDED_RECOVERY, ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
+        log.info("STARTUP OK | codigo carregado | versao=62 | OBJETIVO=LUCRO_EXCLUSIVO_NA_PONTA_DIRECIONAL | INVARIANTE=SHARES_DIR-CUSTO_TOTAL-RESERVA_TAXAS>=ALVO | PROTECAO_OPPOSTA=MINIMA | SIZING=DINAMICO_POR_PRECO+ALVO+CAIXA | EXECUCAO_NORMAL=GTC_MAX_060 | T5=COMPLEMENTA_SOMENTE_DIRECIONAL_MAX_065 | OVERLAP_ROUNDS=ON | MARTINGALE_CASCATA=FIFO_CACHE+PREVIA_PROBABILISTICA+FREEZE_SE_ERRO | RESOLUCAO=CHAINLINK_TWAP_PROVISORIO<=4MIN+SALDO_AUTO_REDEEM+GAMMA+CLOB | PREVIA_ERRO=AGUARDA_TODAS_POSICOES_RD_CONSOLIDADO | MIN_ORDER=TOKEN_BOOK_DINAMICO+USD1_NOTIONAL | CHAINLINK_FASTPATH=BTC_ETH_HYPE_RTDSTWAP+HOURLY_BINANCE | CAIXA_LOGICO=EQUITY-CAPITAL_COMPROMETIDO | PATRIMONIO=CAIXA_WALLET+TOKENS_A_CUSTO | CANCELAMENTO=IDEMPOTENTE | AUTO_RESET_RECOVERY_SEM_CAIXA=%s | ENTRY_SECONDS=%s | MIN_USD_PONTA=1.00 | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | NEWS_FAIL_OPEN=%s", AUTO_RESET_UNFUNDED_RECOVERY, ENTRY_SECONDS, EDGE_5M, EDGE_15M, EDGE_1H, not NEWS_FAIL_CLOSED)
         _, gasless_mode = build_gasless_api_key()
         log.info(
             "POLYMARKET BTC+ETH+HYPE V61 FINAL | LUCRO=EXCLUSIVO_DIRECIONAL | ENTRY=GTC_BOOK_060 | FEE_RESERVE=%s | T5=SO_DIRECIONAL_ATE_065 | LIVE=%s | GASLESS_AUTH=%s | 18 ROBOS | "
@@ -5233,7 +5279,7 @@ class Bot:
             "SINAL T-%ss | PRECO<=%s | PAR OU DIRECIONAL-ONLY ANTES DO INICIO | "
             "SWITCH_1PONTA=RD>=CAPITAL_MINIMO_REAL_DO_PAR | SEM_FALLBACK_1PONTA | PARTIAL_PAR=PROPORCIONAL | "
             "DAY=SEG-SEX_10-16_BRT | NEWS=US_HIGH_3ESTRELAS_RESILIENTE | NEWS_5M15M=+-15M | NEWS_1H=+-60M | "
-            "SAQUES=AUTO_PROPORCIONAL | RESGATE=AUTO_OPERATOR | BALANCE=MONITORADO+FASTPATH_REDEEM_UNICO | CHAINLINK_RESULT=BTC_ETH_HYPE_TWAP_5M15M<=4MIN+BINANCE_HOURLY<=4MIN | MARTINGALE=DEFICIT_ACUMULADO+BASE | SIZING=USD1_POR_PONTA+AUTO_DIRECIONAL_ONLY | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
+            "SAQUES=AUTO_PROPORCIONAL | RESGATE=DIRETO_SDK_RELAYER | BALANCE=MONITORADO+FASTPATH_REDEEM_UNICO | CHAINLINK_RESULT=BTC_ETH_HYPE_TWAP_5M15M<=4MIN+BINANCE_HOURLY<=4MIN | MARTINGALE=DEFICIT_ACUMULADO+BASE | SIZING=USD1_POR_PONTA+AUTO_DIRECIONAL_ONLY | EDGE_5M=%s | EDGE_15M=%s | EDGE_1H=%s | TARGET=%s | DATA=%s",
             PAIR_FEE_RESERVE_PCT,
             LIVE,
             gasless_mode,
@@ -5294,7 +5340,7 @@ class Bot:
                     self.s, bal.get("balance"), token_mtm
                 )
                 log.info(
-                    "HEARTBEAT V61 | LIVE=%s | wallet_cash_usd=%s | capital_em_tokens_custo=%s | "
+                    "HEARTBEAT V62 | LIVE=%s | wallet_cash_usd=%s | capital_em_tokens_custo=%s | "
                     "tokens_valor_atual=%s | patrimonio_real=%s | capital_inicial_real=%s | pnl_real_conta=%s | "
                     "pnl_realizado_logico=%s | wins=%s | losses=%s | "
                     "withdrawn_applied=%s | %s",
