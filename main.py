@@ -1,38 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ASTER PERPETUAL BOT V17 - BTC / ETH / HYPE
-=========================================
+ASTER PERPETUAL BOT V18 - BTC / ETH / HYPE - SEM INDICADORES
+=============================================================
 Motores independentes:
-  A) RANGE_1PCT: gatilho EXCLUSIVAMENTE por +/-1% do ponto zero, sem MACD,
-     alvo +1%, hedge/recovery alternado,
-     recovery 4x minimo com dimensionamento dinamico liquido, protecao apos 2 falhas.
-  B) MACD: BTC/ETH/HYPE em 5m e 15m, MACD 7/21/9, entrada apenas no cruzamento
-     confirmado em candle fechado, SEM TP FIXO, com trailing stop de proteção
-     de lucro (ativa após +2%, segue a 2% do preço máximo), stop loss de 2%,
-     martingale 2x, proteção após 2 perdas consecutivas.
-  C) PYRAMID_1PCT: dois robos independentes por ativo (LONG e SHORT), sem indicador.
+  A) RANGE_1PCT: gatilho EXCLUSIVAMENTE por +/-1% do ponto zero, sem indicador,
+     alvo +1%, hedge/recovery alternado, recovery 4x minimo com dimensionamento
+     dinamico liquido e protecao apos 2 falhas.
+  B) PYRAMID_1PCT: dois robos independentes por ativo (LONG e SHORT), sem indicador.
      Cada robo fixa um ponto zero persistente. LONG abre US$100 no +1% e adiciona
      5% do caixa virtual a cada novo nivel de +1%; SHORT faz o espelho em -1%.
      Recuos nao reduzem posicao. Cada robo para e fecha sua propria cesta quando
      a perda liquida estimada alcanca o caixa virtual de US$10.
 
-Conta/margem:
-  - Aster Pro USDT perpetual.
-  - Hedge Mode obrigatorio.
-  - ISOLATED obrigatorio.
-  - Alavancagem adaptativa por ordem, consultando leverageBracket.
-  - A API documentada aceita leverage 1..125, mas este bot usa limite absoluto de 35x.
-
-IMPORTANTE SOBRE "USD 10 por operacao":
-  INITIAL_OPERATION_NOTIONAL_USD=10 significa US$10 de EXPOSICAO TOTAL (notional),
-  independentemente da alavancagem. A margem isolada usada sera notional/leverage.
+Ativos: BTCUSDT, ETHUSDT e HYPEUSDT.
+Conta real Aster Pro USDT perpetual, Hedge Mode e margem ISOLATED.
+A estrategia PYRAMID usa apenas movimentacao percentual do preco a partir do anchor.
+Nenhum indicador tecnico e utilizado.
 
 Seguranca:
-  - LIVE_TRADING=0 por padrao.
+  - LIVE_TRADING=0 por padrao; para conta real use LIVE_TRADING=1.
   - SOFT kill-switch bloqueia novas entradas, mas continua gerenciando posicoes.
   - HARD kill-switch cancela ordens e tenta fechar posicoes do bot.
-  - Noticias de alto impacto (3 estrelas) bloqueiam entradas -15/+15 minutos.
+  - Noticias de alto impacto podem bloquear novas entradas quando habilitadas.
   - Estado persistente em BOT_DIR/state.json.
   - Ordens usam clientOrderId prefixado por estrategia para reconciliacao.
   - Estrategias simultaneas no mesmo simbolo habilitadas por padrao.
@@ -40,31 +30,7 @@ Seguranca:
 Dependencias:
   pip install requests websocket-client beautifulsoup4 eth-account
 
-Variaveis principais Railway:
-  ASTER_USER_ADDRESS=0x...              # carteira principal/login Aster
-  ASTER_API_WALLET_ADDRESS=0x...        # endereço público da API Wallet autorizada
-  ASTER_API_WALLET_PRIVATE_KEY=0x...    # chave privada SOMENTE da API Wallet
-  LIVE_TRADING=0
-  VALIDATE_API_ONLY=1
-  BOT_DIR=/data
-  MAX_REQUESTED_LEVERAGE=35
-  INITIAL_BANKROLL_USD=10
-  INITIAL_OPERATION_NOTIONAL_USD=10
-  BTC_INITIAL_BANKROLL_USD=20
-  BTC_INITIAL_OPERATION_NOTIONAL_USD=100
-  MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT=0.05
-  RECOVERY_MULTIPLIER=4                # usado apenas para RANGE
-  MACD_RECOVERY_MULTIPLIER=2           # usado apenas para MACD
-  MAX_RECOVERY_FAILURES=2
-  EMERGENCY_CLOSE_ALL_AND_RESET=0
-  EMERGENCY_RESET_ID=reset-20260830-01
-  NEWS_FILTER_ENABLED=1
-  NEWS_FAIL_CLOSED=1
-  MACD_TRAILING_ACTIVATION_PCT=0.02    # ativa trailing após 2% de lucro
-  MACD_TRAILING_DISTANCE_PCT=0.02      # trailing segue a 2% do preço máximo
-  MACD_HARD_STOP_PCT=0.02              # stop loss de 2%
-
-Nao coloque seed phrase nem chave privada da Trust Wallet principal no Railway.
+Nunca coloque seed phrase ou a chave privada da carteira principal no Railway.
 Use somente a chave privada da API Wallet dedicada e autorizada na Aster.
 """
 
@@ -113,8 +79,8 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "6.0.0-v17-pyramid-1pct"
-BOT_NAME = "ASTER_PERPETUAL_BOT_V17"
+VERSION = "7.0.0-v18-no-indicators"
+BOT_NAME = "ASTER_PERPETUAL_BOT_V18"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
 USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS", "").strip()
@@ -146,7 +112,6 @@ INITIAL_OPERATION_NOTIONAL_USD = D(os.getenv(
 BTC_INITIAL_OPERATION_NOTIONAL_USD = D(os.getenv("BTC_INITIAL_OPERATION_NOTIONAL_USD", "100"))
 MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT = D(os.getenv("MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT", "0.05"))
 RECOVERY_MULTIPLIER = D(os.getenv("RECOVERY_MULTIPLIER", "4"))
-MACD_RECOVERY_MULTIPLIER = D(os.getenv("MACD_RECOVERY_MULTIPLIER", "2"))
 MAX_RECOVERY_FAILURES = int(os.getenv("MAX_RECOVERY_FAILURES", "2"))
 
 MAX_REQUESTED_LEVERAGE = int(os.getenv("MAX_REQUESTED_LEVERAGE", "35"))
@@ -166,18 +131,6 @@ RANGE_HARD_STOP_PCT = D(os.getenv("RANGE_HARD_STOP_PCT", "0.02"))
 RANGE_REARM_PCT = D(os.getenv("RANGE_REARM_PCT", "0.03"))
 RANGE_ENGINE_ENABLED = os.getenv("RANGE_ENGINE_ENABLED", "1") == "1"
 
-MACD_ENGINE_ENABLED = os.getenv("MACD_ENGINE_ENABLED", "1") == "1"
-MACD_FAST = int(os.getenv("MACD_FAST", "7"))
-MACD_SLOW = int(os.getenv("MACD_SLOW", "21"))
-MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
-MACD_TIMEFRAMES = tuple(x.strip() for x in os.getenv("MACD_TIMEFRAMES", "5m,15m").split(",") if x.strip())
-if not MACD_TIMEFRAMES:
-    MACD_TIMEFRAMES = ("5m", "15m")
-MACD_REARM_PCT = D(os.getenv("MACD_REARM_PCT", "0.03"))
-MACD_TRAILING_ACTIVATION_PCT = D(os.getenv("MACD_TRAILING_ACTIVATION_PCT", "0.02"))
-MACD_TRAILING_DISTANCE_PCT = D(os.getenv("MACD_TRAILING_DISTANCE_PCT", "0.02"))
-MACD_HARD_STOP_PCT = D(os.getenv("MACD_HARD_STOP_PCT", "0.02"))
-MACD_NATIVE_TRAILING_ENABLED = os.getenv("MACD_NATIVE_TRAILING_ENABLED", "1") == "1"
 PROTECTIVE_WATCHDOG_SECONDS = float(os.getenv("PROTECTIVE_WATCHDOG_SECONDS", "5"))
 
 # PYRAMID 1% engine: 2 robos independentes por ativo (LONG e SHORT).
@@ -300,31 +253,6 @@ def ema(values: List[Decimal], period: int) -> List[Decimal]:
         out.append(v * k + out[-1] * (D(1) - k))
     return out
 
-def macd_series(closes: List[Decimal], fast: int, slow: int, sig: int) -> Tuple[List[Decimal], List[Decimal]]:
-    if len(closes) < slow + sig + 3:
-        return [], []
-    ef = ema(closes, fast)
-    es = ema(closes, slow)
-    offset = slow - fast
-    ef2 = ef[offset:]
-    n = min(len(ef2), len(es))
-    m = [ef2[i] - es[i] for i in range(n)]
-    s = ema(m, sig)
-    if not s:
-        return [], []
-    m_aligned = m[sig - 1:]
-    n2 = min(len(m_aligned), len(s))
-    return m_aligned[-n2:], s[-n2:]
-
-def get_macd_cross(closes: List[Decimal]) -> Optional[str]:
-    m, s = macd_series(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
-    if len(m) < 2 or len(s) < 2:
-        return None
-    if m[-2] <= s[-2] and m[-1] > s[-1]:
-        return "LONG"
-    if m[-2] >= s[-2] and m[-1] < s[-1]:
-        return "SHORT"
-    return None
 
 # -----------------------------------------------------------------------------
 # ASTER REST CLIENT
@@ -1022,27 +950,6 @@ def empty_range_state(symbol: str) -> Dict[str, Any]:
         "last_update": now_iso(),
     }
 
-def empty_macd_state(symbol: str, tf: str) -> Dict[str, Any]:
-    bankroll = configured_bankroll(symbol)
-    return {
-        "strategy": f"MACD:{symbol}:{tf}",
-        "symbol": symbol,
-        "tf": tf,
-        "equity": str(bankroll),
-        "bankroll_config_base": str(bankroll),
-        "position": None,
-        "recovery_deficit": "0",
-        "loss_streak": 0,
-        "recovery_level": 0,
-        "protect": False,
-        "protect_anchor": None,
-        "last_candle_close_ms": 0,
-        "wins": 0,
-        "losses": 0,
-        "realized_pnl": "0",
-        "last_result": "NONE",
-        "last_update": now_iso(),
-    }
 
 def empty_pyramid_state(symbol: str, side: str) -> Dict[str, Any]:
     side = str(side).upper()
@@ -1074,7 +981,6 @@ def fresh_state() -> Dict[str, Any]:
         "trade_gate": {"open_allowed": True, "reason": None, "at": now_iso()},
         "protection_blocks": {},
         "range": {s: empty_range_state(s) for s in SYMBOLS},
-        "macd": {f"{s}:{tf}": empty_macd_state(s, tf) for s in SYMBOLS for tf in MACD_TIMEFRAMES},
         "pyramid": {f"{s}:{side}": empty_pyramid_state(s, side) for s in SYMBOLS for side in ("LONG", "SHORT")},
         "symbol_owner": {s: None for s in SYMBOLS},
         "last_wallet": {},
@@ -1097,7 +1003,6 @@ class StateStore:
         st.setdefault("trade_gate", {"open_allowed": True, "reason": None, "at": now_iso()})
         st.setdefault("protection_blocks", {})
         st.setdefault("range", {})
-        st.setdefault("macd", {})
         st.setdefault("pyramid", {})
         st.setdefault("symbol_owner", {})
         st.setdefault("last_wallet", {})
@@ -1108,29 +1013,6 @@ class StateStore:
             for side in ("LONG", "SHORT"):
                 pkey = f"{s}:{side}"
                 st["pyramid"].setdefault(pkey, empty_pyramid_state(s, side))
-            for tf in MACD_TIMEFRAMES:
-                key = f"{s}:{tf}"
-                st["macd"].setdefault(key, empty_macd_state(s, tf))
-                m = st["macd"][key]
-                rd = dec(m.get("recovery_deficit"))
-                streak = max(0, int(m.get("loss_streak", 0)))
-                saved_level = max(0, int(m.get("recovery_level", 0)))
-                if rd > 0:
-                    repaired_level = min(
-                        MAX_RECOVERY_FAILURES,
-                        max(1, saved_level, streak),
-                    )
-                    if saved_level != repaired_level or streak == 0:
-                        logger.warning(
-                            f"STATE MIGRATION | {key} | RD={rd} streak={streak} recovery_level={saved_level}->{repaired_level}"
-                        )
-                    m["recovery_level"] = repaired_level
-                    if streak == 0:
-                        m["loss_streak"] = repaired_level
-                else:
-                    m["recovery_level"] = 0
-                    if not m.get("protect"):
-                        m["loss_streak"] = 0
         st["version"] = VERSION
         return st
 
@@ -1326,11 +1208,6 @@ class FillLedger:
                     q = dec(leg.get("qty")); ep = dec(leg.get("entry_price")); lid = str(leg.get("id") or uuid.uuid4().hex)
                     if q > 0 and ep > 0:
                         self.record_open_lot(lid, f"RANGE:{sym}", sym, str(leg.get("side")), q, ep, lid, "STATE_BOOTSTRAP"); seeded += 1
-            for st in store.state.get("macd", {}).values():
-                pos = (st or {}).get("position") or {}; leg = pos.get("leg") or {}
-                q = dec(leg.get("qty")); ep = dec(leg.get("entry_price")); lid = str(leg.get("id") or uuid.uuid4().hex)
-                if q > 0 and ep > 0:
-                    self.record_open_lot(lid, str(st.get("strategy")), str(st.get("symbol")), str(leg.get("side")), q, ep, lid, "STATE_BOOTSTRAP"); seeded += 1
             for st in store.state.get("pyramid", {}).values():
                 st = st or {}
                 for leg in st.get("legs", []) or []:
@@ -1338,7 +1215,7 @@ class FillLedger:
                     if q > 0 and ep > 0:
                         self.record_open_lot(lid, str(st.get("strategy")), str(st.get("symbol")), str(leg.get("side")), q, ep, lid, "STATE_BOOTSTRAP"); seeded += 1
         if seeded:
-            logger.warning(f"LEDGER BOOTSTRAP V15 | lots_seeded={seeded} from state.json")
+            logger.warning(f"LEDGER BOOTSTRAP V18 | lots_seeded={seeded} from state.json")
         return seeded
 
 class OrderManager:
@@ -1401,13 +1278,13 @@ class AccountManager:
         if not LIVE_TRADING and not VALIDATE_API_ONLY:
             strategy_count = (
                 (len(SYMBOLS) if RANGE_ENGINE_ENABLED else 0)
-                + (len(SYMBOLS) * len(MACD_TIMEFRAMES) if MACD_ENGINE_ENABLED else 0)
+                + (len(SYMBOLS) * 2 if PYRAMID_ENGINE_ENABLED else 0)
             )
             simulated_total = D(0)
             if RANGE_ENGINE_ENABLED:
                 simulated_total += sum((configured_bankroll(s) for s in SYMBOLS), D(0))
-            if MACD_ENGINE_ENABLED:
-                simulated_total += sum((configured_bankroll(s) * D(len(MACD_TIMEFRAMES)) for s in SYMBOLS), D(0))
+            if PYRAMID_ENGINE_ENABLED:
+                simulated_total += PYRAMID_BANKROLL_USD * D(len(SYMBOLS) * 2)
             if strategy_count == 0:
                 simulated_total = INITIAL_BANKROLL_USD
             self.wallet_balance = simulated_total
@@ -1891,127 +1768,6 @@ class ExecutionEngine:
         logger.info(f"NATIVE BRACKET | {strategy_id} | {symbol} {side} qty={qty} | TP={tp} cid={tp_cid} | SL={sl} cid={sl_cid}")
         return bracket
 
-    def install_stop_only(self, strategy_id: str, symbol: str, leg: Dict[str, Any],
-                          stop_price: Decimal, reason: str = "STOP_LOSS") -> Optional[Dict[str, Any]]:
-        """Instala STOP_MARKET nativo sem TP para uma perna MACD."""
-        if not NATIVE_PROTECTIVE_ORDERS:
-            return None
-        side = str(leg["side"])
-        qty = dec(leg["qty"])
-        if qty <= 0:
-            return None
-        direction = "DOWN" if side == "LONG" else "UP"
-        sl = self.rules.trigger_price(symbol, stop_price, direction)
-        close_side = self.order_side(side, False)
-        cid = self.client_id(strategy_id, "mstop")
-        if not LIVE_TRADING:
-            logger.info("SIM MACD STOP NATIVO | %s | %s %s qty=%s stop=%s", strategy_id, symbol, side, qty, sl)
-            return {"client_id": cid, "order_id": f"SIM-{cid}", "stop_price": str(sl),
-                    "type": "STOP_MARKET", "status": "NEW", "working_type": PROTECTIVE_WORKING_TYPE,
-                    "qty": str(qty), "installed_at": now_iso(), "reason": reason}
-        resp = self.orders.submit_conditional(
-            strategy_id, symbol, side, close_side, qty, sl, cid, "STOP_MARKET",
-            PROTECTIVE_WORKING_TYPE, PROTECTIVE_PRICE_PROTECT, reason,)
-        out = {"client_id": cid, "order_id": resp.get("orderId"), "stop_price": str(sl),
-               "type": "STOP_MARKET", "status": resp.get("status", "NEW"),
-               "working_type": PROTECTIVE_WORKING_TYPE, "qty": str(qty),
-               "installed_at": now_iso(), "reason": reason}
-        logger.info("MACD STOP NATIVO INSTALADO V16 | %s | %s %s qty=%s stop=%s cid=%s",
-                    strategy_id, symbol, side, qty, sl, cid)
-        return out
-
-    def cancel_stop_only(self, symbol: str, stop_order: Optional[Dict[str, Any]]) -> bool:
-        if not stop_order or not LIVE_TRADING:
-            return True
-        cid = str(stop_order.get("client_id") or "")
-        if not cid:
-            return True
-        try:
-            self.client.cancel_order(symbol, cid)
-            return True
-        except AsterAPIError as e:
-            if e.code in (-2011, -2013):
-                return True
-            logger.warning("CANCEL MACD STOP FAIL V16 | %s | %s | %s", symbol, cid, e)
-            return False
-        except Exception as e:
-            logger.warning("CANCEL MACD STOP FAIL V16 | %s | %s | %s", symbol, cid, e)
-            return False
-
-    def stop_status(self, symbol: str, stop_order: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        if not LIVE_TRADING or not stop_order:
-            return None
-        cid = str(stop_order.get("client_id") or "")
-        if not cid:
-            return None
-        try:
-            q = self.client.query_order(symbol, cid)
-            stop_order["status"] = str(q.get("status") or stop_order.get("status") or "")
-            return q
-        except AsterAPIError as e:
-            if e.code in (-2011, -2013):
-                return {"status": "MISSING", "clientOrderId": cid}
-            raise
-
-    def replace_stop_only(self, strategy_id: str, symbol: str, leg: Dict[str, Any],
-                          old_stop: Optional[Dict[str, Any]], new_stop_price: Decimal,
-                          reason: str = "TRAILING_STOP") -> Optional[Dict[str, Any]]:
-        """Move a proteção nativa. Instala o novo stop antes de cancelar o antigo para evitar janela sem proteção."""
-        if not NATIVE_PROTECTIVE_ORDERS:
-            return None
-        side = str(leg["side"])
-        direction = "DOWN" if side == "LONG" else "UP"
-        rounded = self.rules.trigger_price(symbol, new_stop_price, direction)
-        current = dec((old_stop or {}).get("stop_price"))
-        tick = self.rules.rules[symbol].tick_size
-        if current > 0:
-            tighter = rounded > current if side == "LONG" else rounded < current
-            if not tighter or abs(rounded - current) < tick:
-                return old_stop
-        new_meta = self.install_stop_only(strategy_id, symbol, leg, rounded, reason)
-        if new_meta:
-            if old_stop and not self.cancel_stop_only(symbol, old_stop):
-                # Avoid leaving two active stop orders if the old one could not be removed.
-                self.cancel_stop_only(symbol, new_meta)
-                logger.warning("MACD STOP MOVE ROLLBACK V16 | %s | mantendo stop antigo=%s", strategy_id, current)
-                return old_stop
-            logger.info("MACD STOP NATIVO MOVIDO V16 | %s | %s %s | %s -> %s",
-                        strategy_id, symbol, side, current, rounded)
-            return new_meta
-        return old_stop
-
-    def consume_stop_fill(self, strategy_id: str, symbol: str, leg: Dict[str, Any],
-                          stop_order: Optional[Dict[str, Any]], ref_price: Decimal) -> Optional[Dict[str, Any]]:
-        """Consome fill do stop. Em partial fill, zera o remanescente antes de encerrar o lote lógico."""
-        if not LIVE_TRADING or not stop_order:
-            return None
-        q = self.stop_status(symbol, stop_order)
-        if not q:
-            return None
-        status = str(q.get("status") or "")
-        executed = dec(q.get("executedQty"))
-        if status not in ("FILLED", "PARTIALLY_FILLED") or executed <= 0:
-            return None
-        requested = dec(leg["qty"])
-        first_qty = min(requested, executed)
-        avg1 = dec(q.get("avgPrice")) or ref_price
-        cid = str(stop_order.get("client_id") or q.get("clientOrderId") or "NATIVE_STOP")
-        if first_qty < requested:
-            remaining = requested - first_qty
-            logger.warning("MACD NATIVE STOP PARTIAL V16 | %s | filled=%s remaining=%s; zerando remanescente a mercado",
-                           strategy_id, first_qty, remaining)
-            fallback = self.market(strategy_id, symbol, str(leg["side"]), remaining, False, ref_price)
-            second_qty = dec(fallback["qty"])
-            total_qty = first_qty + second_qty
-            if total_qty <= 0:
-                return None
-            combined = (avg1 * first_qty + dec(fallback["price"]) * second_qty) / total_qty
-            # _close_record needs one close id for accounting; use market fill id, whose commission is available.
-            return self._close_record(strategy_id, symbol, leg, min(requested, total_qty), combined,
-                                      "NATIVE_STOP_PARTIAL_PLUS_MARKET", str(fallback["client_id"]),
-                                      "ASTER_STOP_PLUS_MARKET")
-        return self._close_record(strategy_id, symbol, leg, first_qty, avg1,
-                                  "NATIVE_STOP_LOSS", cid, "ASTER_CONDITIONAL_STOP")
 
     def cancel_bracket(self, symbol: str, bracket: Optional[Dict[str, Any]]) -> None:
         if not bracket or not LIVE_TRADING:
@@ -2291,7 +2047,7 @@ def release_owner(store: StateStore, symbol: str, strategy_id: str) -> None:
 # -----------------------------------------------------------------------------
 
 def _apply_realized_pnl_to_state(st: Dict[str, Any], pnl: Decimal, exit_price: Decimal,
-                                 close_reason: str, is_macd: bool = False) -> None:
+                                 close_reason: str) -> None:
     before = dec(st.get("equity"))
     after = before + pnl
     st["equity"] = str(after)
@@ -2301,26 +2057,14 @@ def _apply_realized_pnl_to_state(st: Dict[str, Any], pnl: Decimal, exit_price: D
         rd_after = rd_before + (-pnl)
         st["losses"] = int(st.get("losses", 0)) + 1
         st["last_result"] = "LOSS"
-        if is_macd:
-            st["loss_streak"] = int(st.get("loss_streak", 0)) + 1
-            st["recovery_level"] = min(
-                MAX_RECOVERY_FAILURES,
-                max(1, int(st.get("recovery_level", 0)) + 1),
-            )
     elif pnl > 0:
         rd_after = max(D(0), rd_before - pnl)
         st["wins"] = int(st.get("wins", 0)) + 1
         st["last_result"] = "WIN"
-        if is_macd and rd_after == 0:
-            st["loss_streak"] = 0
-            st["recovery_level"] = 0
     else:
         rd_after = rd_before
         st["last_result"] = "FLAT"
     st["recovery_deficit"] = str(rd_after)
-    if is_macd and int(st.get("loss_streak", 0)) >= MAX_RECOVERY_FAILURES:
-        st["protect"] = True
-        st["protect_anchor"] = str(exit_price)
     st["last_update"] = now_iso()
 
 # -----------------------------------------------------------------------------
@@ -2344,16 +2088,16 @@ class RangeEngine:
 
     def _other_strategy_reserved_qty(self, position_side: str) -> Decimal:
         total = D(0)
+        wanted = str(position_side).upper()
         with self.store.lock:
-            for mst in self.store.state.get("macd", {}).values():
-                mst = mst or {}
-                if str(mst.get("symbol", "")).upper() != self.symbol:
+            for pst in self.store.state.get("pyramid", {}).values():
+                pst = pst or {}
+                if str(pst.get("symbol", "")).upper() != self.symbol:
                     continue
-                pos = mst.get("position") or {}
-                leg = pos.get("leg") or {}
-                if str(leg.get("side", "")).upper() != str(position_side).upper():
+                if str(pst.get("side", "")).upper() != wanted:
                     continue
-                total += dec(leg.get("qty"))
+                for leg in pst.get("legs", []) or []:
+                    total += dec(leg.get("qty"))
         return total
 
     def _range_physical_capacity(self, position_side: str) -> Decimal:
@@ -2581,7 +2325,7 @@ class RangeEngine:
                 closes.append(_c)
                 pnl += dec(_c.get("pnl_est"))
                 reserved_used[_side] = reserved_used.get(_side, D(0)) + dec(_c.get("qty"))
-        _apply_realized_pnl_to_state(st, pnl, price, reason, is_macd=False)
+        _apply_realized_pnl_to_state(st, pnl, price, reason)
         st["basket"] = None
         st["failures"] = 0
         if protect_after:
@@ -2712,7 +2456,7 @@ class RangeEngine:
                 )
                 if native_close:
                     pnl = dec(native_close["pnl_est"])
-                    _apply_realized_pnl_to_state(st, pnl, dec(native_close["exit_price"]), native_close["reason"], is_macd=False)
+                    _apply_realized_pnl_to_state(st, pnl, dec(native_close["exit_price"]), native_close["reason"])
                     protect_after = pnl < 0
                     st["basket"] = None
                     st["failures"] = 0
@@ -2771,7 +2515,7 @@ class RangeEngine:
                 if native_result:
                     self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
                     pnl, closes = native_result
-                    _apply_realized_pnl_to_state(st, pnl, price, "NATIVE_RANGE_BASKET_TAKE_PROFIT", is_macd=False)
+                    _apply_realized_pnl_to_state(st, pnl, price, "NATIVE_RANGE_BASKET_TAKE_PROFIT")
                     st["basket"] = None
                     st["failures"] = 0
                     st["status"] = "IDLE"
@@ -2791,7 +2535,7 @@ class RangeEngine:
                 if native_stop:
                     self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
                     pnl, closes = native_stop
-                    _apply_realized_pnl_to_state(st, pnl, price, "NATIVE_RANGE_BASKET_STOP_LOSS", is_macd=False)
+                    _apply_realized_pnl_to_state(st, pnl, price, "NATIVE_RANGE_BASKET_STOP_LOSS")
                     st["basket"] = None
                     st["status"] = "PROTECT"
                     st["protect_anchor"] = str(price)
@@ -2842,213 +2586,6 @@ class RangeEngine:
             if (active == "LONG" and price <= rev) or (active == "SHORT" and price >= rev):
                 self._reverse(price)
 
-# -----------------------------------------------------------------------------
-# MACD ENGINE com trailing stop e stop loss
-# -----------------------------------------------------------------------------
-
-class MacdEngine:
-    def __init__(self, symbol: str, tf: str, client: AsterClient, md: MarketData, news: NewsFilter,
-                 account: AccountManager, exe: ExecutionEngine, store: StateStore):
-        self.symbol = symbol; self.tf = tf
-        self.id = f"MACD:{symbol}:{tf}"
-        self.client = client; self.md = md; self.news = news; self.account = account; self.exe = exe; self.store = store
-
-    def st(self) -> Dict[str, Any]:
-        return self.store.state["macd"][f"{self.symbol}:{self.tf}"]
-
-    def closed_closes(self) -> Tuple[List[Decimal], int]:
-        rows = self.client.klines(self.symbol, self.tf, max(100, MACD_SLOW + MACD_SIGNAL + 20))
-        if not rows: return [], 0
-        n = now_ms(); closed = [r for r in rows if int(r[6]) < n]
-        if not closed: return [], 0
-        return [dec(r[4]) for r in closed], int(closed[-1][6])
-
-    def _finalize_close(self, st: Dict[str, Any], rec: Dict[str, Any], reason: str) -> None:
-        pnl = dec(rec["pnl_est"]); exit_price = dec(rec.get("exit_price"))
-        _apply_realized_pnl_to_state(st, pnl, exit_price, reason, is_macd=True)
-        st["position"] = None
-        if int(st.get("loss_streak", 0)) >= MAX_RECOVERY_FAILURES:
-            st["protect"] = True; st["protect_anchor"] = str(exit_price)
-        st["last_update"] = now_iso(); self.store.set_protection_block(self.id, None); self.store.save(); release_owner(self.store, self.symbol, self.id)
-        logger.info("MACD CLOSE V16 | %s | %s | pnl=%s eq=%s RD=%s streak=%s protect=%s",
-                    self.id, reason, pnl, st["equity"], st["recovery_deficit"], st["loss_streak"], st["protect"])
-
-    def _close(self, price: Decimal, reason: str) -> None:
-        st = self.st(); pos = st.get("position")
-        if not pos: return
-        # Cancel all known old protection before deliberate market close.
-        if pos.get("native_bracket"):
-            self.exe.cancel_bracket(self.symbol, pos.get("native_bracket"))
-        self.exe.cancel_stop_only(self.symbol, pos.get("native_stop"))
-        c = self.exe.close_leg(self.id, self.symbol, pos["leg"], price, reason)
-        if c is None:
-            # Physical side may already have been closed by a native order. Do not invent PnL.
-            logger.warning("MACD CLOSE SKIP V16 | %s | %s | posição física indisponível; aguardando reconciliação", self.id, reason)
-            return
-        self._finalize_close(st, c, reason)
-
-    def _open(self, side: str, price: Decimal) -> None:
-        st = self.st(); blocked, why = self.news.blocked()
-        if blocked: logger.info("MACD NEWS BLOCK | %s | %s", self.id, why); return
-        if self.store.killed() != "OFF":
-            logger.warning("MACD ENTRY BLOCKED BY KILL V16 | %s | mode=%s | side=%s", self.id, self.store.killed(), side); return
-        gate_ok, gate_reason = self.store.entry_allowed()
-        if not gate_ok: logger.warning("MACD ENTRY GATE V16 | %s | %s", self.id, gate_reason); return
-        if not self.md.is_fresh(self.symbol):
-            logger.warning("MACD ENTRY STALE PRICE V16 | %s | age_s=%.3f", self.id, self.md.age(self.symbol)); return
-        if not acquire_owner(self.store, self.symbol, self.id):
-            logger.info("MACD OWNER BLOCK | %s | owner=%s", self.id, self.store.state["symbol_owner"].get(self.symbol)); return
-        rd = dec(st.get("recovery_deficit"))
-        recovery_level = min(MAX_RECOVERY_FAILURES, max(1, int(st.get("recovery_level",0)), int(st.get("loss_streak",0)))) if rd > 0 else 0
-        st["recovery_level"] = recovery_level
-        # No fixed TP: sizing uses the real adverse hard-stop distance and the configured MACD recovery multiplier.
-        sizing = self.account.sizing_for_profit_target(
-            self.symbol, price, st, target_profit=None, target_move_pct=MACD_HARD_STOP_PCT,
-            adverse_distance_pct=MACD_HARD_STOP_PCT, recovery_level=recovery_level,
-            recovery_multiplier=MACD_RECOVERY_MULTIPLIER)
-        if not sizing:
-            release_owner(self.store, self.symbol, self.id); logger.warning("MACD SIZING NAO CABE | %s", self.id); return
-        leg = self.exe.open_leg(self.id, self.symbol, side, sizing, "MACD_CROSS")
-        entry = dec(leg["entry_price"])
-        hard_stop = entry * (D(1)-MACD_HARD_STOP_PCT) if side == "LONG" else entry * (D(1)+MACD_HARD_STOP_PCT)
-        try:
-            native_stop = self.exe.install_stop_only(self.id, self.symbol, leg, hard_stop, "MACD_HARD_STOP")
-        except Exception:
-            # A live MACD position without its emergency native stop is not acceptable.
-            logger.exception("MACD STOP NATIVO INSTALL FAIL V16 | %s | fechando posição recém-aberta", self.id)
-            try:
-                c = self.exe.close_leg(self.id, self.symbol, leg, price, "PROTECTION_INSTALL_FAILED")
-                if c:
-                    self._finalize_close(st, c, "PROTECTION_INSTALL_FAILED")
-            finally:
-                release_owner(self.store, self.symbol, self.id)
-            return
-        self.store.set_protection_block(self.id, None)
-        st["position"] = {"side":side,"leg":leg,"opened_at":now_iso(),"signal_price":str(price),
-                          "hard_stop_price":str(hard_stop),"native_stop":native_stop,"native_bracket":None,
-                          "trailing_active":False,"trailing_stop":None,"highest_price":str(entry),"lowest_price":str(entry),
-                          "last_stop_check_ms":0,"recovery_level":recovery_level}
-        st["last_update"] = now_iso(); self.store.save()
-        logger.info("MACD OPEN V16 | %s | %s @%s | lev=%sx qty=%s notional=%s stop_nativo=%s recovery_level=%s multiplier=%sx",
-                    self.id, side, entry, sizing["leverage"], sizing["qty"], sizing["notional"], hard_stop, recovery_level, MACD_RECOVERY_MULTIPLIER)
-
-    def _migrate_old_bracket(self, st: Dict[str, Any], pos: Dict[str, Any], price: Decimal) -> bool:
-        old = pos.get("native_bracket")
-        if not old: return False
-        # First consume a fill that may have happened while the bot was offline.
-        native = self.exe.consume_bracket_fill(self.id, self.symbol, pos["leg"], old, price)
-        if native:
-            self._finalize_close(st, native, "MIGRATED_OLD_NATIVE_BRACKET_FILL")
-            return True
-        self.exe.cancel_bracket(self.symbol, old)
-        pos["native_bracket"] = None
-        logger.warning("MACD BRACKET ANTIGO REMOVIDO V16 | %s | migrando para stop-only", self.id)
-        return False
-
-    def _desired_native_stop(self, pos: Dict[str, Any]) -> Decimal:
-        hard = dec(pos.get("hard_stop_price")); trail = dec(pos.get("trailing_stop"))
-        if not pos.get("trailing_active") or trail <= 0: return hard
-        return max(hard, trail) if pos["side"] == "LONG" else min(hard, trail)
-
-    def _watch_native_stop(self, st: Dict[str, Any], pos: Dict[str, Any], price: Decimal, force: bool=False) -> bool:
-        if not NATIVE_PROTECTIVE_ORDERS: return False
-        now = now_ms(); last = int(pos.get("last_stop_check_ms",0) or 0)
-        if not force and now-last < int(PROTECTIVE_WATCHDOG_SECONDS*1000): return False
-        pos["last_stop_check_ms"] = now
-        # Old V15/V5 state migration.
-        if self._migrate_old_bracket(st, pos, price): return True
-        stop = pos.get("native_stop")
-        if stop:
-            native = self.exe.consume_stop_fill(self.id, self.symbol, pos["leg"], stop, price)
-            if native:
-                self._finalize_close(st, native, native.get("reason","NATIVE_STOP_LOSS")); return True
-            try:
-                q = self.exe.stop_status(self.symbol, stop)
-            except Exception as e:
-                logger.warning("MACD STOP WATCHDOG QUERY FAIL V16 | %s | %s", self.id, e); self.store.save(); return False
-            status = str((q or {}).get("status") or "")
-            if status in ("NEW","PARTIALLY_FILLED"):
-                # After restart, persisted software trailing may be tighter than the exchange stop.
-                if pos.get("trailing_active"):
-                    self._sync_native_trailing(pos)
-                self.store.set_protection_block(self.id, None)
-                self.store.save(); return False
-            if status not in ("CANCELED","EXPIRED","REJECTED","MISSING"):
-                self.store.save(); return False
-            logger.warning("MACD STOP WATCHDOG V16 | %s | stop ausente/inativo status=%s; reinstalando", self.id, status)
-        try:
-            pos["native_stop"] = self.exe.install_stop_only(self.id, self.symbol, pos["leg"], self._desired_native_stop(pos), "MACD_STOP_WATCHDOG")
-            self.store.set_protection_block(self.id, None)
-            self.store.save()
-        except Exception as e:
-            logger.exception("MACD STOP WATCHDOG REINSTALL FAIL V16 | %s | %s", self.id, e)
-            # Independent durable fail-closed block; periodic position reconciliation cannot clear it.
-            self.store.set_protection_block(self.id, "NATIVE_STOP_MISSING")
-        return False
-
-    def _sync_native_trailing(self, pos: Dict[str, Any]) -> None:
-        if not (MACD_NATIVE_TRAILING_ENABLED and NATIVE_PROTECTIVE_ORDERS and pos.get("trailing_active")): return
-        desired = self._desired_native_stop(pos); old = pos.get("native_stop")
-        try:
-            moved = self.exe.replace_stop_only(self.id, self.symbol, pos["leg"], old, desired, "MACD_NATIVE_TRAILING")
-            if moved is not old: pos["native_stop"] = moved
-        except Exception as e:
-            logger.exception("MACD NATIVE TRAILING UPDATE FAIL V16 | %s | desired=%s | %s", self.id, desired, e)
-
-    def tick(self, price: Decimal) -> None:
-        st = self.st(); pos = st.get("position")
-        if pos:
-            # Watchdog/consume first so a fill on Aster can never be followed by a second logical close.
-            if self._watch_native_stop(st, pos, price): return
-            side=pos["side"]; entry=dec(pos["leg"]["entry_price"])
-            hard=dec(pos.get("hard_stop_price"))
-            if hard <= 0:
-                hard = entry*(D(1)-MACD_HARD_STOP_PCT) if side=="LONG" else entry*(D(1)+MACD_HARD_STOP_PCT)
-                pos["hard_stop_price"] = str(hard)
-            if side=="LONG":
-                highest=max(dec(pos.get("highest_price") or entry), price); pos["highest_price"]=str(highest)
-                if not pos.get("trailing_active") and pct_change(entry,price)>=MACD_TRAILING_ACTIVATION_PCT:
-                    pos["trailing_active"]=True; pos["trailing_stop"]=str(entry); self._sync_native_trailing(pos); logger.info("MACD TRAILING ATIVADO V16 | %s | LONG | stop=BE", self.id)
-                if pos.get("trailing_active"):
-                    nxt=highest*(D(1)-MACD_TRAILING_DISTANCE_PCT); cur=dec(pos.get("trailing_stop"))
-                    if nxt>cur: pos["trailing_stop"]=str(nxt); self._sync_native_trailing(pos)
-                if price<=hard: self._close(price,"MACD_HARD_STOP_SOFTWARE_BACKUP"); return
-                if pos.get("trailing_active") and price<=dec(pos.get("trailing_stop")): self._close(price,"MACD_TRAILING_STOP"); return
-            else:
-                lowest=min(dec(pos.get("lowest_price") or entry), price); pos["lowest_price"]=str(lowest)
-                if not pos.get("trailing_active") and pct_change(price,entry)>=MACD_TRAILING_ACTIVATION_PCT:
-                    pos["trailing_active"]=True; pos["trailing_stop"]=str(entry); self._sync_native_trailing(pos); logger.info("MACD TRAILING ATIVADO V16 | %s | SHORT | stop=BE", self.id)
-                if pos.get("trailing_active"):
-                    nxt=lowest*(D(1)+MACD_TRAILING_DISTANCE_PCT); cur=dec(pos.get("trailing_stop"))
-                    if cur<=0 or nxt<cur: pos["trailing_stop"]=str(nxt); self._sync_native_trailing(pos)
-                if price>=hard: self._close(price,"MACD_HARD_STOP_SOFTWARE_BACKUP"); return
-                if pos.get("trailing_active") and price>=dec(pos.get("trailing_stop")): self._close(price,"MACD_TRAILING_STOP"); return
-            self.store.save()
-
-        try: closes, close_ms = self.closed_closes()
-        except Exception as e: logger.warning("MACD KLINES FAIL | %s | %s",self.id,e); return
-        if close_ms <= int(st.get("last_candle_close_ms",0)): return
-        st["last_candle_close_ms"]=close_ms; cross=get_macd_cross(closes); self.store.save()
-        if not cross: return
-        logger.info("MACD CROSS | %s | cross=%s close_ms=%s price=%s",self.id,cross,close_ms,price)
-        if st.get("protect"):
-            pa=dec(st.get("protect_anchor"))
-            if pa<=0: st["protect_anchor"]=str(price); self.store.save(); return
-            if abs(pct_change(pa,price))<MACD_REARM_PCT:
-                logger.info("MACD PROTECT | %s | falta deslocamento 3%% | move=%s",self.id,abs(pct_change(pa,price))); return
-            st["protect"]=False
-            if dec(st.get("recovery_deficit"))>0:
-                st["recovery_level"]=min(MAX_RECOVERY_FAILURES,max(1,int(st.get("recovery_level",0)),int(st.get("loss_streak",0))))
-                st["loss_streak"]=max(1,int(st.get("loss_streak",0)))
-            else: st["recovery_level"]=0; st["loss_streak"]=0
-            st["protect_anchor"]=None; self.store.save(); logger.info("MACD PROTECT LIBERADO V16 | %s | cross=%s",self.id,cross)
-        pos=st.get("position")
-        if pos:
-            if pos["side"]==cross: return
-            self._close(price,"OPPOSITE_MACD_CROSS"); st=self.st()
-            if st.get("protect") or st.get("position"): return
-            self._open(cross,price)
-        else: self._open(cross,price)
 
 # -----------------------------------------------------------------------------
 # PYRAMID 1% ENGINE - LONG e SHORT independentes, sem indicador
@@ -3265,11 +2802,11 @@ class Reconciler:
             desired = "HARD" if HARD_KILL_ON_POSITION_MISMATCH else "SOFT"
             if str(current_ks.get("mode")) != desired or str(current_ks.get("reason")) != reason:
                 self.store.kill(desired, reason)
-            logger.error(f"RECONCILE V16 | BLOQUEADO | {reason}")
+            logger.error(f"RECONCILE V18 | BLOQUEADO | {reason}")
             return False
         self.store.set_trade_gate(True, None)
         cleared = self.store.clear_soft_position_mismatch()
-        logger.info(f"RECONCILE V16 | OK | ledger={expected} physical={actual} | soft_mismatch_cleared={cleared}")
+        logger.info(f"RECONCILE V18 | OK | ledger={expected} physical={actual} | soft_mismatch_cleared={cleared}")
         return True
 
 # -----------------------------------------------------------------------------
@@ -3279,22 +2816,18 @@ class Reconciler:
 def run_internal_regression_checks() -> None:
     assert RANGE_SIGNAL_MODE == "VOLATILITY_ONLY"
     assert RANGE_TRIGGER_PCT > 0 and RANGE_TAKE_PROFIT_PCT > 0 and RANGE_HARD_STOP_PCT > 0
-    assert MACD_FAST < MACD_SLOW and MACD_SIGNAL > 0
-    assert RECOVERY_MULTIPLIER >= D(1) and MACD_RECOVERY_MULTIPLIER >= D(1) and MAX_RECOVERY_FAILURES >= 0
+    assert RECOVERY_MULTIPLIER >= D(1) and MAX_RECOVERY_FAILURES >= 0
     assert configured_max_recovery_notional("BTCUSDT") >= configured_initial_notional("BTCUSDT")
     assert configured_max_recovery_notional("ETHUSDT") >= configured_initial_notional("ETHUSDT")
     fake = object.__new__(RulesBook)
     fake.rules = {"X": SymbolRules("X", D("0.1"), D("0.001"), D("0.001"), D("100"), D("5"))}
     assert fake.trigger_price("X", D("100.01"), "UP") == D("100.1")
     assert fake.trigger_price("X", D("100.09"), "DOWN") == D("100.0")
-    assert MACD_RECOVERY_MULTIPLIER ** 1 == MACD_RECOVERY_MULTIPLIER
     assert RECOVERY_MULTIPLIER ** 2 == RECOVERY_MULTIPLIER * RECOVERY_MULTIPLIER
     assert PYRAMID_BANKROLL_USD > 0 and PYRAMID_INITIAL_NOTIONAL_USD > 0
     assert PYRAMID_STEP_PCT > 0 and D(0) < PYRAMID_ADD_BANKROLL_PCT <= D(1)
     assert PYRAMID_LEVERAGE >= 1 and PYRAMID_MAX_LOSS_USD > 0
-    assert MACD_HARD_STOP_PCT > 0 and MACD_TRAILING_ACTIVATION_PCT > 0 and MACD_TRAILING_DISTANCE_PCT > 0
-    assert PROTECTIVE_WATCHDOG_SECONDS >= 1
-    logger.info("SELF TEST V17 | PASS | range/macd/pyramid/recovery/risk/tick/native-stop invariants")
+    logger.info("SELF TEST V18 | PASS | range/pyramid/recovery/risk/tick invariants")
 
 # -----------------------------------------------------------------------------
 # BOT
@@ -3314,17 +2847,16 @@ class Bot:
         self._last_periodic_reconcile_ms = 0
         self.reconciler = Reconciler(self.client, self.store, self.ledger, self.rules)
         self.range_engines: List[RangeEngine] = []
-        self.macd_engines: List[MacdEngine] = []
         self.pyramid_engines: List[PyramidEngine] = []
         self.last_hb = 0.0
 
     def startup(self) -> None:
         logger.info("=" * 90)
         logger.info(f"{BOT_NAME} | version={VERSION} | LIVE_TRADING={LIVE_TRADING}")
-        logger.info(f"SYMBOLS={SYMBOLS} | RANGE={RANGE_ENGINE_ENABLED} mode={RANGE_SIGNAL_MODE} | MACD_SEPARADO={MACD_ENGINE_ENABLED} TF={MACD_TIMEFRAMES} | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED}")
+        logger.info(f"SYMBOLS={SYMBOLS} | RANGE={RANGE_ENGINE_ENABLED} mode={RANGE_SIGNAL_MODE} | PYRAMID_1PCT={PYRAMID_ENGINE_ENABLED} | INDICADORES=NONE")
         logger.info(f"MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV={MAX_REQUESTED_LEVERAGE} | BOT_HARD_CAP={BOT_HARD_MAX_LEVERAGE} | API_HARD_CAP={API_HARD_MAX_LEVERAGE}")
-        logger.info(f"BASE ETH/HYPE: bankroll={INITIAL_BANKROLL_USD} notional={INITIAL_OPERATION_NOTIONAL_USD} | BASE BTC: bankroll={BTC_INITIAL_BANKROLL_USD} notional={BTC_INITIAL_OPERATION_NOTIONAL_USD} | RANGE_RECOVERY={RECOVERY_MULTIPLIER}x | MACD_RECOVERY={MACD_RECOVERY_MULTIPLIER}x | MAX_FAIL={MAX_RECOVERY_FAILURES}")
-        logger.info(f"EXITS | RANGE_TP={RANGE_TAKE_PROFIT_PCT} RANGE_STOP={RANGE_HARD_STOP_PCT} | MACD: trailing_activation={MACD_TRAILING_ACTIVATION_PCT} trailing_distance={MACD_TRAILING_DISTANCE_PCT} stop_loss={MACD_HARD_STOP_PCT}")
+        logger.info(f"BASE ETH/HYPE: bankroll={INITIAL_BANKROLL_USD} notional={INITIAL_OPERATION_NOTIONAL_USD} | BASE BTC: bankroll={BTC_INITIAL_BANKROLL_USD} notional={BTC_INITIAL_OPERATION_NOTIONAL_USD} | RANGE_RECOVERY={RECOVERY_MULTIPLIER}x | MAX_FAIL={MAX_RECOVERY_FAILURES}")
+        logger.info(f"EXITS | RANGE_TP={RANGE_TAKE_PROFIT_PCT} RANGE_STOP={RANGE_HARD_STOP_PCT} | PYRAMID_MAX_LOSS={PYRAMID_MAX_LOSS_USD}")
         logger.info(f"NEWS 3-STAR={NEWS_FILTER_ENABLED} | janela=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | fail_closed={NEWS_FAIL_CLOSED}")
         logger.info(f"SAME_SYMBOL_MULTI_STRATEGY={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} | NATIVE_PROTECTIVE_ORDERS={NATIVE_PROTECTIVE_ORDERS} workingType={PROTECTIVE_WORKING_TYPE}")
         logger.info(f"V15 HARDENING | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
@@ -3358,9 +2890,6 @@ class Bot:
 
         if RANGE_ENGINE_ENABLED:
             self.range_engines = [RangeEngine(s, self.client, self.md, self.news, self.account, self.exe, self.store) for s in SYMBOLS]
-        if MACD_ENGINE_ENABLED:
-            self.macd_engines = [MacdEngine(s, tf, self.client, self.md, self.news, self.account, self.exe, self.store)
-                                 for s in SYMBOLS for tf in MACD_TIMEFRAMES]
         if PYRAMID_ENGINE_ENABLED:
             self.pyramid_engines = [PyramidEngine(s, side, self.client, self.md, self.news, self.account, self.exe, self.store)
                                     for s in SYMBOLS for side in ("LONG", "SHORT")]
@@ -3453,11 +2982,6 @@ class Bot:
                 p = self.md.get(e.symbol)
                 if b and p: e._close_basket(p, "HARD_KILL", protect_after=True)
             except Exception as ex: logger.exception(f"HARD KILL range {e.symbol} | {ex}")
-        for e in self.macd_engines:
-            try:
-                st = e.st(); p = self.md.get(e.symbol)
-                if st.get("position") and p: e._close(p, "HARD_KILL")
-            except Exception as ex: logger.exception(f"HARD KILL macd {e.id} | {ex}")
         for e in self.pyramid_engines:
             try:
                 st = e.st(); p = self.md.get(e.symbol)
@@ -3479,9 +3003,6 @@ class Bot:
             for s in SYMBOLS:
                 r = self.store.state["range"][s]
                 parts.append(f"R:{s}:eq={r['equity']},RD={r['recovery_deficit']},status={r['status']},fail={r['failures']}")
-            for key, m in self.store.state["macd"].items():
-                if m["symbol"] in SYMBOLS and m["tf"] in MACD_TIMEFRAMES:
-                    parts.append(f"M:{m['symbol']}:{m['tf']}:eq={m['equity']},RD={m['recovery_deficit']},streak={m['loss_streak']},pos={'1' if m.get('position') else '0'},prot={int(bool(m.get('protect')))}")
             for key, p in self.store.state.get("pyramid", {}).items():
                 if p.get("symbol") in SYMBOLS:
                     parts.append(f"P:{p['symbol']}:{p['side']}:eq={p['equity']},lvl={p['next_level']},legs={len(p.get('legs',[]) or [])},net={p.get('last_net_pnl','0')},stop={int(bool(p.get('stopped')))}")
@@ -3502,7 +3023,6 @@ class Bot:
             f"mode=HEDGE margin=ISOLATED multi_strategy_same_symbol={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} native_protection={NATIVE_PROTECTIVE_ORDERS} | "
             f"news={news_health} source={news_source} events={news_events} age_s={news_age} fail_closed={NEWS_FAIL_CLOSED} window=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | "
             f"range=VOLATILITY_ONLY trigger={RANGE_TRIGGER_PCT} tp={RANGE_TAKE_PROFIT_PCT} stop={RANGE_HARD_STOP_PCT} | "
-            f"macd={MACD_ENGINE_ENABLED} tf={MACD_TIMEFRAMES} trailing_activation={MACD_TRAILING_ACTIVATION_PCT} trailing_distance={MACD_TRAILING_DISTANCE_PCT} hard_stop={MACD_HARD_STOP_PCT} native_trailing={MACD_NATIVE_TRAILING_ENABLED} watchdog={PROTECTIVE_WATCHDOG_SECONDS}s recovery_multiplier={MACD_RECOVERY_MULTIPLIER}x | recovery={RECOVERY_MULTIPLIER}x range, {MACD_RECOVERY_MULTIPLIER}x macd, max_fail={MAX_RECOVERY_FAILURES} | "
             f"pyramid={PYRAMID_ENGINE_ENABLED} bankroll={PYRAMID_BANKROLL_USD} initial={PYRAMID_INITIAL_NOTIONAL_USD} step={PYRAMID_STEP_PCT} add_cash_pct={PYRAMID_ADD_BANKROLL_PCT} lev={PYRAMID_LEVERAGE}x max_loss={PYRAMID_MAX_LOSS_USD}"
         )
         if LIVE_TRADING:
@@ -3516,7 +3036,6 @@ class Bot:
         found = 0
         with self.store.lock:
             state_range = self.store.state.get("range", {})
-            state_macd = self.store.state.get("macd", {})
             state_pyramid = self.store.state.get("pyramid", {})
             legacy_owners = dict(self.store.state.get("symbol_owner", {}))
 
@@ -3556,22 +3075,6 @@ class Bot:
                     ventry,
                 )
 
-        for key, mst in state_macd.items():
-            mst = mst or {}
-            pos = mst.get("position") or {}
-            leg = pos.get("leg") or {}
-            symbol = str(mst.get("symbol") or pos.get("symbol") or "").upper()
-            side = str(pos.get("side") or leg.get("side") or "").upper()
-            q = dec(leg.get("qty"))
-            if q > 0:
-                strategy = str(mst.get("strategy") or f"MACD:{key.replace(':', ':')}")
-                add_logical(
-                    symbol, side, strategy, q,
-                    pos.get("trailing_stop") or "-",
-                    pos.get("hard_stop_price") or "-",
-                    pos.get("recovery_level", mst.get("recovery_level", mst.get("loss_streak", 0))),
-                    leg.get("entry_price") or "-",
-                )
 
         for pst in state_pyramid.values():
             pst = pst or {}
@@ -3722,18 +3225,13 @@ class Bot:
                     try:
                         self.reconciler.reconcile()
                     except Exception as _re:
-                        logger.warning(f"PERIODIC RECONCILE FAIL V16 | {_re}")
+                        logger.warning(f"PERIODIC RECONCILE FAIL V18 | {_re}")
 
                 for e in self.range_engines:
                     p = prices.get(e.symbol)
                     if p and p > 0:
                         try: e.tick(p)
                         except Exception as ex: logger.exception(f"RANGE TICK FAIL | {e.symbol} | {ex}")
-                for e in self.macd_engines:
-                    p = prices.get(e.symbol)
-                    if p and p > 0:
-                        try: e.tick(p)
-                        except Exception as ex: logger.exception(f"MACD TICK FAIL | {e.id} | {ex}")
                 for e in self.pyramid_engines:
                     p = prices.get(e.symbol)
                     if p and p > 0:
