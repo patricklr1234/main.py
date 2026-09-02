@@ -79,8 +79,8 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "7.2.1-v21-pyramid-diagnostic-fix"
-BOT_NAME = "ASTER_PERPETUAL_BOT_V21"
+VERSION = "7.3.0-v22-account-isolation"
+BOT_NAME = "ASTER_PERPETUAL_BOT_V22"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
 USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS", "").strip()
@@ -90,7 +90,14 @@ LIVE_TRADING = os.getenv("LIVE_TRADING", "0") == "1"
 VALIDATE_API_ONLY = os.getenv("VALIDATE_API_ONLY", "0") == "1"
 EMERGENCY_CLOSE_ALL_AND_RESET = os.getenv("EMERGENCY_CLOSE_ALL_AND_RESET", "0") == "1"
 EMERGENCY_RESET_ID = os.getenv("EMERGENCY_RESET_ID", "reset-20260830-01").strip()
-BOT_DIR = Path(os.getenv("BOT_DIR", "/data"))
+
+# V22: isolamento automático por par USER + SIGNER. Dois serviços/contas podem usar o
+# mesmo BOT_DIR base sem compartilhar state.json, ledger ou journal.
+ACCOUNT_ISOLATION_ENABLED = os.getenv("ACCOUNT_ISOLATION_ENABLED", "1") == "1"
+_ACCOUNT_BINDING_RAW = f"{USER_ADDRESS.lower()}|{SIGNER_ADDRESS.lower()}"
+ACCOUNT_FINGERPRINT = hashlib.sha256(_ACCOUNT_BINDING_RAW.encode("utf-8")).hexdigest()[:16] if (USER_ADDRESS and SIGNER_ADDRESS) else "unbound"
+BOT_DIR_BASE = Path(os.getenv("BOT_DIR", "/data"))
+BOT_DIR = BOT_DIR_BASE / f"account_{ACCOUNT_FINGERPRINT}" if ACCOUNT_ISOLATION_ENABLED else BOT_DIR_BASE
 BOT_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = BOT_DIR / "state.json"
 TRADES_FILE = BOT_DIR / "trades.jsonl"
@@ -305,12 +312,22 @@ class AsterClient:
 
     def _request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None,
                  signed: bool = False, api_key_only: bool = False, retry_unknown: bool = False) -> Any:
-        params = dict(params or {})
+        business_params = dict(params or {})
+        params = business_params
         if signed:
             if not self.user_address or not self.signer_address or not self.signer_private_key:
                 raise AsterAPIError("Credenciais da API Wallet V3 ausentes")
-            params["nonce"] = self._nonce()
-            params["signer"] = self.signer_address
+            # V22 CRITICAL: Aster Futures V3 exige user + signer + nonce em TODA chamada
+            # TRADE/USER_DATA. V21 enviava signer+nonce, mas omitira user; com múltiplas
+            # contas isso podia autenticar/consultar a conta associada ao signer em vez da
+            # conta explicitamente configurada. O payload assinado e o querystring enviado
+            # são agora idênticos e vinculados ao ASTER_USER_ADDRESS.
+            params = {
+                "user": self.user_address,
+                "signer": self.signer_address,
+                "nonce": self._nonce(),
+                **business_params,
+            }
             qs = urlencode([(k, str(v).lower() if isinstance(v, bool) else str(v)) for k, v in params.items()])
             typed_data = {"types": {"EIP712Domain": [{"name": "name", "type": "string"}, {"name": "version", "type": "string"}, {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}], "Message": [{"name": "msg", "type": "string"}]}, "primaryType": "Message", "domain": {"name": "AsterSignTransaction", "version": "1", "chainId": 1666, "verifyingContract": "0x0000000000000000000000000000000000000000"}, "message": {"msg": qs}}
             signable = encode_typed_data(full_message=typed_data)
@@ -1007,6 +1024,7 @@ class StateStore:
         st.setdefault("pyramid", {})
         st.setdefault("symbol_owner", {})
         st.setdefault("last_wallet", {})
+        st.setdefault("account_binding", {})
         st.setdefault("maintenance", {"completed_emergency_actions": []})
         for s in SYMBOLS:
             st["range"].setdefault(s, empty_range_state(s))
@@ -1296,16 +1314,38 @@ class AccountManager:
         if not force and time.time() - self.last_sync < ACCOUNT_SYNC_SECONDS:
             return
         with self._lock:
+            # V22: /balance USDT é a fonte autoritativa para wallet/available.
+            # /accountWithJoinMargin é consultado em paralelo para PnL e cross-check.
+            balances = self.client.balance()
             acct = self.client.account()
-            self.wallet_balance = dec(acct.get("totalWalletBalance") or acct.get("totalMarginBalance") or 0)
-            self.available_balance = dec(acct.get("availableBalance") or 0)
-            self.unrealized = dec(acct.get("totalUnrealizedProfit") or 0)
+            usdt = None
+            if isinstance(balances, list):
+                for row in balances:
+                    if isinstance(row, dict) and str(row.get("asset", "")).upper() == "USDT":
+                        usdt = row
+                        break
+            if not isinstance(usdt, dict):
+                raise AsterAPIError("Futures V3 /balance nao retornou linha USDT para o user configurado")
+            self.wallet_balance = dec(usdt.get("balance") or usdt.get("walletBalance") or 0)
+            self.available_balance = dec(usdt.get("availableBalance") or 0)
+            self.unrealized = dec(acct.get("totalUnrealizedProfit") or 0) if isinstance(acct, dict) else D(0)
+            acct_wallet = dec(acct.get("totalWalletBalance") or acct.get("totalMarginBalance") or 0) if isinstance(acct, dict) else D(0)
+            acct_avail = dec(acct.get("availableBalance") or 0) if isinstance(acct, dict) else D(0)
+            if abs(acct_wallet - self.wallet_balance) > D("0.000001") or abs(acct_avail - self.available_balance) > D("0.000001"):
+                logger.warning(
+                    "ACCOUNT BALANCE CROSSCHECK V22 | user=%s signer=%s | /balance USDT wallet=%s avail=%s | /account wallet=%s avail=%s",
+                    self.client.user_address, self.client.signer_address, self.wallet_balance, self.available_balance, acct_wallet, acct_avail
+                )
             self.last_sync = time.time()
             with self.store.lock:
                 self.store.state["last_wallet"] = {
                     "wallet": str(self.wallet_balance),
                     "available": str(self.available_balance),
                     "unrealized": str(self.unrealized),
+                    "source": "FAPI_V3_BALANCE_USDT",
+                    "user": self.client.user_address,
+                    "signer": self.client.signer_address,
+                    "fingerprint": ACCOUNT_FINGERPRINT,
                     "at": now_iso(),
                 }
             self.store.save()
@@ -2776,7 +2816,7 @@ class PyramidEngine:
             st["next_level"] = max(1, int(st.get("next_level", 1)))
             st["last_update"] = now_iso()
             self.store.save()
-            logger.warning(f"PYRAMID ANCHOR V21 | {self.id} | anchor={price} | first_trigger={self._trigger_price(price, 1)}")
+            logger.warning(f"PYRAMID ANCHOR V22 | {self.id} | anchor={price} | first_trigger={self._trigger_price(price, 1)}")
             return
 
         legs = st.get("legs", []) or []
@@ -2843,11 +2883,11 @@ class Reconciler:
             desired = "HARD" if HARD_KILL_ON_POSITION_MISMATCH else "SOFT"
             if str(current_ks.get("mode")) != desired or str(current_ks.get("reason")) != reason:
                 self.store.kill(desired, reason)
-            logger.error(f"RECONCILE V21 | BLOQUEADO | {reason}")
+            logger.error(f"RECONCILE V22 | BLOQUEADO | {reason}")
             return False
         self.store.set_trade_gate(True, None)
         cleared = self.store.clear_soft_position_mismatch()
-        logger.info(f"RECONCILE V21 | OK | ledger={expected} physical={actual} | soft_mismatch_cleared={cleared}")
+        logger.info(f"RECONCILE V22 | OK | ledger={expected} physical={actual} | soft_mismatch_cleared={cleared}")
         return True
 
 # -----------------------------------------------------------------------------
@@ -2869,7 +2909,7 @@ def run_internal_regression_checks() -> None:
     assert PYRAMID_BTC_MIN_ADD_NOTIONAL_USD > 0
     assert PYRAMID_STEP_PCT > 0 and D(0) < PYRAMID_ADD_BANKROLL_PCT <= D(1)
     assert PYRAMID_LEVERAGE >= 1 and PYRAMID_MAX_LOSS_USD > 0
-    logger.info("SELF TEST V21 | PASS | range/pyramid/recovery/risk/tick invariants")
+    logger.info("SELF TEST V22 | PASS | range/pyramid/recovery/risk/tick invariants")
 
 # -----------------------------------------------------------------------------
 # BOT
@@ -2892,6 +2932,32 @@ class Bot:
         self.pyramid_engines: List[PyramidEngine] = []
         self.last_hb = 0.0
 
+    def _bind_account_identity(self) -> None:
+        """Fail-closed if persisted state belongs to a different USER/SIGNER pair."""
+        current = {
+            "user": USER_ADDRESS.lower(),
+            "signer": SIGNER_ADDRESS.lower(),
+            "fingerprint": ACCOUNT_FINGERPRINT,
+        }
+        with self.store.lock:
+            previous = self.store.state.get("account_binding") or {}
+            if previous:
+                prev_user = str(previous.get("user", "")).lower()
+                prev_signer = str(previous.get("signer", "")).lower()
+                if (prev_user and prev_user != current["user"]) or (prev_signer and prev_signer != current["signer"]):
+                    raise RuntimeError(
+                        "ACCOUNT BINDING MISMATCH V22: este state/ledger pertence a outro USER/SIGNER. "
+                        f"stored_user={previous.get('user')} stored_signer={previous.get('signer')} "
+                        f"current_user={USER_ADDRESS} current_signer={SIGNER_ADDRESS}. "
+                        "Use ACCOUNT_ISOLATION_ENABLED=1 (recomendado) ou um BOT_DIR exclusivo por conta."
+                    )
+            self.store.state["account_binding"] = current
+            self.store.save()
+        logger.info(
+            "ACCOUNT BINDING V22 | user=%s | signer=%s | fingerprint=%s | isolated=%s | dir=%s",
+            USER_ADDRESS, SIGNER_ADDRESS, ACCOUNT_FINGERPRINT, ACCOUNT_ISOLATION_ENABLED, BOT_DIR
+        )
+
     def startup(self) -> None:
         logger.info("=" * 90)
         logger.info(f"{BOT_NAME} | version={VERSION} | LIVE_TRADING={LIVE_TRADING}")
@@ -2907,6 +2973,8 @@ class Bot:
         logger.info("=" * 90)
         if (LIVE_TRADING or VALIDATE_API_ONLY) and (not USER_ADDRESS or not SIGNER_ADDRESS or not SIGNER_PRIVATE_KEY):
             raise RuntimeError("LIVE_TRADING=1 ou VALIDATE_API_ONLY=1 requer as tres credenciais da API Wallet V3")
+        if LIVE_TRADING or VALIDATE_API_ONLY:
+            self._bind_account_identity()
         if SELF_TEST_ON_STARTUP:
             run_internal_regression_checks()
         self.client.sync_time()
@@ -2922,6 +2990,11 @@ class Bot:
         if LIVE_TRADING:
             self.account.ensure_modes()
             self.account.sync(force=True)
+            logger.info(
+                "ACCOUNT SYNC V22 | user=%s signer=%s fingerprint=%s | source=FAPI_V3_BALANCE_USDT | wallet=%s avail=%s unreal=%s",
+                USER_ADDRESS, SIGNER_ADDRESS, ACCOUNT_FINGERPRINT,
+                self.account.wallet_balance, self.account.available_balance, self.account.unrealized
+            )
             if LEDGER_RECONCILE_ON_STARTUP:
                 self.ledger.bootstrap_from_state(self.store)
             if EMERGENCY_CLOSE_ALL_AND_RESET:
@@ -3050,7 +3123,7 @@ class Bot:
                     parts.append(f"P:{p['symbol']}:{p['side']}:eq={p['equity']},lvl={p['next_level']},legs={len(p.get('legs',[]) or [])},net={p.get('last_net_pnl','0')},stop={int(bool(p.get('stopped')))}")
             ks = self.store.state["kill_switch"]
             gate = self.store.state.get("trade_gate", {})
-        logger.info(f"HEARTBEAT | wallet={self.account.wallet_balance} avail={self.account.available_balance} unreal={self.account.unrealized} | kill={ks.get('mode')}:{ks.get('reason')} | entry_gate={gate.get('open_allowed')}:{gate.get('reason')} | ledger={self.ledger.open_by_symbol_side()} | {' | '.join(parts)}")
+        logger.info(f"HEARTBEAT | account={ACCOUNT_FINGERPRINT} source=FAPI_V3_BALANCE_USDT wallet={self.account.wallet_balance} avail={self.account.available_balance} unreal={self.account.unrealized} | kill={ks.get('mode')}:{ks.get('reason')} | entry_gate={gate.get('open_allowed')}:{gate.get('reason')} | ledger={self.ledger.open_by_symbol_side()} | {' | '.join(parts)}")
         # Diagnóstico explícito de cada PYRAMID: mostra exatamente por que ainda não abriu.
         for e in self.pyramid_engines:
             try:
@@ -3058,21 +3131,21 @@ class Bot:
                 d = e.diagnostic(mark)
                 if d.get("status") == "WAITING_TRIGGER":
                     logger.info(
-                        f"PYRAMID WAIT V21 | {e.id} | status={d['status']} reason={d['reason']} "
+                        f"PYRAMID WAIT V22 | {e.id} | status={d['status']} reason={d['reason']} "
                         f"mark={d['mark']} anchor={d['anchor']} next_level={d['level']} "
                         f"trigger={d['trigger']} faltam_pct={d['remaining_pct']:.6f}% "
                         f"next_notional_usd={d['desired_notional']} legs={d['legs']} eq={d['equity']} net={d['net']}"
                     )
                 elif d.get("status") == "TRIGGER_REACHED":
                     logger.warning(
-                        f"PYRAMID TRIGGER V21 | {e.id} | status={d['status']} reason={d['reason']} "
+                        f"PYRAMID TRIGGER V22 | {e.id} | status={d['status']} reason={d['reason']} "
                         f"mark={d['mark']} trigger={d['trigger']} next_level={d['level']} "
                         f"next_notional_usd={d['desired_notional']} legs={d['legs']}"
                     )
                 else:
                     logger.info(f"PYRAMID STATUS V21 | {e.id} | {d}")
             except Exception as ex:
-                logger.warning(f"PYRAMID DIAGNOSTIC FAIL V21 | {e.id} | {ex}")
+                logger.warning(f"PYRAMID DIAGNOSTIC FAIL V22 | {e.id} | {ex}")
         with self.news._lock:
             news_events = len(self.news.events)
             news_source = self.news.last_source
