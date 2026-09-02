@@ -79,8 +79,8 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "7.2.0-v20-pyramid-diagnostic"
-BOT_NAME = "ASTER_PERPETUAL_BOT_V20"
+VERSION = "7.2.1-v21-pyramid-diagnostic-fix"
+BOT_NAME = "ASTER_PERPETUAL_BOT_V21"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
 USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS", "").strip()
@@ -2410,39 +2410,6 @@ class RangeEngine:
         self.store.save()
         logger.warning(f"RANGE REVERSE 4X DINAMICO | {self.symbol} | new={new_side} @{recovery_entry} | mtm={mtm} existing_at_tp={existing_at_tp} desired_notional={desired_notional} recovery_tp={recovery_tp} failures={st['failures']}")
 
-    def diagnostic(self, price: Optional[Decimal]) -> Dict[str, Any]:
-        """Retorna o motivo operacional atual para não haver nova entrada."""
-        st = self.st()
-        if price is None or price <= 0:
-            return {"status": "WAITING_PRICE", "reason": "NO_MARK_PRICE"}
-        if st.get("stopped"):
-            return {"status": "STOPPED", "reason": st.get("stop_reason") or "STOPPED"}
-        anchor = dec(st.get("anchor"))
-        if anchor <= 0:
-            return {"status": "WAITING_ANCHOR", "reason": "ANCHOR_NOT_SET", "mark": price}
-        level = max(1, int(st.get("next_level", 1)))
-        trigger = self._trigger_price(anchor, level)
-        desired = self._desired_notional(level)
-        if trigger <= 0:
-            return {"status": "INVALID_TRIGGER", "reason": "TRIGGER_LE_ZERO", "mark": price, "anchor": anchor, "level": level}
-        crossed = self._crossed(price, trigger)
-        if crossed:
-            # O gatilho foi alcançado. A tentativa de entrada ocorre no tick; se não houver
-            # posição, os logs específicos informarão gate/news/margem/cap/API.
-            remain_pct = D(0)
-            status = "TRIGGER_REACHED"
-            reason = "ENTRY_ATTEMPT_EXPECTED"
-        else:
-            remain_pct = (abs(trigger - price) / price * D(100)) if price > 0 else D(0)
-            status = "WAITING_TRIGGER"
-            reason = "PRICE_NOT_REACHED"
-        return {
-            "status": status, "reason": reason, "mark": price, "anchor": anchor,
-            "trigger": trigger, "remaining_pct": remain_pct, "level": level,
-            "desired_notional": desired, "legs": len(st.get("legs", []) or []),
-            "equity": dec(st.get("equity")), "net": dec(st.get("last_net_pnl")),
-        }
-
     def tick(self, price: Decimal) -> None:
         with self.store.lock:
             st = self.st()
@@ -2697,12 +2664,12 @@ class PyramidEngine:
         margin = actual_notional / D(lev)
         free = self.account.free_margin()
         if margin > free:
-            logger.warning(f"PYRAMID MARGIN BLOCK V20 | {self.id} | level={level} margin={margin} free={free}")
+            logger.warning(f"PYRAMID MARGIN BLOCK V21 | {self.id} | level={level} margin={margin} free={free}")
             return None
         current_symbol = self.account.current_symbol_notional(self.symbol)
         symbol_cap = configured_max_total_symbol_notional(self.symbol)
         if current_symbol + actual_notional > symbol_cap:
-            logger.warning(f"PYRAMID SYMBOL CAP V20 | {self.id} | current={current_symbol} add={actual_notional} cap={symbol_cap}")
+            logger.warning(f"PYRAMID SYMBOL CAP V21 | {self.id} | current={current_symbol} add={actual_notional} cap={symbol_cap}")
             return None
         return {"leverage": lev, "qty": qty, "price": price, "notional": actual_notional,
                 "margin": margin, "estimated_adverse_loss": D(0), "target_profit": D(0),
@@ -2714,10 +2681,10 @@ class PyramidEngine:
             return False
         gate_ok, gate_reason = self.store.entry_allowed()
         if not gate_ok:
-            logger.warning(f"PYRAMID ENTRY GATE V20 | {self.id} | {gate_reason}")
+            logger.warning(f"PYRAMID ENTRY GATE V21 | {self.id} | {gate_reason}")
             return False
         if not self.md.is_fresh(self.symbol):
-            logger.warning(f"PYRAMID STALE PRICE V20 | {self.id} | age_s={self.md.age(self.symbol):.3f}")
+            logger.warning(f"PYRAMID STALE PRICE V21 | {self.id} | age_s={self.md.age(self.symbol):.3f}")
             return False
         if PYRAMID_APPLY_NEWS_FILTER:
             blocked, why = self.news.blocked()
@@ -2742,7 +2709,7 @@ class PyramidEngine:
         st["last_update"] = now_iso()
         self.store.save()
         logger.warning(
-            f"PYRAMID OPEN V20 | {self.id} | level={level} trigger={trigger} fill={leg.get('entry_price')} "
+            f"PYRAMID OPEN V21 | {self.id} | level={level} trigger={trigger} fill={leg.get('entry_price')} "
             f"qty={leg.get('qty')} notional={leg.get('notional')} leverage={sizing['leverage']}x "
             f"anchor={st.get('anchor')} next_level={st['next_level']}"
         )
@@ -2765,7 +2732,40 @@ class PyramidEngine:
         st["stop_reason"] = f"MAX_LOSS_REACHED net_before_close={net_before_close} realized_close={total}"
         st["last_update"] = now_iso()
         self.store.save()
-        logger.critical(f"PYRAMID STOP V20 | {self.id} | net_before_close={net_before_close} realized={total} remaining_legs={len(remaining)} stopped={st['stopped']}")
+        logger.critical(f"PYRAMID STOP V21 | {self.id} | net_before_close={net_before_close} realized={total} remaining_legs={len(remaining)} stopped={st['stopped']}")
+
+    def diagnostic(self, price: Optional[Decimal]) -> Dict[str, Any]:
+        """Retorna o motivo operacional atual para não haver nova entrada."""
+        st = self.st()
+        if price is None or price <= 0:
+            return {"status": "WAITING_PRICE", "reason": "NO_MARK_PRICE"}
+        if st.get("stopped"):
+            return {"status": "STOPPED", "reason": st.get("stop_reason") or "STOPPED"}
+        anchor = dec(st.get("anchor"))
+        if anchor <= 0:
+            return {"status": "WAITING_ANCHOR", "reason": "ANCHOR_NOT_SET", "mark": price}
+        level = max(1, int(st.get("next_level", 1)))
+        trigger = self._trigger_price(anchor, level)
+        desired = self._desired_notional(level)
+        if trigger <= 0:
+            return {"status": "INVALID_TRIGGER", "reason": "TRIGGER_LE_ZERO", "mark": price, "anchor": anchor, "level": level}
+        crossed = self._crossed(price, trigger)
+        if crossed:
+            # O gatilho foi alcançado. A tentativa de entrada ocorre no tick; se não houver
+            # posição, os logs específicos informarão gate/news/margem/cap/API.
+            remain_pct = D(0)
+            status = "TRIGGER_REACHED"
+            reason = "ENTRY_ATTEMPT_EXPECTED"
+        else:
+            remain_pct = (abs(trigger - price) / price * D(100)) if price > 0 else D(0)
+            status = "WAITING_TRIGGER"
+            reason = "PRICE_NOT_REACHED"
+        return {
+            "status": status, "reason": reason, "mark": price, "anchor": anchor,
+            "trigger": trigger, "remaining_pct": remain_pct, "level": level,
+            "desired_notional": desired, "legs": len(st.get("legs", []) or []),
+            "equity": dec(st.get("equity")), "net": dec(st.get("last_net_pnl")),
+        }
 
     def tick(self, price: Decimal) -> None:
         st = self.st()
@@ -2776,7 +2776,7 @@ class PyramidEngine:
             st["next_level"] = max(1, int(st.get("next_level", 1)))
             st["last_update"] = now_iso()
             self.store.save()
-            logger.warning(f"PYRAMID ANCHOR V20 | {self.id} | anchor={price} | first_trigger={self._trigger_price(price, 1)}")
+            logger.warning(f"PYRAMID ANCHOR V21 | {self.id} | anchor={price} | first_trigger={self._trigger_price(price, 1)}")
             return
 
         legs = st.get("legs", []) or []
@@ -2843,11 +2843,11 @@ class Reconciler:
             desired = "HARD" if HARD_KILL_ON_POSITION_MISMATCH else "SOFT"
             if str(current_ks.get("mode")) != desired or str(current_ks.get("reason")) != reason:
                 self.store.kill(desired, reason)
-            logger.error(f"RECONCILE V20 | BLOQUEADO | {reason}")
+            logger.error(f"RECONCILE V21 | BLOQUEADO | {reason}")
             return False
         self.store.set_trade_gate(True, None)
         cleared = self.store.clear_soft_position_mismatch()
-        logger.info(f"RECONCILE V20 | OK | ledger={expected} physical={actual} | soft_mismatch_cleared={cleared}")
+        logger.info(f"RECONCILE V21 | OK | ledger={expected} physical={actual} | soft_mismatch_cleared={cleared}")
         return True
 
 # -----------------------------------------------------------------------------
@@ -2869,7 +2869,7 @@ def run_internal_regression_checks() -> None:
     assert PYRAMID_BTC_MIN_ADD_NOTIONAL_USD > 0
     assert PYRAMID_STEP_PCT > 0 and D(0) < PYRAMID_ADD_BANKROLL_PCT <= D(1)
     assert PYRAMID_LEVERAGE >= 1 and PYRAMID_MAX_LOSS_USD > 0
-    logger.info("SELF TEST V20 | PASS | range/pyramid/recovery/risk/tick invariants")
+    logger.info("SELF TEST V21 | PASS | range/pyramid/recovery/risk/tick invariants")
 
 # -----------------------------------------------------------------------------
 # BOT
@@ -3058,21 +3058,21 @@ class Bot:
                 d = e.diagnostic(mark)
                 if d.get("status") == "WAITING_TRIGGER":
                     logger.info(
-                        f"PYRAMID WAIT V20 | {e.id} | status={d['status']} reason={d['reason']} "
+                        f"PYRAMID WAIT V21 | {e.id} | status={d['status']} reason={d['reason']} "
                         f"mark={d['mark']} anchor={d['anchor']} next_level={d['level']} "
                         f"trigger={d['trigger']} faltam_pct={d['remaining_pct']:.6f}% "
                         f"next_notional_usd={d['desired_notional']} legs={d['legs']} eq={d['equity']} net={d['net']}"
                     )
                 elif d.get("status") == "TRIGGER_REACHED":
                     logger.warning(
-                        f"PYRAMID TRIGGER V20 | {e.id} | status={d['status']} reason={d['reason']} "
+                        f"PYRAMID TRIGGER V21 | {e.id} | status={d['status']} reason={d['reason']} "
                         f"mark={d['mark']} trigger={d['trigger']} next_level={d['level']} "
                         f"next_notional_usd={d['desired_notional']} legs={d['legs']}"
                     )
                 else:
-                    logger.info(f"PYRAMID STATUS V20 | {e.id} | {d}")
+                    logger.info(f"PYRAMID STATUS V21 | {e.id} | {d}")
             except Exception as ex:
-                logger.warning(f"PYRAMID DIAGNOSTIC FAIL V20 | {e.id} | {ex}")
+                logger.warning(f"PYRAMID DIAGNOSTIC FAIL V21 | {e.id} | {ex}")
         with self.news._lock:
             news_events = len(self.news.events)
             news_source = self.news.last_source
