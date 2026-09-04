@@ -79,8 +79,8 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "7.2.1-v21-pyramid-diagnostic-fix"
-BOT_NAME = "ASTER_PERPETUAL_BOT_V21"
+VERSION = "7.3.0-v22-range-price-monitor"
+BOT_NAME = "ASTER_PERPETUAL_BOT_V22"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
 USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS", "").strip()
@@ -3051,6 +3051,39 @@ class Bot:
             ks = self.store.state["kill_switch"]
             gate = self.store.state.get("trade_gate", {})
         logger.info(f"HEARTBEAT | wallet={self.account.wallet_balance} avail={self.account.available_balance} unreal={self.account.unrealized} | kill={ks.get('mode')}:{ks.get('reason')} | entry_gate={gate.get('open_allowed')}:{gate.get('reason')} | ledger={self.ledger.open_by_symbol_side()} | {' | '.join(parts)}")
+        # RANGE PRICE MONITOR: exibe o ponto zero fixado e os gatilhos exatos de entrada +/-1%.
+        # O anchor permanece fixo enquanto o RANGE estiver IDLE; portanto estes sao os precos
+        # que o mercado precisa atingir para disparar LONG ou SHORT.
+        for e in self.range_engines:
+            try:
+                rst = e.st()
+                mark = self.md.get(e.symbol)
+                anchor = dec(rst.get("anchor"))
+                status = str(rst.get("status", "IDLE"))
+                if anchor > 0:
+                    long_trigger = e.exe.rules.trigger_price(
+                        e.symbol, anchor * (D(1) + RANGE_TRIGGER_PCT), "UP"
+                    )
+                    short_trigger = e.exe.rules.trigger_price(
+                        e.symbol, anchor * (D(1) - RANGE_TRIGGER_PCT), "DOWN"
+                    )
+                    if mark is not None and mark > 0:
+                        to_long = max(D(0), (long_trigger / mark - D(1)) * D(100))
+                        to_short = max(D(0), (D(1) - short_trigger / mark) * D(100))
+                        logger.info(
+                            f"RANGE PRICE MONITOR | {e.symbol} | status={status} mark={mark} "
+                            f"anchor_fixado={anchor} LONG_entrada={long_trigger} SHORT_entrada={short_trigger} "
+                            f"faltam_LONG={to_long:.6f}% faltam_SHORT={to_short:.6f}%"
+                        )
+                    else:
+                        logger.info(
+                            f"RANGE PRICE MONITOR | {e.symbol} | status={status} mark=INDISPONIVEL "
+                            f"anchor_fixado={anchor} LONG_entrada={long_trigger} SHORT_entrada={short_trigger}"
+                        )
+                else:
+                    logger.info(f"RANGE PRICE MONITOR | {e.symbol} | status={status} anchor_fixado=AGUARDANDO_PRIMEIRO_PRECO")
+            except Exception as ex:
+                logger.warning(f"RANGE PRICE MONITOR FAIL | {e.symbol} | {ex}")
         # Diagnóstico explícito de cada PYRAMID: mostra exatamente por que ainda não abriu.
         for e in self.pyramid_engines:
             try:
